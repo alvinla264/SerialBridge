@@ -1,0 +1,40 @@
+# Glossary
+
+Terms used by SerialBridge. The client tasks (MCP server, terminal) should use
+these words in their tool names and user-facing text.
+
+- **Core** (`serial-core`): the one process per local user that owns serial
+  devices and serves clients over a Unix socket. It starts automatically when
+  the first client connects and exits after a grace period with no clients.
+- **Client**: anything connected to the core. An **AI client** is the MCP
+  server; a **human client** is the terminal.
+- **Device**: one serial port the core has open (e.g. `/dev/ttyUSB0`). The core
+  identifies an open device by a numeric **device id**.
+- **Open**: the first client to use a device chooses its **baud rate**; later
+  clients **join** the open device instead of opening it again.
+- **Reader**: an AI client attached to a device without write control. It can
+  read history and live output, but not write.
+- **Controller**: the one AI client that holds **write control** of a device
+  and may write to it.
+- **Write control**: the exclusive right of one AI client per device to write.
+  Claimed explicitly with `open(..., request_control = true)`, released on
+  disconnect, and expired after the **control idle timeout** with no request
+  from the holder. A human client writes without holding control.
+- **Control holder**: the client currently holding write control, reported in
+  `ControlState` and control events.
+- **History**: the bounded, in-memory record of **lines** per open device,
+  labelled by **source** (device, AI, human). Discarded when the device closes.
+- **Line**: bytes ending in `\n` (a trailing `\r` is trimmed). A line with no
+  newline yet is **partial** and is marked as such.
+- **Partial**: a line-like value without a terminating newline (a prompt, or a
+  write that did not end in one). Flagged `partial` and ordered by when it
+  started, so an old prompt does not appear newer than later writes.
+- **Grace period**: the 30-second default during which the core stays alive
+  after its last client disconnects.
+- **Close**: detaching the last client. Accepted writes are drained first, then
+  the serial handle is released and `DeviceClosed` is announced.
+- **Truncated**: a read or waited-write result trimmed to the IPC frame budget.
+  The newest lines are kept; `truncated` says older ones were left out.
+- **Event**: an unsolicited notification from the core (device output, write
+  echo, client joined/left, control granted/released/denied, device closed,
+  core shutdown). Clients receive all events from their subscription onward.
