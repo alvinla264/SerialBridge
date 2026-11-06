@@ -1,15 +1,15 @@
 # SerialBridge
 
 One local core owns the serial devices; AI clients and the human terminal share
-them through it. This repository currently contains the **foundation**: the
-Cargo workspace, `serial-core`, and the reusable Rust client/IPC library. The
-MCP server, the human terminal and the Nix packaging are separate follow-up
-tasks that build on the client library documented here.
+them through it. This repository currently contains the **foundation** (the
+Cargo workspace, `serial-core`, and the reusable Rust client/IPC library), the
+**MCP server** the AI host launches, and their tests. The human terminal and the
+Nix packaging are separate follow-up tasks that build on the client library.
 
 ```
             serialbridge-client  (this repo: shared Rust API + auto-start)
                /            \
-   serial-mcp (follow-up)   serial-terminal (follow-up)
+   serial-mcp               serial-terminal (follow-up)
                \            /
                 Unix socket (one per user)
                      |
@@ -25,9 +25,10 @@ tasks that build on the client library documented here.
 | `serialbridge-protocol` | Wire types and newline-delimited JSON framing shared by the core and clients. |
 | `serialbridge-client` | Thread-safe client: discovery, open/join, write control, read, write, live events, lifecycle, core auto-start. |
 | `serial-core` | The `serial-core` binary and its engine: one core per user, one writer per device, history, timers. |
+| `serial-mcp` | The `serial-mcp` binary: an MCP server over stdio (`list_devices`, `connect`, `disconnect`, `read`, `send`) for an AI host. |
 
-One `cargo build --release` produces `serial-core` (the only binary in this
-slice; the client crates are libraries for the next tasks).
+One `cargo build --release` produces `serial-core` and `serial-mcp`; the client
+crates are libraries.
 
 ## Behaviour and defaults
 
@@ -185,6 +186,34 @@ The same settings can come from `SERIALBRIDGE_SOCKET`,
 `SERIALBRIDGE_HISTORY_LINES` and `SERIALBRIDGE_DEFAULT_BAUD`. Clients normally
 never run it by hand.
 
+## MCP server (`serial-mcp`)
+
+`serial-mcp` is an MCP server over stdio: the AI host launches it and it reaches
+the devices through `serialbridge-client` and the core, starting the core when
+needed. It never opens a serial port itself, so the core's rules (one AI writer
+per device, baud conflicts, idle expiry, human writes) still apply.
+
+```json
+{
+  "mcpServers": {
+    "serial": { "command": "/path/to/serial-mcp" }
+  }
+}
+```
+
+Tools: `list_devices` (paths, open state, baud, control holder), `connect`
+(`port`, optional `baud` and `request_control`; reports active baud and either
+granted AI control or read-only with the holder), `disconnect`, `read` (recent
+history lines labelled `device`/`ai`/`human`, partial lines marked, truncation
+and drops reported) and `send` (exact text, no newline added; waits for the
+requested device-output lines or a bounded timeout and returns what arrived,
+including a marked partial line). One MCP session can connect to several
+devices. There is no continuous stream: poll `read`.
+
+See [`crates/serial-mcp/README.md`](crates/serial-mcp/README.md) for the tool
+reference, protocol notes and limitations (text only, one request at a time per
+session, bounded waits and reads, Linux only).
+
 ## Security
 
 The first version is local-only: a Unix socket, no network listener. The socket
@@ -223,6 +252,12 @@ path as a real serial port and the test drives the master. Covered end to end:
   writes, pipelined writes keeping arrival order, unplug notification;
 - core grace-period shutdown and client auto-start (including an explicit core
   path, a missing binary, and the started core owning a separate session).
+
+`serial-mcp` additionally has end-to-end tests over real MCP stdio framing:
+handshake and tool listing, protocol errors, default and joined baud, rejected
+conflicts, two independent sessions with read-only takeover, exact writes,
+waited sends, partial lines, timeouts, disconnect releasing control, detached
+and missing devices, an unplugged device, and auto-start.
 
 Not proven here: real hardware and drivers, PTY behaviour that differs from
 USB serial adapters, platforms other than Linux, and `libudev`-based

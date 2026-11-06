@@ -4,6 +4,7 @@ members = [
     "crates/serialbridge-protocol",
     "crates/serialbridge-client",
     "crates/serial-core",
+    "crates/serial-mcp",
 ]
 
 [workspace.package]

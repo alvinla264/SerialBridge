@@ -282,6 +282,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serial-mcp"
+version = "0.1.0"
+dependencies = [
+ "nix 0.29.0",
+ "serde",
+ "serde_json",
+ "serial-core",
+ "serialbridge-client",
+ "serialbridge-protocol",
+ "tempfile",
+]
+
+[[package]]
 name = "serialbridge-client"
 version = "0.1.0"
 dependencies = [

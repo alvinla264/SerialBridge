@@ -35,6 +35,12 @@ these words in their tool names and user-facing text.
   the serial handle is released and `DeviceClosed` is announced.
 - **Truncated**: a read or waited-write result trimmed to the IPC frame budget.
   The newest lines are kept; `truncated` says older ones were left out.
+- **MCP session**: one run of `serial-mcp`, launched by the AI host and spoken
+  to over stdio. It may be attached to several devices at once; each device
+  keeps its own baud, history and control.
+- **Tool call**: one MCP request from the host to `serial-mcp` (`list_devices`,
+  `connect`, `disconnect`, `read`, `send`). It returns one bounded result; there
+  is no continuous stream.
 - **Event**: an unsolicited notification from the core (device output, write
   echo, client joined/left, control granted/released/denied, device closed,
   core shutdown). Clients receive all events from their subscription onward.
