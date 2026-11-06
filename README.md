@@ -1,15 +1,15 @@
 # SerialBridge
 
 One local core owns the serial devices; AI clients and the human terminal share
-them through it. This repository currently contains the **foundation** (the
-Cargo workspace, `serial-core`, and the reusable Rust client/IPC library), the
-**MCP server** the AI host launches, and their tests. The human terminal and the
-Nix packaging are separate follow-up tasks that build on the client library.
+them through it. This repository contains the Cargo workspace, `serial-core`,
+the reusable Rust client/IPC library, the **MCP server** an AI host launches,
+and the human terminal. The Nix packaging is a separate follow-up task that
+builds on the client library.
 
 ```
             serialbridge-client  (this repo: shared Rust API + auto-start)
                /            \
-   serial-mcp               serial-terminal (follow-up)
+   serial-mcp               serial-terminal
                \            /
                 Unix socket (one per user)
                      |
@@ -26,9 +26,11 @@ Nix packaging are separate follow-up tasks that build on the client library.
 | `serialbridge-client` | Thread-safe client: discovery, open/join, write control, read, write, live events, lifecycle, core auto-start. |
 | `serial-core` | The `serial-core` binary and its engine: one core per user, one writer per device, history, timers. |
 | `serial-mcp` | The `serial-mcp` binary: an MCP server over stdio (`list_devices`, `connect`, `disconnect`, `read`, `send`) for an AI host. |
+| `serial-terminal` | The human TUI: device sidebar, minicom-like stream, baud choice, human writes, AI-write visibility. |
 
-One `cargo build --release` produces `serial-core` and `serial-mcp`; the client
-crates are libraries.
+One `cargo build --release` produces `serial-core`, `serial-mcp` and
+`serial-terminal`; `serialbridge-client` and `serialbridge-protocol` are
+libraries.
 
 ## Behaviour and defaults
 
@@ -93,8 +95,8 @@ Device rules:
 
 ## Using the client library
 
-Both follow-up clients should use `serialbridge-client` rather than speaking
-the socket themselves. The quickest path:
+The MCP server and the terminal both use `serialbridge-client` rather than
+speaking the socket themselves. The quickest path:
 
 ```rust
 use serialbridge_client::{Client, ClientConfig, ClientInfo, WaitSpec};
@@ -174,6 +176,38 @@ A packaged client that keeps the core elsewhere should set either the explicit
 path or `SERIALBRIDGE_CORE`; `find_core_binary()` and `spawn_core()` are public
 for wrappers with their own launch strategy.
 
+### Human terminal
+
+`serial-terminal` is the human client. It connects with `Client::connect`
+(so a missing core is started automatically) as a human client and never takes
+AI write control.
+
+- The sidebar lists every device the core can see, with open/closed state, its
+  active baud and the AI control holder. `Tab` switches between the sidebar
+  and the stream.
+- In the sidebar, `Enter` opens a closed device (after the baud prompt, default
+  `115200`) or joins an open one at its active rate, `b` opens the baud prompt,
+  `d` disconnects explicitly, and the arrow keys select. Opened devices stay
+  attached while switching.
+- In the stream, keys are written to the selected device as-is: arrows are ANSI
+  sequences, Enter is CR and Backspace is DEL. Nothing typed is echoed locally;
+  the device's own echo is still shown.
+- Device output is rendered through a small ANSI screen (cursor movement,
+  erase, SGR colours/attributes, OSC titles ignored). AI writes appear inline in a distinct
+  colour, without labels; human writes are never added to the stream.
+- The header shows the selected path, active baud, AI control holder and
+  attachment; the footer shows errors, unplug notices and the baud prompt.
+- `Ctrl+Q` (or `F10`) quits. Normal exit, I/O errors and panics restore raw
+  mode and the alternate screen, and explicitly disconnect every device.
+  Catchable termination signals (SIGTERM, SIGHUP) are not handled and may
+  leave the terminal in raw mode; SIGKILL cannot be handled.
+
+Tests drive the real client/core seam through PTY-backed simulated devices:
+opening by prompt and joining, switching without reopening, no local echo,
+device echo, visible AI writes, baud conflicts, unplug notices, explicit
+disconnect and shutdown. State/input/render and the terminal cleanup guard are
+tested without a real terminal.
+
 ### Core CLI
 
 ```
@@ -251,7 +285,10 @@ path as a real serial port and the test drives the master. Covered end to end:
 - multiple devices per client, last-client close, close draining accepted
   writes, pipelined writes keeping arrival order, unplug notification;
 - core grace-period shutdown and client auto-start (including an explicit core
-  path, a missing binary, and the started core owning a separate session).
+  path, a missing binary, and the started core owning a separate session);
+- the terminal's sidebar/prompt/switch/disconnect flows, no local echo,
+  visible AI writes, unplug and shutdown through the same core. The terminal's
+  stream parsing and key mapping are covered by unit tests.
 
 `serial-mcp` additionally has end-to-end tests over real MCP stdio framing:
 handshake and tool listing, protocol errors, default and joined baud, rejected

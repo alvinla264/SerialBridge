@@ -1,0 +1,19 @@
+[package]
+name = "serial-terminal"
+description = "Human terminal for SerialBridge: a minicom-like TUI on the shared core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+crossbeam-channel.workspace = true
+crossterm = "0.28"
+ratatui = "0.29"
+serialbridge-client = { path = "../serialbridge-client" }
+serialbridge-protocol = { path = "../serialbridge-protocol" }
+
+[dev-dependencies]
+nix.workspace = true
+serial-core = { path = "../serial-core" }
+tempfile = "3"
