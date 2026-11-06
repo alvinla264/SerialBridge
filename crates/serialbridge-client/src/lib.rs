@@ -44,7 +44,9 @@
 //! polls until the socket accepts. The core locks its socket directory, so two
 //! clients racing to start it still end up with one core. Clients that ship the
 //! core elsewhere (packaging, tests) set [`ClientConfig::core_binary`] or the
-//! `SERIALBRIDGE_CORE` environment variable to an explicit path.
+//! `SERIALBRIDGE_CORE` environment variable to an explicit path; a packaged
+//! build can also compile the path in with `SERIALBRIDGE_CORE_DEFAULT` (what
+//! the Nix flake does), so the two binaries are always used together.
 //!
 //! The core closes a serial device when its last client disconnects, and the
 //! core itself exits 30 seconds (by default) after its last client leaves.

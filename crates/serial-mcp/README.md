@@ -28,11 +28,22 @@ configuration entry:
 }
 ```
 
+A Nix host can run it straight from the flake instead:
+
+```json
+{
+  "mcpServers": {
+    "serial": { "command": "nix", "args": ["run", "github:OWNER/SerialBridge#serial-mcp"] }
+  }
+}
+```
+
 The core is found like every other SerialBridge client:
 
 1. `SERIALBRIDGE_SOCKET` (or the standard per-user socket path);
-2. `SERIALBRIDGE_CORE` for an explicit `serial-core` binary, else a
-   `serial-core` next to `serial-mcp`, else `serial-core` on `PATH`.
+2. `SERIALBRIDGE_CORE` for an explicit `serial-core` binary, else the path the
+   build compiled in (`SERIALBRIDGE_CORE_DEFAULT`, set by the Nix flake), else
+   a `serial-core` next to `serial-mcp`, else `serial-core` on `PATH`.
 
 With no core running, the first tool call starts one detached; it exits again
 after its grace period once no clients remain.

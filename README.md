@@ -3,8 +3,8 @@
 One local core owns the serial devices; AI clients and the human terminal share
 them through it. This repository contains the Cargo workspace, `serial-core`,
 the reusable Rust client/IPC library, the **MCP server** an AI host launches,
-and the human terminal. The Nix packaging is a separate follow-up task that
-builds on the client library.
+the human terminal, and a Nix flake that packages the core together with both
+clients (x86_64-linux and aarch64-linux).
 
 ```
             serialbridge-client  (this repo: shared Rust API + auto-start)
@@ -31,6 +31,113 @@ builds on the client library.
 One `cargo build --release` produces `serial-core`, `serial-mcp` and
 `serial-terminal`; `serialbridge-client` and `serialbridge-protocol` are
 libraries.
+
+## Installing
+
+### Prerequisites
+
+- **Linux.** The core uses a Unix socket and `SO_PEERCRED` uid checks, reads
+  `/dev/serial/by-id` and `/sys/class/tty`, and talks to ports through
+  `serialport`. macOS and Windows are not supported.
+- **A serial adapter** (or an on-board port) and access to it: see
+  [Linux serial permissions](#linux-serial-permissions).
+- **Rust 1.85 or newer** to build from source, or **Nix** with flakes enabled
+  to use the flake.
+- Linux header/tooling for `serialport` is not needed: this workspace builds
+  it with `default-features = false`, so no `libudev` is required.
+
+### Linux serial permissions
+
+A serial port belongs to the `dialout` group on Debian and Ubuntu, `uucp` on
+Arch, and a distro-specific group elsewhere. Add your user to it, then log out
+and back in:
+
+```sh
+ls -l /dev/ttyUSB0                 # who owns the device
+sudo usermod -aG dialout "$USER"   # Debian/Ubuntu
+# sudo usermod -aG uucp "$USER"    # Arch
+id -nG                             # confirm the group after logging in again
+```
+
+On NixOS the same in `configuration.nix`:
+
+```nix
+users.users.<name>.extraGroups = [ "dialout" ];
+```
+
+Everything runs as your user; no root, setuid or system service is involved.
+The core itself never needs the port to be world-writable, and the socket
+directory is private (0700, socket 0600).
+
+### Cargo
+
+```sh
+cargo build --release
+# target/release/serial-core, target/release/serial-mcp, target/release/serial-terminal
+```
+
+To put all three on `PATH`, install them next to each other:
+
+```sh
+cargo install --path crates/serial-core
+cargo install --path crates/serial-mcp
+cargo install --path crates/serial-terminal
+```
+
+They land in `~/.cargo/bin` together, so a client installed this way finds its
+core as a sibling. A single `cargo build --release` is also fine: the clients
+look for `serial-core` next to themselves and on `PATH`, and the second client
+to start reuses the running core.
+
+### Nix
+
+The flake builds `serial-core`, the MCP server (`serial-mcp`), the human
+terminal (`serial-terminal`), and a `default`/`serialbridge` package containing
+all three. `OWNER` stands for the repository owner; replace it with the real
+one, or use `.` inside a checkout.
+
+```sh
+nix run github:OWNER/SerialBridge                  # the human TUI (default)
+nix run github:OWNER/SerialBridge#serial-mcp       # MCP server over stdio
+nix run github:OWNER/SerialBridge#serial-core -- --help
+nix build github:OWNER/SerialBridge                # ./result/bin/{serial-core,serial-mcp,serial-terminal}
+nix profile install github:OWNER/SerialBridge      # all three on PATH
+nix develop                                        # cargo, rustc, rustfmt, clippy
+```
+
+Local checkout: the same with `.` instead of `github:OWNER/SerialBridge`
+(`nix run .`, `nix build .#serial-mcp`, ...). The flake supports
+`x86_64-linux` and `aarch64-linux`. `nix flake check` builds and checks the
+current system only; `nix flake check --all-systems --no-build` evaluates every
+system without building it. Building for the other architecture needs a native
+builder or an emulator.
+
+The two client packages are built against the `serial-core` they ship with: the
+flake compiles that store path in as `SERIALBRIDGE_CORE_DEFAULT` (see
+[Auto-start and packaging](#auto-start-and-packaging)), so a client started
+from anywhere always launches its own matching core. No separate core install
+is needed; set `SERIALBRIDGE_CORE` to use a different one.
+
+## Running
+
+- **The core has no service.** The first client to connect starts it detached
+  (own session, stdio discarded) on the standard per-user socket; the core exits
+  30 seconds after its last client disconnects. Both the TUI and the MCP server
+  do this, so either can be started first.
+- **One core per user.** Clients racing to start it still end up sharing one.
+  `SERIALBRIDGE_SOCKET` (or `--socket`) in a fresh parent directory isolates a
+  second core for testing; the lock is `core.lock` in that directory, so two
+  sockets in one directory still mean one core.
+- **Stopping.** Close the clients (the TUI on `Ctrl+Q`, the MCP host ends its
+  session) and the core goes away after its grace period. To stop it sooner,
+  terminate `serial-core`; devices close and attached clients see the
+  connection end.
+- **Human access.** Run `serial-terminal` whenever you want: it lists the same
+  devices as the AI, joins an open one at its active baud, follows the live
+  stream from then on, and can always write. It does not replay earlier
+  history; the AI's `read` tool does.
+- **AI access.** Configure your MCP host with `serial-mcp` (below). One AI
+  client per device may write; others join read-only.
 
 ## Behaviour and defaults
 
@@ -167,14 +274,17 @@ still end up with one core. `spawn_core()` returns the new process id.
 
 The executable is found in this order:
 
-1. `ClientConfig::core_binary` (an explicit path, for packaging);
+1. `ClientConfig::core_binary` (an explicit path, for embedding);
 2. `$SERIALBRIDGE_CORE`;
-3. a `serial-core` next to the current executable (what `cargo build` gives);
-4. `serial-core` on `PATH`.
+3. the path compiled in with `SERIALBRIDGE_CORE_DEFAULT` at build time (the
+   Nix flake points this at its `serial-core` store path, so a client installed
+   on its own still starts the core it was built against);
+4. a `serial-core` next to the current executable (what `cargo build` gives);
+5. `serial-core` on `PATH`.
 
-A packaged client that keeps the core elsewhere should set either the explicit
-path or `SERIALBRIDGE_CORE`; `find_core_binary()` and `spawn_core()` are public
-for wrappers with their own launch strategy.
+A packaged client that keeps the core elsewhere sets either the explicit path
+or `SERIALBRIDGE_CORE` at runtime; `find_core_binary()` and `spawn_core()` are
+public for wrappers with their own launch strategy.
 
 ### Human terminal
 
@@ -235,6 +345,24 @@ per device, baud conflicts, idle expiry, human writes) still apply.
 }
 ```
 
+or, without installing anything, point the host at the flake (some hosts want
+one command and no arguments):
+
+```json
+{
+  "mcpServers": {
+    "serial": {
+      "command": "nix",
+      "args": ["run", "github:OWNER/SerialBridge#serial-mcp"]
+    }
+  }
+}
+```
+
+After `nix profile install github:OWNER/SerialBridge`, or `cargo install` of the
+three crates, `"command": "serial-mcp"` works too. The core is started by the
+first tool call; the host does not need to launch `serial-core` itself.
+
 Tools: `list_devices` (paths, open state, baud, control holder), `connect`
 (`port`, optional `baud` and `request_control`; reports active baud and either
 granted AI control or read-only with the holder), `disconnect`, `read` (recent
@@ -267,6 +395,18 @@ nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#rustfmt nixpkgs#clippy -c sh -c '
 
 or, with a Rust toolchain on `PATH`, the same `cargo` commands. The workspace
 declares Rust 1.85 as its minimum (the locked dependencies need it).
+
+Packaging:
+
+```sh
+cargo build --release        # all three binaries
+nix build .#default          # the same three, from the flake, under ./result/bin
+nix flake check              # build the packages/checks for this system
+nix flake check --all-systems --no-build   # evaluate every system, build none
+```
+
+The Nix build skips the Rust test suite (`doCheck = false`): those tests open
+PTY pairs and sockets, and belong to `cargo test`, not to a sandboxed build.
 
 Tests use simulated serial devices: a PTY pair where the core opens the slave
 path as a real serial port and the test drives the master. Covered end to end:
