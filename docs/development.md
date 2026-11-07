@@ -20,13 +20,19 @@ nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#rustfmt nixpkgs#clippy -c sh -c '
 or, with a Rust toolchain on `PATH`, the same `cargo` commands. The workspace
 declares Rust 1.85 as its minimum (the locked dependencies need it).
 
-GitHub Actions runs those three commands on every pull request and on each
-push to `main` ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)), on
-the stable toolchain, with `--locked` so a stale `Cargo.lock` fails the pull
-request instead of being silently updated. Two more jobs guard the promises
-around them: the same tests on Rust 1.85, the declared minimum, and
-`cargo build --workspace --release --locked`, the optimised build of all three
-binaries. Every action is pinned to a release commit.
+GitHub Actions runs the same checks on every pull request and on each push to
+`main` ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)), with
+`--locked` so a stale `Cargo.lock` fails the pull request instead of being
+silently updated, and with every action pinned to a release commit. Each check
+is its own job, named after the command it runs, so a pull request shows:
+
+- `cargo fmt --all --check` (stable)
+- `cargo clippy --workspace --all-targets -- -D warnings` (stable)
+- `cargo test --workspace (stable)` and `cargo test --workspace (1.85.0)`
+- `cargo build --workspace --release (stable)` and `cargo build --workspace --release (1.85.0)`
+
+The tests and the release build run on both, so the declared minimum is checked
+rather than assumed.
 
 Packaging:
 
