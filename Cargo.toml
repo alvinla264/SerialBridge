@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/serialbridge-protocol",
-    "crates/serialbridge-client",
-    "crates/serial-core",
-    "crates/serial-mcp",
-    "crates/serial-terminal",
+    "crates/serial-nexus-protocol",
+    "crates/serial-nexus-client",
+    "crates/serial-nexus-core",
+    "crates/serial-nexus-mcp",
+    "crates/serial-nexus-terminal",
 ]
 
 [workspace.package]

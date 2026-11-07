@@ -1,5 +1,5 @@
 {
-  description = "SerialBridge: one local core owns the serial devices; AI clients and the human terminal share them";
+  description = "SerialNexus: one local core owns the serial devices; AI clients and the human terminal share them";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -17,8 +17,8 @@
 
       # Cargo builds are per-package, so the core and the two clients are two
       # derivations. The clients compile the core's store path in as their
-      # `SERIALBRIDGE_CORE_DEFAULT`, so a client installed on its own starts the
-      # exact core it was built against (see crates/serialbridge-client/src/autostart.rs).
+      # `SERIAL_NEXUS_CORE_DEFAULT`, so a client installed on its own starts the
+      # exact core it was built against (see crates/serial-nexus-client/src/autostart.rs).
       build =
         pkgs:
         let
@@ -31,14 +31,14 @@
             # to `cargo test`, not to a sandboxed Nix build.
             doCheck = false;
           };
-          serial-core = pkgs.rustPlatform.buildRustPackage (
+          serial-nexus-core = pkgs.rustPlatform.buildRustPackage (
             common
             // {
-              pname = "serial-core";
-              buildAndTestSubdir = "crates/serial-core";
+              pname = "serial-nexus-core";
+              buildAndTestSubdir = "crates/serial-nexus-core";
               meta = {
-                description = "The SerialBridge core: owns serial devices for one local user and serves clients";
-                mainProgram = "serial-core";
+                description = "The SerialNexus core: owns serial devices for one local user and serves clients";
+                mainProgram = "serial-nexus-core";
                 license = pkgs.lib.licenses.asl20;
               };
             }
@@ -46,55 +46,55 @@
           clients = pkgs.rustPlatform.buildRustPackage (
             common
             // {
-              pname = "serialbridge-clients";
+              pname = "serial-nexus-clients";
               cargoBuildFlags = [
                 "--package"
-                "serial-mcp"
+                "serial-nexus-mcp"
                 "--package"
-                "serial-terminal"
+                "serial-nexus-terminal"
               ];
-              SERIALBRIDGE_CORE_DEFAULT = "${serial-core}/bin/serial-core";
+              SERIAL_NEXUS_CORE_DEFAULT = "${serial-nexus-core}/bin/serial-nexus-core";
               # nixpkgs' cargo hook passes an explicit `--target`, so the
               # binaries land under the target triple.
               installPhase = ''
                 runHook preInstall
                 mkdir -p $out/bin
                 target="target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release"
-                install -m755 "$target/serial-mcp" $out/bin/serial-mcp
-                install -m755 "$target/serial-terminal" $out/bin/serial-terminal
+                install -m755 "$target/serial-nexus-mcp" $out/bin/serial-nexus-mcp
+                install -m755 "$target/serial-nexus-terminal" $out/bin/serial-nexus-terminal
                 runHook postInstall
               '';
               meta = {
-                description = "SerialBridge clients: the MCP server and the human terminal";
-                mainProgram = "serial-terminal";
+                description = "SerialNexus clients: the MCP server and the human terminal";
+                mainProgram = "serial-nexus-terminal";
                 license = pkgs.lib.licenses.asl20;
               };
             }
           );
         in
         {
-          inherit serial-core clients;
-          # Same binaries, correct `meta.mainProgram`, so `nix run .#serial-mcp`
-          # and `nix run .#serial-terminal` each start the right one.
-          serial-terminal = clients.overrideAttrs (old: {
+          inherit serial-nexus-core clients;
+          # Same binaries, correct `meta.mainProgram`, so `nix run .#serial-nexus-mcp`
+          # and `nix run .#serial-nexus-terminal` each start the right one.
+          serial-nexus-terminal = clients.overrideAttrs (old: {
             meta = old.meta // {
-              mainProgram = "serial-terminal";
+              mainProgram = "serial-nexus-terminal";
             };
           });
-          serial-mcp = clients.overrideAttrs (old: {
+          serial-nexus-mcp = clients.overrideAttrs (old: {
             meta = old.meta // {
-              mainProgram = "serial-mcp";
+              mainProgram = "serial-nexus-mcp";
             };
           });
           default = pkgs.symlinkJoin {
-            name = "serialbridge-${version}";
+            name = "serial-nexus-${version}";
             paths = [
-              serial-core
+              serial-nexus-core
               clients
             ];
             meta = {
-              description = "SerialBridge: core, MCP server and human terminal";
-              mainProgram = "serial-terminal";
+              description = "SerialNexus: core, MCP server and human terminal";
+              mainProgram = "serial-nexus-terminal";
               license = pkgs.lib.licenses.asl20;
             };
           };
@@ -108,7 +108,7 @@
         in
         built
         // {
-          serialbridge = built.default;
+          serial-nexus = built.default;
         }
       );
 
@@ -117,7 +117,7 @@
       # native builder or emulator is configured.
       checks = eachSystem (pkgs: {
         default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-        serial-mcp = self.packages.${pkgs.stdenv.hostPlatform.system}.serial-mcp;
+        serial-nexus-mcp = self.packages.${pkgs.stdenv.hostPlatform.system}.serial-nexus-mcp;
       });
 
       devShells = eachSystem (pkgs: {

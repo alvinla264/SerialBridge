@@ -1,0 +1,27 @@
+[package]
+name = "serial-nexus-mcp"
+description = "MCP server over stdio that gives an AI host SerialNexus serial devices"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "serial-nexus-mcp"
+path = "src/main.rs"
+
+[lib]
+name = "serial_nexus_mcp"
+path = "src/lib.rs"
+
+[dependencies]
+serial-nexus-protocol = { path = "../serial-nexus-protocol" }
+serial-nexus-client = { path = "../serial-nexus-client" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serial-nexus-core = { path = "../serial-nexus-core" }
+serial-nexus-client = { path = "../serial-nexus-client" }
+tempfile = "3"
+nix = { workspace = true }

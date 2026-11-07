@@ -1,0 +1,19 @@
+[package]
+name = "serial-nexus-client"
+description = "Reusable Rust client for serial-nexus-core: discovery, control, read/write, live events, auto-start"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serial-nexus-protocol = { path = "../serial-nexus-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+crossbeam-channel = { workspace = true }
+nix = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

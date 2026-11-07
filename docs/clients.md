@@ -2,14 +2,14 @@
 
 ## Using the client library
 
-The MCP server and the terminal both use `serialbridge-client` rather than
+The MCP server and the terminal both use `serial-nexus-client` rather than
 speaking the socket themselves. The quickest path:
 
 ```rust
-use serialbridge_client::{Client, ClientConfig, ClientInfo, WaitSpec};
+use serial_nexus_client::{Client, ClientConfig, ClientInfo, WaitSpec};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Starts serial-core if it is not already running, then says hello.
+    // Starts serial-nexus-core if it is not already running, then says hello.
     let client = Client::connect(ClientConfig::new(ClientInfo::ai("my-agent")))?;
 
     // Live updates for a human-facing view.
@@ -67,28 +67,29 @@ Errors are `ClientError`. Use `error.code()` to match the core's `ErrorCode`
 ### Auto-start and packaging
 
 `Client::connect` tries the socket first. If nothing answers and auto-start is
-on, it starts `serial-core` detached (its own session, so Ctrl-C in the client
-that launched it does not kill the shared core) and polls until the socket
-accepts. The core locks its socket directory, so clients racing to start it
-still end up with one core. `spawn_core()` returns the new process id.
+on, it starts `serial-nexus-core` detached (its own session, so Ctrl-C in the
+client that launched it does not kill the shared core) and polls until the
+socket accepts. The core locks its socket directory, so clients racing to start
+it still end up with one core. `spawn_core()` returns the new process id.
 
 The executable is found in this order:
 
 1. `ClientConfig::core_binary` (an explicit path, for embedding);
-2. `$SERIALBRIDGE_CORE`;
-3. the path compiled in with `SERIALBRIDGE_CORE_DEFAULT` at build time (the
-   Nix flake points this at its `serial-core` store path, so a client installed
-   on its own still starts the core it was built against);
-4. a `serial-core` next to the current executable (what `cargo build` gives);
-5. `serial-core` on `PATH`.
+2. `$SERIAL_NEXUS_CORE`;
+3. the path compiled in with `SERIAL_NEXUS_CORE_DEFAULT` at build time (the
+   Nix flake points this at its `serial-nexus-core` store path, so a client
+   installed on its own still starts the core it was built against);
+4. a `serial-nexus-core` next to the current executable (what `cargo build`
+   gives);
+5. `serial-nexus-core` on `PATH`.
 
 A packaged client that keeps the core elsewhere sets either the explicit path
-or `SERIALBRIDGE_CORE` at runtime; `find_core_binary()` and `spawn_core()` are
+or `SERIAL_NEXUS_CORE` at runtime; `find_core_binary()` and `spawn_core()` are
 public for wrappers with their own launch strategy.
 
 ### Human terminal
 
-`serial-terminal` is the human client. It connects with `Client::connect`
+`serial-nexus-terminal` is the human client. It connects with `Client::connect`
 (so a missing core is started automatically) as a human client and never takes
 AI write control.
 
@@ -103,8 +104,8 @@ AI write control.
   sequences, Enter is CR and Backspace is DEL. Nothing typed is echoed locally;
   the device's own echo is still shown.
 - Device output is rendered through a small ANSI screen (cursor movement,
-  erase, SGR colours/attributes, OSC titles ignored). AI writes appear inline in a distinct
-  colour, without labels; human writes are never added to the stream.
+  erase, SGR colours/attributes, OSC titles ignored). AI writes appear inline in
+  a distinct colour, without labels; human writes are never added to the stream.
 - The header shows the selected path, active baud, AI control holder and
   attachment; the footer shows errors, unplug notices and the baud prompt.
 - `Ctrl+Q` (or `F10`) quits. Normal exit, I/O errors and panics restore raw
@@ -121,26 +122,26 @@ tested without a real terminal.
 ### Core CLI
 
 ```
-serial-core [--socket PATH] [--grace-secs N] [--control-idle-secs N]
-            [--history-lines N] [--default-baud N]
+serial-nexus-core [--socket PATH] [--grace-secs N] [--control-idle-secs N]
+                  [--history-lines N] [--default-baud N]
 ```
 
-The same settings can come from `SERIALBRIDGE_SOCKET`,
-`SERIALBRIDGE_GRACE_SECS`, `SERIALBRIDGE_CONTROL_IDLE_SECS`,
-`SERIALBRIDGE_HISTORY_LINES` and `SERIALBRIDGE_DEFAULT_BAUD`. Clients normally
+The same settings can come from `SERIAL_NEXUS_SOCKET`,
+`SERIAL_NEXUS_GRACE_SECS`, `SERIAL_NEXUS_CONTROL_IDLE_SECS`,
+`SERIAL_NEXUS_HISTORY_LINES` and `SERIAL_NEXUS_DEFAULT_BAUD`. Clients normally
 never run it by hand.
 
-## MCP server (`serial-mcp`)
+## MCP server (`serial-nexus-mcp`)
 
-`serial-mcp` is an MCP server over stdio: the AI host launches it and it reaches
-the devices through `serialbridge-client` and the core, starting the core when
-needed. It never opens a serial port itself, so the core's rules (one AI writer
-per device, baud conflicts, idle expiry, human writes) still apply.
+`serial-nexus-mcp` is an MCP server over stdio: the AI host launches it and it
+reaches the devices through `serial-nexus-client` and the core, starting the
+core when needed. It never opens a serial port itself, so the core's rules (one
+AI writer per device, baud conflicts, idle expiry, human writes) still apply.
 
 ```json
 {
   "mcpServers": {
-    "serial": { "command": "/path/to/serial-mcp" }
+    "serial": { "command": "/path/to/serial-nexus-mcp" }
   }
 }
 ```
@@ -153,15 +154,16 @@ one command and no arguments):
   "mcpServers": {
     "serial": {
       "command": "nix",
-      "args": ["run", "github:alvinla264/SerialBridge#serial-mcp"]
+      "args": ["run", "github:alvinla264/SerialNexus#serial-nexus-mcp"]
     }
   }
 }
 ```
 
-After `nix profile install github:alvinla264/SerialBridge`, or `cargo install` of the
-three crates, `"command": "serial-mcp"` works too. The core is started by the
-first tool call; the host does not need to launch `serial-core` itself.
+After `nix profile install github:alvinla264/SerialNexus`, or `cargo install` of
+the three crates, `"command": "serial-nexus-mcp"` works too. The core is started
+by the first tool call; the host does not need to launch `serial-nexus-core`
+itself.
 
 Tools: `list_devices` (paths, open state, baud, control holder), `connect`
 (`port`, optional `baud` and `request_control`; reports active baud and either
@@ -172,6 +174,6 @@ requested device-output lines or a bounded timeout and returns what arrived,
 including a marked partial line). One MCP session can connect to several
 devices. There is no continuous stream: poll `read`.
 
-See [`crates/serial-mcp/README.md`](../crates/serial-mcp/README.md) for the tool
-reference, protocol notes and limitations (text only, one request at a time per
-session, bounded waits and reads, Linux only).
+See [`crates/serial-nexus-mcp/README.md`](../crates/serial-nexus-mcp/README.md)
+for the tool reference, protocol notes and limitations (text only, one request at
+a time per session, bounded waits and reads, Linux only).

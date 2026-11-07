@@ -1,0 +1,30 @@
+[package]
+name = "serial-nexus-core"
+description = "The SerialNexus core: owns serial devices for one local user and serves clients"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "serial-nexus-core"
+path = "src/main.rs"
+
+[lib]
+name = "serial_nexus_core"
+path = "src/lib.rs"
+
+[dependencies]
+serial-nexus-protocol = { path = "../serial-nexus-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+base64 = { workspace = true }
+crossbeam-channel = { workspace = true }
+serialport = { workspace = true }
+nix = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+serial-nexus-client = { path = "../serial-nexus-client" }
+tempfile = "3"
