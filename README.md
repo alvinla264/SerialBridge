@@ -1,5 +1,7 @@
 # SerialBridge
 
+Copyright 2026 Alvin La. Licensed under the [Apache License, Version 2.0](LICENSE).
+
 One local core owns the serial devices; AI clients and the human terminal share
 them through it. This repository contains the Cargo workspace, `serial-core`,
 the reusable Rust client/IPC library, the **MCP server** an AI host launches,
