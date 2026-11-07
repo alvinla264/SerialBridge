@@ -1,8 +1,8 @@
-# SerialBridge
+# SerialNexus
 
 Copyright 2026 Alvin La. Licensed under the [Apache License, Version 2.0](LICENSE).
 
-SerialBridge lets AI clients and humans share serial devices through one local
+SerialNexus lets AI clients and humans share serial devices through one local
 core. The core owns each device; the MCP server gives AI hosts tool access, and
 an interactive terminal lets a human observe and type without taking AI control.
 Linux is supported; macOS and Windows are not currently supported.
@@ -29,7 +29,7 @@ automatically; no separate service is needed.
 With Nix flakes enabled, start the human terminal directly:
 
 ```sh
-nix run github:alvinla264/SerialBridge
+nix run github:alvinla264/SerialNexus
 ```
 
 ### Cargo
@@ -37,15 +37,16 @@ nix run github:alvinla264/SerialBridge
 With Rust and Cargo installed, clone and build the workspace:
 
 ```sh
-git clone https://github.com/alvinla264/SerialBridge.git
-cd SerialBridge
+git clone https://github.com/alvinla264/SerialNexus.git
+cd SerialNexus
 cargo build --release
-./target/release/serial-terminal
+./target/release/serial-nexus-terminal
 ```
 
-The same build also produces `target/release/serial-core` and
-`target/release/serial-mcp`. See [Installing](docs/getting-started.md#installing)
-for prerequisites and installation options.
+The same build also produces `target/release/serial-nexus-core` and
+`target/release/serial-nexus-mcp`. See
+[Installing](docs/getting-started.md#installing) for prerequisites and
+installation options.
 
 ### Connect an AI host
 
@@ -56,23 +57,24 @@ Configure an MCP-compatible host to start the MCP server. For example, with Nix:
   "mcpServers": {
     "serial": {
       "command": "nix",
-      "args": ["run", "github:alvinla264/SerialBridge#serial-mcp"]
+      "args": ["run", "github:alvinla264/SerialNexus#serial-nexus-mcp"]
     }
   }
 }
 ```
 
-For a Cargo build, use the absolute path to `target/release/serial-mcp` as
-the command. See the [MCP guide](docs/clients.md#mcp-server-serial-mcp) for
-tools and configuration details.
+For a Cargo build, use the absolute path to `target/release/serial-nexus-mcp`
+as the command. See the
+[MCP guide](docs/clients.md#mcp-server-serial-nexus-mcp) for tools and
+configuration details.
 
 ## How it works
 
-- **serial-core** owns devices and enforces one AI writer per device, while
+- **serial-nexus-core** owns devices and enforces one AI writer per device, while
   allowing multiple readers and human writes.
-- **serial-mcp** exposes devices to an AI host through MCP tool calls.
-- **serial-terminal** provides the human terminal and device sidebar.
-- **serialbridge-client** and **serialbridge-protocol** share the core interface
+- **serial-nexus-mcp** exposes devices to an AI host through MCP tool calls.
+- **serial-nexus-terminal** provides the human terminal and device sidebar.
+- **serial-nexus-client** and **serial-nexus-protocol** share the core interface
   and communication types.
 
 The first client opening a device chooses its baud rate; later clients share
@@ -84,7 +86,7 @@ for control, history, and lifecycle details.
 - [Installation, running, and device behavior](docs/getting-started.md)
 - [Client library, human terminal, and MCP server](docs/clients.md)
 - [Security, building, and testing](docs/development.md)
-- [MCP tool reference](crates/serial-mcp/README.md)
+- [MCP tool reference](crates/serial-nexus-mcp/README.md)
 
 ## Contributing
 
@@ -105,4 +107,4 @@ message. Contributions are subject to the project's [Apache 2.0 license](LICENSE
 
 ## License
 
-SerialBridge is licensed under the [Apache License, Version 2.0](LICENSE).
+SerialNexus is licensed under the [Apache License, Version 2.0](LICENSE).

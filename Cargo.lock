@@ -514,7 +514,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "serial-core"
+name = "serial-nexus-client"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "libc",
+ "nix 0.29.0",
+ "serde",
+ "serde_json",
+ "serial-nexus-protocol",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "serial-nexus-core"
 version = "0.1.0"
 dependencies = [
  "base64",
@@ -523,56 +537,28 @@ dependencies = [
  "nix 0.29.0",
  "serde",
  "serde_json",
- "serialbridge-client",
- "serialbridge-protocol",
+ "serial-nexus-client",
+ "serial-nexus-protocol",
  "serialport",
  "tempfile",
  "thiserror",
 ]
 
 [[package]]
-name = "serial-mcp"
+name = "serial-nexus-mcp"
 version = "0.1.0"
 dependencies = [
  "nix 0.29.0",
  "serde",
  "serde_json",
- "serial-core",
- "serialbridge-client",
- "serialbridge-protocol",
+ "serial-nexus-client",
+ "serial-nexus-core",
+ "serial-nexus-protocol",
  "tempfile",
 ]
 
 [[package]]
-name = "serial-terminal"
-version = "0.1.0"
-dependencies = [
- "crossbeam-channel",
- "crossterm",
- "nix 0.29.0",
- "ratatui",
- "serial-core",
- "serialbridge-client",
- "serialbridge-protocol",
- "tempfile",
-]
-
-[[package]]
-name = "serialbridge-client"
-version = "0.1.0"
-dependencies = [
- "crossbeam-channel",
- "libc",
- "nix 0.29.0",
- "serde",
- "serde_json",
- "serialbridge-protocol",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
-name = "serialbridge-protocol"
+name = "serial-nexus-protocol"
 version = "0.1.0"
 dependencies = [
  "base64",
@@ -580,6 +566,20 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "serial-nexus-terminal"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "crossterm",
+ "nix 0.29.0",
+ "ratatui",
+ "serial-nexus-client",
+ "serial-nexus-core",
+ "serial-nexus-protocol",
+ "tempfile",
 ]
 
 [[package]]

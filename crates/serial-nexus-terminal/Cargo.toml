@@ -1,0 +1,19 @@
+[package]
+name = "serial-nexus-terminal"
+description = "Human terminal for SerialNexus: a minicom-like TUI on the shared core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+crossbeam-channel.workspace = true
+crossterm = "0.28"
+ratatui = "0.29"
+serial-nexus-client = { path = "../serial-nexus-client" }
+serial-nexus-protocol = { path = "../serial-nexus-protocol" }
+
+[dev-dependencies]
+nix.workspace = true
+serial-nexus-core = { path = "../serial-nexus-core" }
+tempfile = "3"

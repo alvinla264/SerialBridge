@@ -41,49 +41,49 @@ directory is private (0700, socket 0600).
 
 ```sh
 cargo build --release
-# target/release/serial-core, target/release/serial-mcp, target/release/serial-terminal
+# target/release/serial-nexus-{core,mcp,terminal}
 ```
 
 To put all three on `PATH`, install them next to each other:
 
 ```sh
-cargo install --path crates/serial-core
-cargo install --path crates/serial-mcp
-cargo install --path crates/serial-terminal
+cargo install --path crates/serial-nexus-core
+cargo install --path crates/serial-nexus-mcp
+cargo install --path crates/serial-nexus-terminal
 ```
 
 They land in `~/.cargo/bin` together, so a client installed this way finds its
 core as a sibling. A single `cargo build --release` is also fine: the clients
-look for `serial-core` next to themselves and on `PATH`, and the second client
-to start reuses the running core.
+look for `serial-nexus-core` next to themselves and on `PATH`, and the second
+client to start reuses the running core.
 
 ### Nix
 
-The flake builds `serial-core`, the MCP server (`serial-mcp`), the human
-terminal (`serial-terminal`), and a `default`/`serialbridge` package containing
-all three. Use `.` instead of the GitHub URL inside a checkout.
+The flake builds `serial-nexus-core`, the MCP server (`serial-nexus-mcp`), the
+human terminal (`serial-nexus-terminal`), and a `default`/`serial-nexus` package
+containing all three. Use `.` instead of the GitHub URL inside a checkout.
 
 ```sh
-nix run github:alvinla264/SerialBridge                  # the human TUI (default)
-nix run github:alvinla264/SerialBridge#serial-mcp       # MCP server over stdio
-nix run github:alvinla264/SerialBridge#serial-core -- --help
-nix build github:alvinla264/SerialBridge                # ./result/bin/{serial-core,serial-mcp,serial-terminal}
-nix profile install github:alvinla264/SerialBridge      # all three on PATH
-nix develop                                        # cargo, rustc, rustfmt, clippy
+nix run github:alvinla264/SerialNexus  # the human TUI (default)
+nix run github:alvinla264/SerialNexus#serial-nexus-mcp  # MCP server over stdio
+nix run github:alvinla264/SerialNexus#serial-nexus-core -- --help
+nix build github:alvinla264/SerialNexus  # ./result/bin/serial-nexus-{core,mcp,terminal}
+nix profile install github:alvinla264/SerialNexus  # all three on PATH
+nix develop  # cargo, rustc, rustfmt, clippy
 ```
 
-Local checkout: the same with `.` instead of `github:alvinla264/SerialBridge`
-(`nix run .`, `nix build .#serial-mcp`, ...). The flake supports
+Local checkout: the same with `.` instead of `github:alvinla264/SerialNexus`
+(`nix run .`, `nix build .#serial-nexus-mcp`, ...). The flake supports
 `x86_64-linux` and `aarch64-linux`. `nix flake check` builds and checks the
 current system only; `nix flake check --all-systems --no-build` evaluates every
 system without building it. Building for the other architecture needs a native
 builder or an emulator.
 
-The two client packages are built against the `serial-core` they ship with: the
-flake compiles that store path in as `SERIALBRIDGE_CORE_DEFAULT` (see
+The two client packages are built against the `serial-nexus-core` they ship
+with: the flake compiles that store path in as `SERIAL_NEXUS_CORE_DEFAULT` (see
 [Auto-start and packaging](clients.md#auto-start-and-packaging)), so a client started
 from anywhere always launches its own matching core. No separate core install
-is needed; set `SERIALBRIDGE_CORE` to use a different one.
+is needed; set `SERIAL_NEXUS_CORE` to use a different one.
 
 ## Running
 
@@ -92,18 +92,18 @@ is needed; set `SERIALBRIDGE_CORE` to use a different one.
   30 seconds after its last client disconnects. Both the TUI and the MCP server
   do this, so either can be started first.
 - **One core per user.** Clients racing to start it still end up sharing one.
-  `SERIALBRIDGE_SOCKET` (or `--socket`) in a fresh parent directory isolates a
+  `SERIAL_NEXUS_SOCKET` (or `--socket`) in a fresh parent directory isolates a
   second core for testing; the lock is `core.lock` in that directory, so two
   sockets in one directory still mean one core.
 - **Stopping.** Close the clients (the TUI on `Ctrl+Q`, the MCP host ends its
   session) and the core goes away after its grace period. To stop it sooner,
-  terminate `serial-core`; devices close and attached clients see the
+  terminate `serial-nexus-core`; devices close and attached clients see the
   connection end.
-- **Human access.** Run `serial-terminal` whenever you want: it lists the same
-  devices as the AI, joins an open one at its active baud, follows the live
+- **Human access.** Run `serial-nexus-terminal` whenever you want: it lists the
+  same devices as the AI, joins an open one at its active baud, follows the live
   stream from then on, and can always write. It does not replay earlier
   history; the AI's `read` tool does.
-- **AI access.** Configure your MCP host with `serial-mcp` (below). One AI
+- **AI access.** Configure your MCP host with `serial-nexus-mcp` (below). One AI
   client per device may write; others join read-only.
 
 ## Behaviour and defaults
@@ -120,7 +120,7 @@ All defaults are bounded and reported to clients in the `hello` response
 | History | 2000 lines / 256 KiB per open device | In memory only; discarded when the device closes. Drops are counted and reported. |
 | Read lines | 50 default, 2000 max | The AI chooses per call. |
 | Write wait | 1000 ms default, 30 s max | The AI chooses per call. |
-| Default socket | `$SERIALBRIDGE_SOCKET`, else `$XDG_RUNTIME_DIR/serialbridge/core.sock`, else `$TMPDIR/serialbridge-<uid>/core.sock` | Directory 0700, socket 0600, peer uid checked. |
+| Default socket | `$SERIAL_NEXUS_SOCKET`, else `$XDG_RUNTIME_DIR/serial-nexus/core.sock`, else `$TMPDIR/serial-nexus-<uid>/core.sock` | Directory 0700, socket 0600, peer uid checked. |
 
 Device rules:
 

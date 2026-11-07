@@ -1,11 +1,12 @@
 # Glossary
 
-Terms used by SerialBridge. The client tasks (MCP server, terminal) should use
+Terms used by SerialNexus. The client tasks (MCP server, terminal) should use
 these words in their tool names and user-facing text.
 
-- **Core** (`serial-core`): the one process per local user that owns serial
-  devices and serves clients over a Unix socket. It starts automatically when
-  the first client connects and exits after a grace period with no clients.
+- **Core** (`serial-nexus-core`): the one process per local user that owns
+  serial devices and serves clients over a Unix socket. It starts automatically
+  when the first client connects and exits after a grace period with no
+  clients.
 - **Client**: anything connected to the core. An **AI client** is the MCP
   server; a **human client** is the terminal.
 - **Device**: one serial port the core has open (e.g. `/dev/ttyUSB0`). The core
@@ -35,12 +36,12 @@ these words in their tool names and user-facing text.
   the serial handle is released and `DeviceClosed` is announced.
 - **Truncated**: a read or waited-write result trimmed to the IPC frame budget.
   The newest lines are kept; `truncated` says older ones were left out.
-- **MCP session**: one run of `serial-mcp`, launched by the AI host and spoken
-  to over stdio. It may be attached to several devices at once; each device
-  keeps its own baud, history and control.
-- **Tool call**: one MCP request from the host to `serial-mcp` (`list_devices`,
-  `connect`, `disconnect`, `read`, `send`). It returns one bounded result; there
-  is no continuous stream.
+- **MCP session**: one run of `serial-nexus-mcp`, launched by the AI host and
+  spoken to over stdio. It may be attached to several devices at once; each
+  device keeps its own baud, history and control.
+- **Tool call**: one MCP request from the host to `serial-nexus-mcp`
+  (`list_devices`, `connect`, `disconnect`, `read`, `send`). It returns one
+  bounded result; there is no continuous stream.
 - **Event**: an unsolicited notification from the core (device output, write
   echo, client joined/left, control granted/released/denied, device closed,
   core shutdown). Clients receive all events from their subscription onward.

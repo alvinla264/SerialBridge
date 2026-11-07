@@ -68,7 +68,7 @@ path as a real serial port and the test drives the master. Covered end to end:
   visible AI writes, unplug and shutdown through the same core. The terminal's
   stream parsing and key mapping are covered by unit tests.
 
-`serial-mcp` additionally has end-to-end tests over real MCP stdio framing:
+`serial-nexus-mcp` additionally has end-to-end tests over real MCP stdio framing:
 handshake and tool listing, protocol errors, default and joined baud, rejected
 conflicts, two independent sessions with read-only takeover, exact writes,
 waited sends, partial lines, timeouts, disconnect releasing control, detached
