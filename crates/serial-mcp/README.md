@@ -33,7 +33,7 @@ A Nix host can run it straight from the flake instead:
 ```json
 {
   "mcpServers": {
-    "serial": { "command": "nix", "args": ["run", "github:OWNER/SerialBridge#serial-mcp"] }
+    "serial": { "command": "nix", "args": ["run", "github:alvinla264/SerialBridge#serial-mcp"] }
   }
 }
 ```

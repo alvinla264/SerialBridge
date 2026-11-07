@@ -2,442 +2,107 @@
 
 Copyright 2026 Alvin La. Licensed under the [Apache License, Version 2.0](LICENSE).
 
-One local core owns the serial devices; AI clients and the human terminal share
-them through it. This repository contains the Cargo workspace, `serial-core`,
-the reusable Rust client/IPC library, the **MCP server** an AI host launches,
-the human terminal, and a Nix flake that packages the core together with both
-clients (x86_64-linux and aarch64-linux).
+SerialBridge lets AI clients and humans share serial devices through one local
+core. The core owns each device; the MCP server gives AI hosts tool access, and
+an interactive terminal lets a human observe and type without taking AI control.
+Linux is supported; macOS and Windows are not currently supported.
 
-```
-            serialbridge-client  (this repo: shared Rust API + auto-start)
-               /            \
-   serial-mcp               serial-terminal
-               \            /
-                Unix socket (one per user)
-                     |
-                 serial-core  -- one process per local user
-                     |
-              /dev/ttyUSB0, /dev/ttyACM0, ...
-```
+## Table of contents
 
-## What exists now
+- [Quick start](#quick-start)
+  - [Nix](#nix)
+  - [Cargo](#cargo)
+  - [Connect an AI host](#connect-an-ai-host)
+- [How it works](#how-it-works)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [License](#license)
 
-| Crate | Purpose |
-| --- | --- |
-| `serialbridge-protocol` | Wire types and newline-delimited JSON framing shared by the core and clients. |
-| `serialbridge-client` | Thread-safe client: discovery, open/join, write control, read, write, live events, lifecycle, core auto-start. |
-| `serial-core` | The `serial-core` binary and its engine: one core per user, one writer per device, history, timers. |
-| `serial-mcp` | The `serial-mcp` binary: an MCP server over stdio (`list_devices`, `connect`, `disconnect`, `read`, `send`) for an AI host. |
-| `serial-terminal` | The human TUI: device sidebar, minicom-like stream, baud choice, human writes, AI-write visibility. |
+## Quick start
 
-One `cargo build --release` produces `serial-core`, `serial-mcp` and
-`serial-terminal`; `serialbridge-client` and `serialbridge-protocol` are
-libraries.
-
-## Installing
-
-### Prerequisites
-
-- **Linux.** The core uses a Unix socket and `SO_PEERCRED` uid checks, reads
-  `/dev/serial/by-id` and `/sys/class/tty`, and talks to ports through
-  `serialport`. macOS and Windows are not supported.
-- **A serial adapter** (or an on-board port) and access to it: see
-  [Linux serial permissions](#linux-serial-permissions).
-- **Rust 1.85 or newer** to build from source, or **Nix** with flakes enabled
-  to use the flake.
-- Linux header/tooling for `serialport` is not needed: this workspace builds
-  it with `default-features = false`, so no `libudev` is required.
-
-### Linux serial permissions
-
-A serial port belongs to the `dialout` group on Debian and Ubuntu, `uucp` on
-Arch, and a distro-specific group elsewhere. Add your user to it, then log out
-and back in:
-
-```sh
-ls -l /dev/ttyUSB0                 # who owns the device
-sudo usermod -aG dialout "$USER"   # Debian/Ubuntu
-# sudo usermod -aG uucp "$USER"    # Arch
-id -nG                             # confirm the group after logging in again
-```
-
-On NixOS the same in `configuration.nix`:
-
-```nix
-users.users.<name>.extraGroups = [ "dialout" ];
-```
-
-Everything runs as your user; no root, setuid or system service is involved.
-The core itself never needs the port to be world-writable, and the socket
-directory is private (0700, socket 0600).
-
-### Cargo
-
-```sh
-cargo build --release
-# target/release/serial-core, target/release/serial-mcp, target/release/serial-terminal
-```
-
-To put all three on `PATH`, install them next to each other:
-
-```sh
-cargo install --path crates/serial-core
-cargo install --path crates/serial-mcp
-cargo install --path crates/serial-terminal
-```
-
-They land in `~/.cargo/bin` together, so a client installed this way finds its
-core as a sibling. A single `cargo build --release` is also fine: the clients
-look for `serial-core` next to themselves and on `PATH`, and the second client
-to start reuses the running core.
+You'll need access to your serial device. See [Linux serial permissions](docs/getting-started.md#linux-serial-permissions)
+if opening it fails with a permission error. The first client starts the core
+automatically; no separate service is needed.
 
 ### Nix
 
-The flake builds `serial-core`, the MCP server (`serial-mcp`), the human
-terminal (`serial-terminal`), and a `default`/`serialbridge` package containing
-all three. `OWNER` stands for the repository owner; replace it with the real
-one, or use `.` inside a checkout.
+With Nix flakes enabled, start the human terminal directly:
 
 ```sh
-nix run github:OWNER/SerialBridge                  # the human TUI (default)
-nix run github:OWNER/SerialBridge#serial-mcp       # MCP server over stdio
-nix run github:OWNER/SerialBridge#serial-core -- --help
-nix build github:OWNER/SerialBridge                # ./result/bin/{serial-core,serial-mcp,serial-terminal}
-nix profile install github:OWNER/SerialBridge      # all three on PATH
-nix develop                                        # cargo, rustc, rustfmt, clippy
+nix run github:alvinla264/SerialBridge
 ```
 
-Local checkout: the same with `.` instead of `github:OWNER/SerialBridge`
-(`nix run .`, `nix build .#serial-mcp`, ...). The flake supports
-`x86_64-linux` and `aarch64-linux`. `nix flake check` builds and checks the
-current system only; `nix flake check --all-systems --no-build` evaluates every
-system without building it. Building for the other architecture needs a native
-builder or an emulator.
+### Cargo
 
-The two client packages are built against the `serial-core` they ship with: the
-flake compiles that store path in as `SERIALBRIDGE_CORE_DEFAULT` (see
-[Auto-start and packaging](#auto-start-and-packaging)), so a client started
-from anywhere always launches its own matching core. No separate core install
-is needed; set `SERIALBRIDGE_CORE` to use a different one.
+With Rust and Cargo installed, clone and build the workspace:
 
-## Running
-
-- **The core has no service.** The first client to connect starts it detached
-  (own session, stdio discarded) on the standard per-user socket; the core exits
-  30 seconds after its last client disconnects. Both the TUI and the MCP server
-  do this, so either can be started first.
-- **One core per user.** Clients racing to start it still end up sharing one.
-  `SERIALBRIDGE_SOCKET` (or `--socket`) in a fresh parent directory isolates a
-  second core for testing; the lock is `core.lock` in that directory, so two
-  sockets in one directory still mean one core.
-- **Stopping.** Close the clients (the TUI on `Ctrl+Q`, the MCP host ends its
-  session) and the core goes away after its grace period. To stop it sooner,
-  terminate `serial-core`; devices close and attached clients see the
-  connection end.
-- **Human access.** Run `serial-terminal` whenever you want: it lists the same
-  devices as the AI, joins an open one at its active baud, follows the live
-  stream from then on, and can always write. It does not replay earlier
-  history; the AI's `read` tool does.
-- **AI access.** Configure your MCP host with `serial-mcp` (below). One AI
-  client per device may write; others join read-only.
-
-## Behaviour and defaults
-
-All defaults are bounded and reported to clients in the `hello` response
-(`Limits`), so client tools and docs never hard-code different numbers.
-
-| Setting | Default | Notes |
-| --- | --- | --- |
-| Baud | `115200` | Used when a new device is opened without a rate. |
-| Framing | 8N1, no flow control | Baud rate is the only configurable serial setting. |
-| Core exit grace | 30 s | The core exits 30 s after its last client disconnects. |
-| AI control idle expiry | 5 min | Any request from the holder on that device refreshes it. |
-| History | 2000 lines / 256 KiB per open device | In memory only; discarded when the device closes. Drops are counted and reported. |
-| Read lines | 50 default, 2000 max | The AI chooses per call. |
-| Write wait | 1000 ms default, 30 s max | The AI chooses per call. |
-| Default socket | `$SERIALBRIDGE_SOCKET`, else `$XDG_RUNTIME_DIR/serialbridge/core.sock`, else `$TMPDIR/serialbridge-<uid>/core.sock` | Directory 0700, socket 0600, peer uid checked. |
-
-Device rules:
-
-- **Opening.** The first opener chooses the baud rate. A later client may join
-  with no rate (the active rate) or the same rate; a different rate is rejected
-  with `BaudConflict` and the active rate in the error details. Paths are
-  resolved (`fs::canonicalize`) before lookup, so a symlink such as
-  `/dev/serial/by-id/...` and `/dev/ttyUSB0` name the same open device, and
-  discovery canonicalizes `by-id` aliases so each device is listed once.
-- **Closing.** The last client disconnecting closes the device and releases its
-  rate. Every write already accepted is drained to the device before the close
-  completes, and the core waits for the device's I/O threads to release the
-  serial file before it reports the close (or broadcasts `DeviceClosed`), so an
-  immediate reopen works from any client.
-- **Write control.** One AI client per device may write. It asks for control
-  with `open(..., request_control = true)`. If another AI holds it, the open
-  succeeds read-only and reports the holder; the holder is also told via a
-  `ControlDenied` event. Writing without control fails with `ControlHeld`.
-  Human clients may always write and never take control.
-- **Expiry.** Control expires after 5 idle minutes. The holder calls `open`
-  again (same call, `request_control = true`) to reclaim it. When the holder
-  disconnects, control is released immediately.
-- **History.** Device output and AI/human writes are kept, labelled by source,
-  in a bounded per-device buffer. New joiners can read it. Invalid UTF-8 keeps
-  its bytes internally and appears as U+FFFD in text.
-- **Lines.** `read` returns the newest lines across device output and
-  AI/human writes in arrival order, and includes the open partial tail (marked
-  `partial`) in its chronological place. A `write` optionally waits for
-  device-output lines received after the write, returning early when enough
-  arrive (including a partial tail that started after the write) or returning
-  what arrived plus the current partial tail on timeout. Writes send exactly
-  the supplied bytes; no line ending is added.
-- **Failures.** An unplugged or failed device is closed and every attached
-  client gets `DeviceClosed`. Reconnecting is manual.
-- **Ordering.** Writes from all clients are serialized in arrival order; bytes
-  from two writes never interleave. Multiple devices are independent, including
-  their control timers and history. A write that waits for response lines does
-  not block other requests, live events or disconnect handling on the same
-  connection. Waited writes still enqueue synchronously in arrival order; only
-  waiting for their response lines is offloaded.
-- **Response bounds.** Reads and waited writes keep the newest lines that fit a
-  96 KiB text budget and report `truncated`; a response is never allowed to
-  exceed the IPC frame limit or drop the connection. Incoming frames are read
-  with a hard byte bound, so an unfinished line cannot grow memory without
-  limit.
-
-## Using the client library
-
-The MCP server and the terminal both use `serialbridge-client` rather than
-speaking the socket themselves. The quickest path:
-
-```rust
-use serialbridge_client::{Client, ClientConfig, ClientInfo, WaitSpec};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Starts serial-core if it is not already running, then says hello.
-    let client = Client::connect(ClientConfig::new(ClientInfo::ai("my-agent")))?;
-
-    // Live updates for a human-facing view.
-    let events = client.subscribe();
-
-    for device in client.list_devices()?.devices {
-        println!("{} open={} baud={:?}", device.path, device.open, device.baud);
-    }
-
-    // Open and claim write control.
-    let opened = client.open("/dev/ttyUSB0", Some(115_200), true)?;
-    println!("role {:?}, control {:?}", opened.role, opened.control);
-
-    // Recent history, then send exactly "version\r" and wait for one line.
-    let history = client.read(opened.device_id, Some(20))?;
-    let written = client.write_bytes(
-        opened.device_id,
-        b"version\r",
-        Some(WaitSpec { lines: 1, timeout_ms: Some(2_000) }),
-    )?;
-    println!("{} lines, timed out: {}", written.lines.len(), written.timed_out);
-
-    client.close(opened.device_id)?;
-    Ok(())
-}
+```sh
+git clone https://github.com/alvinla264/SerialBridge.git
+cd SerialBridge
+cargo build --release
+./target/release/serial-terminal
 ```
 
-### API surface
+The same build also produces `target/release/serial-core` and
+`target/release/serial-mcp`. See [Installing](docs/getting-started.md#installing)
+for prerequisites and installation options.
 
-| Call | What it does |
-| --- | --- |
-| `Client::connect(config)` | Connect, starting the core when needed. |
-| `Client::connect_to_socket(path, info)` | Connect to a running core without auto-start (tests, embedding). |
-| `hello()` | Core version, client id, socket and `Limits`. |
-| `list_devices()` | `Vec<DeviceSummary>`: every detected device plus open devices (baud, client count, control holder). |
-| `open(port, baud: Option<u32>, request_control)` | Open or join; returns `OpenResult { device_id, port, baud, role, control }`. |
-| `close(device_id)` | Detach; the last client closes the device. |
-| `read(device_id, lines: Option<usize>)` | `ReadResult { lines, dropped_lines, truncated }`; newest lines last; a partial tail is included and marked. |
-| `write_bytes(device_id, bytes, wait: Option<WaitSpec>)` | Send exact bytes; optionally wait for post-write device lines. `WriteResult { bytes_written, lines, timed_out, truncated }`. |
-| `status(device_id)` | `DeviceStatus` with control holder and history counts. |
-| `subscribe()` | `Receiver<Event>`; each subscriber gets every future event. |
-| `is_connected()` | False after the connection closes (a `TransportClosed` event is also sent). |
-| `socket()` | The socket this client is using. |
+### Connect an AI host
 
-`Event` variants cover raw device output, write echoes with source, client
-join/leave, control granted/released/denied, device closed and core shutdown.
-`DeviceOutput` and `Write` carry the original bytes (base64 on the wire),
-decoded with `event.bytes()`.
-
-Errors are `ClientError`. Use `error.code()` to match the core's `ErrorCode`
-(`BaudConflict`, `ControlHeld`, `NotAttached`, `DeviceClosed`, `DeviceFailed`,
-`NotFound`, `PermissionDenied`, ...); `is_control_held()` and
-`is_device_gone()` cover the two common cases.
-
-### Auto-start and packaging
-
-`Client::connect` tries the socket first. If nothing answers and auto-start is
-on, it starts `serial-core` detached (its own session, so Ctrl-C in the client
-that launched it does not kill the shared core) and polls until the socket
-accepts. The core locks its socket directory, so clients racing to start it
-still end up with one core. `spawn_core()` returns the new process id.
-
-The executable is found in this order:
-
-1. `ClientConfig::core_binary` (an explicit path, for embedding);
-2. `$SERIALBRIDGE_CORE`;
-3. the path compiled in with `SERIALBRIDGE_CORE_DEFAULT` at build time (the
-   Nix flake points this at its `serial-core` store path, so a client installed
-   on its own still starts the core it was built against);
-4. a `serial-core` next to the current executable (what `cargo build` gives);
-5. `serial-core` on `PATH`.
-
-A packaged client that keeps the core elsewhere sets either the explicit path
-or `SERIALBRIDGE_CORE` at runtime; `find_core_binary()` and `spawn_core()` are
-public for wrappers with their own launch strategy.
-
-### Human terminal
-
-`serial-terminal` is the human client. It connects with `Client::connect`
-(so a missing core is started automatically) as a human client and never takes
-AI write control.
-
-- The sidebar lists every device the core can see, with open/closed state, its
-  active baud and the AI control holder. `Tab` switches between the sidebar
-  and the stream.
-- In the sidebar, `Enter` opens a closed device (after the baud prompt, default
-  `115200`) or joins an open one at its active rate, `b` opens the baud prompt,
-  `d` disconnects explicitly, and the arrow keys select. Opened devices stay
-  attached while switching.
-- In the stream, keys are written to the selected device as-is: arrows are ANSI
-  sequences, Enter is CR and Backspace is DEL. Nothing typed is echoed locally;
-  the device's own echo is still shown.
-- Device output is rendered through a small ANSI screen (cursor movement,
-  erase, SGR colours/attributes, OSC titles ignored). AI writes appear inline in a distinct
-  colour, without labels; human writes are never added to the stream.
-- The header shows the selected path, active baud, AI control holder and
-  attachment; the footer shows errors, unplug notices and the baud prompt.
-- `Ctrl+Q` (or `F10`) quits. Normal exit, I/O errors and panics restore raw
-  mode and the alternate screen, and explicitly disconnect every device.
-  Catchable termination signals (SIGTERM, SIGHUP) are not handled and may
-  leave the terminal in raw mode; SIGKILL cannot be handled.
-
-Tests drive the real client/core seam through PTY-backed simulated devices:
-opening by prompt and joining, switching without reopening, no local echo,
-device echo, visible AI writes, baud conflicts, unplug notices, explicit
-disconnect and shutdown. State/input/render and the terminal cleanup guard are
-tested without a real terminal.
-
-### Core CLI
-
-```
-serial-core [--socket PATH] [--grace-secs N] [--control-idle-secs N]
-            [--history-lines N] [--default-baud N]
-```
-
-The same settings can come from `SERIALBRIDGE_SOCKET`,
-`SERIALBRIDGE_GRACE_SECS`, `SERIALBRIDGE_CONTROL_IDLE_SECS`,
-`SERIALBRIDGE_HISTORY_LINES` and `SERIALBRIDGE_DEFAULT_BAUD`. Clients normally
-never run it by hand.
-
-## MCP server (`serial-mcp`)
-
-`serial-mcp` is an MCP server over stdio: the AI host launches it and it reaches
-the devices through `serialbridge-client` and the core, starting the core when
-needed. It never opens a serial port itself, so the core's rules (one AI writer
-per device, baud conflicts, idle expiry, human writes) still apply.
-
-```json
-{
-  "mcpServers": {
-    "serial": { "command": "/path/to/serial-mcp" }
-  }
-}
-```
-
-or, without installing anything, point the host at the flake (some hosts want
-one command and no arguments):
+Configure an MCP-compatible host to start the MCP server. For example, with Nix:
 
 ```json
 {
   "mcpServers": {
     "serial": {
       "command": "nix",
-      "args": ["run", "github:OWNER/SerialBridge#serial-mcp"]
+      "args": ["run", "github:alvinla264/SerialBridge#serial-mcp"]
     }
   }
 }
 ```
 
-After `nix profile install github:OWNER/SerialBridge`, or `cargo install` of the
-three crates, `"command": "serial-mcp"` works too. The core is started by the
-first tool call; the host does not need to launch `serial-core` itself.
+For a Cargo build, use the absolute path to `target/release/serial-mcp` as
+the command. See the [MCP guide](docs/clients.md#mcp-server-serial-mcp) for
+tools and configuration details.
 
-Tools: `list_devices` (paths, open state, baud, control holder), `connect`
-(`port`, optional `baud` and `request_control`; reports active baud and either
-granted AI control or read-only with the holder), `disconnect`, `read` (recent
-history lines labelled `device`/`ai`/`human`, partial lines marked, truncation
-and drops reported) and `send` (exact text, no newline added; waits for the
-requested device-output lines or a bounded timeout and returns what arrived,
-including a marked partial line). One MCP session can connect to several
-devices. There is no continuous stream: poll `read`.
+## How it works
 
-See [`crates/serial-mcp/README.md`](crates/serial-mcp/README.md) for the tool
-reference, protocol notes and limitations (text only, one request at a time per
-session, bounded waits and reads, Linux only).
+- **serial-core** owns devices and enforces one AI writer per device, while
+  allowing multiple readers and human writes.
+- **serial-mcp** exposes devices to an AI host through MCP tool calls.
+- **serial-terminal** provides the human terminal and device sidebar.
+- **serialbridge-client** and **serialbridge-protocol** share the core interface
+  and communication types.
 
-## Security
+The first client opening a device chooses its baud rate; later clients share
+that rate. See [Behaviour and defaults](docs/getting-started.md#behaviour-and-defaults)
+for control, history, and lifecycle details.
 
-The first version is local-only: a Unix socket, no network listener. The socket
-directory is created 0700, the socket file is 0600, and every accepted
-connection is checked with `SO_PEERCRED` against the core's effective uid. A
-caller-provided socket directory is not chmodded; the uid check still applies.
+## Documentation
 
-## Building and testing
+- [Installation, running, and device behavior](docs/getting-started.md)
+- [Client library, human terminal, and MCP server](docs/clients.md)
+- [Security, building, and testing](docs/development.md)
+- [MCP tool reference](crates/serial-mcp/README.md)
 
-```sh
-nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#rustfmt nixpkgs#clippy -c sh -c '
-  cargo fmt --all --check &&
-  cargo clippy --workspace --all-targets -- -D warnings &&
-  cargo test --workspace
-'
-```
+## Contributing
 
-or, with a Rust toolchain on `PATH`, the same `cargo` commands. The workspace
-declares Rust 1.85 as its minimum (the locked dependencies need it).
+Contributions are welcome, including bug reports, documentation, tests, and
+code. To contribute:
 
-Packaging:
+1. Open an issue to report a bug or discuss a proposed change. Include steps to
+   reproduce bugs, the expected and actual behavior, and relevant system details.
+2. Fork the repository, create a branch, and make your changes. Add or update
+   tests where appropriate.
+3. Run the formatting, lint, and test commands in [Building and testing](docs/development.md#building-and-testing).
+4. Open a pull request against `main` describing the change and how you tested it.
+   Link the related issue if there is one.
 
-```sh
-cargo build --release        # all three binaries
-nix build .#default          # the same three, from the flake, under ./result/bin
-nix flake check              # build the packages/checks for this system
-nix flake check --all-systems --no-build   # evaluate every system, build none
-```
+Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for
+commit messages. Pull requests are squash-merged with a conventional commit
+message. Contributions are subject to the project's [Apache 2.0 license](LICENSE).
 
-The Nix build skips the Rust test suite (`doCheck = false`): those tests open
-PTY pairs and sockets, and belong to `cargo test`, not to a sandboxed build.
+## License
 
-Tests use simulated serial devices: a PTY pair where the core opens the slave
-path as a real serial port and the test drives the master. Covered end to end:
-
-- open/join, baud conflicts, join at the active rate, default baud;
-- one AI writer, read-only joins, control denial, `ControlHeld` on write;
-- idle expiry, per-device timers, reclaim with `open`, release on disconnect;
-- read history, dropped-line reporting, partial lines, invalid UTF-8, the
-  partial tail counting toward the requested line limit;
-- fragmented device output, chronological ordering of an old partial tail
-  against newer writes, partial tails in successful and timed-out writes,
-  timed-out writes keeping the shared tail, bounded (truncated) large reads,
-  oversized unfinished frames, alias paths joining one device;
-- exact writes, waited writes, concurrent writes not interleaving, a waited
-  write not blocking other requests, close and immediate reopen;
-- multiple devices per client, last-client close, close draining accepted
-  writes, pipelined writes keeping arrival order, unplug notification;
-- core grace-period shutdown and client auto-start (including an explicit core
-  path, a missing binary, and the started core owning a separate session);
-- the terminal's sidebar/prompt/switch/disconnect flows, no local echo,
-  visible AI writes, unplug and shutdown through the same core. The terminal's
-  stream parsing and key mapping are covered by unit tests.
-
-`serial-mcp` additionally has end-to-end tests over real MCP stdio framing:
-handshake and tool listing, protocol errors, default and joined baud, rejected
-conflicts, two independent sessions with read-only takeover, exact writes,
-waited sends, partial lines, timeouts, disconnect releasing control, detached
-and missing devices, an unplugged device, and auto-start.
-
-Not proven here: real hardware and drivers, PTY behaviour that differs from
-USB serial adapters, platforms other than Linux, and `libudev`-based
-enumeration (device discovery reads `/dev/serial/by-id` and `/sys/class/tty`).
+SerialBridge is licensed under the [Apache License, Version 2.0](LICENSE).
