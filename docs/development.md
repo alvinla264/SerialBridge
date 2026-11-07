@@ -20,6 +20,11 @@ nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#rustfmt nixpkgs#clippy -c sh -c '
 or, with a Rust toolchain on `PATH`, the same `cargo` commands. The workspace
 declares Rust 1.85 as its minimum (the locked dependencies need it).
 
+GitHub Actions runs those three commands on every pull request and on each
+push to `main` ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)), on
+the stable toolchain, with `--locked` so a stale `Cargo.lock` fails the pull
+request instead of being silently updated.
+
 Packaging:
 
 ```sh
