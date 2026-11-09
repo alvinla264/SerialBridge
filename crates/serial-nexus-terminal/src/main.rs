@@ -3,15 +3,13 @@
 use std::io;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{
-    self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{self, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 use serial_nexus_client::{Client, ClientConfig, ClientInfo};
 use serial_nexus_terminal::app::App;
-use serial_nexus_terminal::input::Key;
+use serial_nexus_terminal::input::translate;
 use serial_nexus_terminal::render::{render, stream_body_area};
 use serial_nexus_terminal::settings::{SettingsStore, TerminalSettings};
 use serial_nexus_terminal::state::Notice;
@@ -110,30 +108,5 @@ fn event_loop(
 fn handle_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
     if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
         app.handle_click(area, mouse.column, mouse.row);
-    }
-}
-
-fn translate(event: KeyEvent) -> Option<Key> {
-    let control = event.modifiers.contains(KeyModifiers::CONTROL);
-    match event.code {
-        KeyCode::Char(ch) if control => Some(Key::Ctrl(ch.to_ascii_lowercase())),
-        KeyCode::Char(ch) => Some(Key::Char(ch)),
-        KeyCode::Enter => Some(Key::Enter),
-        KeyCode::Esc => Some(Key::Esc),
-        KeyCode::Tab => Some(Key::Tab),
-        KeyCode::BackTab => Some(Key::BackTab),
-        KeyCode::Backspace => Some(Key::Backspace),
-        KeyCode::Delete => Some(Key::Delete),
-        KeyCode::Insert => Some(Key::Insert),
-        KeyCode::Up => Some(Key::Up),
-        KeyCode::Down => Some(Key::Down),
-        KeyCode::Left => Some(Key::Left),
-        KeyCode::Right => Some(Key::Right),
-        KeyCode::Home => Some(Key::Home),
-        KeyCode::End => Some(Key::End),
-        KeyCode::PageUp => Some(Key::PageUp),
-        KeyCode::PageDown => Some(Key::PageDown),
-        KeyCode::F(number) => Some(Key::F(number)),
-        _ => None,
     }
 }

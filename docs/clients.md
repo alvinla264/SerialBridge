@@ -105,8 +105,9 @@ AI write control.
   active rate, `b` opens the baud prompt and `d` disconnects. Opened devices
   stay attached while switching. The bottom row is the Settings button: select
   it with the arrow keys and open it with `Enter`, or click it with the mouse.
-  `Ctrl+Q` quits from here. `]` sends a literal `Ctrl+]` to the selected device
-  and `Tab` sends a tab.
+  `Ctrl+Q` quits from here, even while the baud prompt is open. `]` sends a
+  literal `Ctrl+]` to the selected device and `Tab` sends a tab. Opening the
+  settings abandons an open baud prompt.
 - In the stream, keys are sent to the device as-is: arrows are ANSI sequences,
   Enter is CR and Backspace is DEL, and `Tab`, `Ctrl+Q` and every printable key
   go to the device. `Ctrl+]` is the only key the terminal keeps, to return to

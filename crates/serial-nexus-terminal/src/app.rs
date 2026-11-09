@@ -135,7 +135,7 @@ impl App {
     /// A huge delta (Home/End) lands on the first or last row.
     fn select_row(&mut self, delta: i32) {
         if delta == i32::MIN {
-            self.state.selected = 0;
+            self.state.select_index(0);
         } else if delta == i32::MAX {
             self.state.select_settings_button();
         } else {
@@ -159,7 +159,7 @@ impl App {
 
     /// Point the sidebar at one of its rows (a mouse click or a test).
     pub fn select_row_index(&mut self, index: usize) {
-        self.state.selected = index.min(self.state.devices.len());
+        self.state.select_index(index);
     }
 
     /// Open the settings view. The current settings are copied into a draft,
@@ -172,6 +172,11 @@ impl App {
     fn toggle_view(&mut self) {
         match self.state.view {
             View::Devices => {
+                // With the Settings button selected, fall back to the last
+                // device row: an attached device still opens its stream.
+                if self.state.selected_session().is_none() {
+                    self.state.select_index(self.state.last_device_index());
+                }
                 if self.state.selected_session().is_none() {
                     self.state.notice = Some(Notice::error(
                         "open a device first: select it and press Enter",

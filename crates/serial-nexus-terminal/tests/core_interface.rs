@@ -618,3 +618,92 @@ fn clicking_the_settings_button_opens_the_settings_and_a_device_row_selects_it()
 
     app.shutdown();
 }
+
+#[test]
+fn settings_clicked_during_a_baud_prompt_takes_the_keys_and_cancels_the_prompt() {
+    use ratatui::layout::Rect;
+    use serial_nexus_terminal::render::settings_button;
+
+    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let device = SimulatedDevice::new();
+    let mut app = app(&socket);
+    app.state
+        .set_devices(vec![serial_nexus_terminal::state::DeviceEntry::new(
+            &device.path,
+        )]);
+    app.handle_key(Key::Char('b'));
+    assert!(app.state.prompt.is_some());
+
+    let area = Rect::new(0, 0, 100, 16);
+    let button = settings_button(area).expect("button");
+    app.handle_click(area, button.x + 2, button.y);
+    assert_eq!(app.state.view, View::Settings);
+    assert!(app.state.prompt.is_none(), "the prompt is abandoned");
+
+    // The settings keys reach the settings, not the prompt.
+    app.handle_key(Key::Char(' '));
+    assert!(!app.state.draft.local_echo);
+    app.handle_key(Key::Ctrl('s'));
+    assert_eq!(app.state.view, View::Devices);
+    assert!(app.state.sessions.is_empty(), "no device was opened");
+    app.shutdown();
+}
+
+#[test]
+fn an_ordinary_ctrl_bracket_byte_switches_the_view() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use serial_nexus_terminal::input::translate;
+
+    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let device = SimulatedDevice::new();
+    let mut app = app(&socket);
+    app.open_path(&device.path, Some(115_200)).expect("open");
+    assert_eq!(app.state.view, View::Stream);
+
+    // What a plain terminal delivers for the 0x1d byte, and what the enhanced
+    // protocol delivers, both route through the same translation.
+    for char in ['5', ']'] {
+        let key =
+            translate(KeyEvent::new(KeyCode::Char(char), KeyModifiers::CONTROL)).expect("a key");
+        app.handle_key(key);
+        assert_eq!(app.state.view, View::Devices, "Ctrl+{char} is Ctrl+]");
+        app.handle_key(Key::Ctrl(']'));
+        assert_eq!(app.state.view, View::Stream);
+    }
+    app.shutdown();
+}
+
+#[test]
+fn opening_settings_does_not_move_typing_to_another_attached_device() {
+    use ratatui::layout::Rect;
+    use serial_nexus_terminal::render::sidebar;
+
+    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let first = SimulatedDevice::new();
+    let second = SimulatedDevice::new();
+    let mut app = app(&socket);
+    app.open_path(&first.path, Some(115_200))
+        .expect("open first");
+    app.open_path(&second.path, Some(115_200))
+        .expect("open second");
+    // Both sessions are listed as open devices, sorted by path.
+    app.state.set_devices(Vec::new());
+    app.handle_key(Key::Ctrl(']'));
+    let sidebar = sidebar(Rect::new(0, 0, 100, 16)).expect("sidebar");
+    // Click the first row, then open Settings from the button.
+    app.handle_click(Rect::new(0, 0, 100, 16), sidebar.list.x, sidebar.list.y);
+    let selected = app.state.selected;
+    app.state.select_settings_button();
+    app.handle_key(Key::Enter);
+    app.handle_key(Key::Esc);
+    assert_eq!(app.state.selected, selected, "the device row is restored");
+
+    // Ctrl+] with the Settings button selected still opens the attached
+    // device's stream rather than complaining.
+    app.state.select_settings_button();
+    app.handle_key(Key::Ctrl(']'));
+    assert_eq!(app.state.view, View::Stream);
+    assert!(app.state.selected_session().is_some());
+
+    app.shutdown();
+}

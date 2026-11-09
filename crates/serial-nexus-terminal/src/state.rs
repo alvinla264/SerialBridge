@@ -225,9 +225,10 @@ impl AppState {
         self.settings_row = 0;
         // Coming from the Settings button itself, fall back to the last device
         // row, so leaving the settings lands on a device.
-        self.selection_before_settings = self
-            .last_device_selection
-            .min(self.devices.len().saturating_sub(1));
+        // Opening the settings abandons a baud prompt: the settings keys would
+        // otherwise reach the hidden prompt.
+        self.prompt = None;
+        self.selection_before_settings = self.last_device_index();
         self.view = View::Settings;
         self.notice = None;
     }
@@ -247,9 +248,7 @@ impl AppState {
     fn leave_settings(&mut self) {
         // The Settings button is not a device: go back to the row the settings
         // were opened from, so Ctrl+] still has a device to show.
-        self.selected = self
-            .selection_before_settings
-            .min(self.devices.len().saturating_sub(1));
+        self.select_index(self.selection_before_settings);
         self.view = View::Devices;
     }
 
@@ -312,35 +311,39 @@ impl AppState {
         self.sessions.get_mut(&id)
     }
 
-    /// Move the sidebar selection over the devices and the Settings button,
-    /// which is the row just past the last device.
-    pub fn select_delta(&mut self, delta: i32) {
-        let last = self.devices.len();
-        let next = self.selected as i32 + delta;
-        self.selected = next.clamp(0, last as i32) as usize;
-        self.remember_device_row();
-    }
-
-    /// Keep the last device row that was selected.
-    fn remember_device_row(&mut self) {
+    /// Select one sidebar row, keeping the last device row for when the
+    /// Settings button is left. Every selection change goes through here.
+    pub fn select_index(&mut self, index: usize) {
+        self.selected = index.min(self.devices.len());
         if self.selected < self.devices.len() {
             self.last_device_selection = self.selected;
         }
     }
 
+    /// Move the sidebar selection over the devices and the Settings button,
+    /// which is the row just past the last device.
+    pub fn select_delta(&mut self, delta: i32) {
+        let last = self.devices.len();
+        let next = self.selected as i32 + delta;
+        self.select_index(next.clamp(0, last as i32) as usize);
+    }
+
+    /// The last device row that was selected.
+    pub fn last_device_index(&self) -> usize {
+        self.last_device_selection
+            .min(self.devices.len().saturating_sub(1))
+    }
+
     /// Point the sidebar selection at the Settings button.
     pub fn select_settings_button(&mut self) {
-        self.selected = self.devices.len();
+        self.select_index(self.devices.len());
     }
 
     pub fn select_path(&mut self, path: &str) -> bool {
         self.devices
             .iter()
             .position(|device| device.path == path)
-            .map(|index| {
-                self.selected = index;
-                self.remember_device_row();
-            })
+            .map(|index| self.select_index(index))
             .is_some()
     }
 
@@ -379,17 +382,16 @@ impl AppState {
         self.devices = devices;
         if let Some(path) = selected_path {
             if let Some(index) = self.devices.iter().position(|device| device.path == path) {
-                self.selected = index;
+                self.select_index(index);
                 return;
             }
         }
         // The Settings button stays selected when it was; otherwise a row that
         // disappeared falls back to the last device.
-        self.selected = self.selected.min(self.devices.len());
         self.last_device_selection = self
             .last_device_selection
             .min(self.devices.len().saturating_sub(1));
-        self.remember_device_row();
+        self.select_index(self.selected);
     }
 
     /// Add a freshly opened session and point the sidebar at it. The screen
@@ -434,8 +436,7 @@ impl AppState {
                 .sort_by(|left, right| left.path.cmp(&right.path));
         }
         if let Some(index) = self.devices.iter().position(|device| device.path == path) {
-            self.selected = index;
-            self.remember_device_row();
+            self.select_index(index);
         }
     }
 

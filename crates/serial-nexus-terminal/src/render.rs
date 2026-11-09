@@ -96,15 +96,28 @@ pub fn settings_button(area: Rect) -> Option<Rect> {
     sidebar(area).map(|sidebar| sidebar.button)
 }
 
-/// The settings rows: a title, the rows, and the key hints.
+/// The settings rows: a title, the rows, and (when there is room) the key
+/// hints. A short terminal drops the hints rather than a flag: both flags stay
+/// visible down to a three-row area.
 pub fn settings_rows(area: Rect) -> Option<(Rect, Rect, Rect)> {
     let main = chrome(area).main;
-    if main.height < 3 || main.width < 8 {
+    if main.height < 2 || main.width < 8 {
         return None;
     }
+    let hint_height = if main.height >= 4 { 1 } else { 0 };
     let title = Rect::new(main.x, main.y, main.width, 1);
-    let hints = Rect::new(main.x, main.y + main.height - 1, main.width, 1);
-    let rows = Rect::new(main.x, main.y + 1, main.width, main.height - 2);
+    let hints = Rect::new(
+        main.x,
+        main.y + main.height - hint_height,
+        main.width,
+        hint_height,
+    );
+    let rows = Rect::new(
+        main.x,
+        main.y + 1,
+        main.width,
+        main.height - 1 - hint_height,
+    );
     Some((title, rows, hints))
 }
 
@@ -326,8 +339,16 @@ fn draw_settings(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u
             .bg(RColor::Cyan)
             .add_modifier(Modifier::BOLD),
     );
-    for row in 0..SETTINGS_ROWS {
-        if row as u16 >= rows.height {
+    // Scroll only if the flags cannot all fit; the selected one stays visible.
+    let visible = rows.height.max(1) as usize;
+    let last_first = SETTINGS_ROWS.saturating_sub(visible);
+    let first = state
+        .settings_row
+        .min(SETTINGS_ROWS - 1)
+        .saturating_sub(visible.saturating_sub(1))
+        .min(last_first);
+    for row in first..SETTINGS_ROWS {
+        if row - first >= visible {
             break;
         }
         let name = AppState::settings_row_name(row).unwrap_or_default();
@@ -336,7 +357,7 @@ fn draw_settings(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u
             _ => "off",
         };
         let selected = row == state.settings_row;
-        let line = Rect::new(rows.x, rows.y + row as u16, rows.width, 1);
+        let line = Rect::new(rows.x, rows.y + (row - first) as u16, rows.width, 1);
         draw_row(
             buffer,
             line,
@@ -759,6 +780,30 @@ mod tests {
         state.settings_row = 1;
         let cursor = render(&state, &mut buffer, area).expect("cursor");
         assert_eq!(cursor.1, rows.y + 1);
+    }
+
+    #[test]
+    fn a_short_settings_view_still_shows_both_flags() {
+        let mut state = demo();
+        state.begin_settings();
+        state.settings_row = 1;
+        let lines = screen(&state, 80, 6);
+        let text = lines.join("\n");
+        assert!(text.contains("Local echo"), "{text}");
+        assert!(text.contains("Scrollback"), "{text}");
+        let area = Rect::new(0, 0, 80, 6);
+        let mut buffer = Buffer::empty(area);
+        let cursor = render(&state, &mut buffer, area).expect("cursor");
+        let (_, rows, _) = settings_rows(area).unwrap();
+        assert!(
+            cursor.1 >= rows.y && cursor.1 < rows.y + rows.height,
+            "the cursor stays on a flag row, not the hints: {cursor:?}"
+        );
+        assert!(
+            lines[cursor.1 as usize].contains("Scrollback"),
+            "the cursor row is the selected flag: {:?}",
+            lines[cursor.1 as usize]
+        );
     }
 
     #[test]
