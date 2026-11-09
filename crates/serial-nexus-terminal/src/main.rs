@@ -3,8 +3,11 @@
 use std::io;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 use serial_nexus_client::{Client, ClientConfig, ClientInfo};
 use serial_nexus_terminal::app::App;
@@ -67,14 +70,18 @@ fn event_loop(
     app: &mut App,
 ) -> io::Result<()> {
     let mut last_refresh = Instant::now();
+    let mut last_area = Rect::default();
     loop {
         app.pump();
         terminal.draw(|frame| {
             let area = frame.area();
+            last_area = area;
             if let Some(body) = stream_body_area(area) {
                 app.resize_stream(body.height as usize, body.width as usize);
             }
-            render(&app.state, frame.buffer_mut(), area);
+            if let Some((x, y)) = render(&app.state, frame.buffer_mut(), area) {
+                frame.set_cursor_position((x, y));
+            }
         })?;
         if app.state.quit {
             return Ok(());
@@ -86,6 +93,7 @@ fn event_loop(
                         app.handle_key(key);
                     }
                 }
+                event::Event::Mouse(mouse) => handle_mouse(app, last_area, mouse),
                 event::Event::Resize(_, _) => terminal.autoresize()?,
                 _ => {}
             }
@@ -94,6 +102,14 @@ fn event_loop(
             app.refresh_devices();
             last_refresh = Instant::now();
         }
+    }
+}
+
+/// A click on a device row selects it; a click on the sidebar's Settings
+/// button opens the settings, just as Enter does.
+fn handle_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
+    if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+        app.handle_click(area, mouse.column, mouse.row);
     }
 }
 

@@ -1,5 +1,9 @@
 //! Drawing the TUI into a ratatui buffer. No terminal is involved, so the
 //! render seam is tested by inspecting the buffer.
+//!
+//! One layout function decides where everything sits, including the cells the
+//! mouse can click, so drawing, resizing the stream screen and hit testing
+//! always agree.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -7,25 +11,16 @@ use ratatui::style::{Color as RColor, Modifier, Style as RStyle};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::screen::{Color, Style};
-use crate::state::{AppState, Focus, Overlay, Severity, SETTINGS_ROWS};
+use crate::state::{AppState, Severity, View, SETTINGS_ROWS};
 
-/// Where each part of the interface sits. One place computes it, so the keys
-/// that resize the stream screen and the drawing always agree.
+/// Where each part of the interface sits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Chrome {
     pub header: Rect,
-    /// The sidebar and stream panes, when the terminal is tall enough.
-    pub main: Option<MainPanes>,
+    /// The area the stream view, the sidebar or the settings use.
+    pub main: Rect,
     /// One or two rows at the bottom: the status line and the key hints.
     pub footer: Rect,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MainPanes {
-    pub sidebar: Rect,
-    pub stream: Rect,
-    /// The stream's drawing area, below its title line.
-    pub stream_body: Option<Rect>,
 }
 
 /// Compute the layout for `area`. Zero-height rects mean "not drawn".
@@ -34,7 +29,7 @@ pub fn chrome(area: Rect) -> Chrome {
         let empty = Rect::new(area.x, area.y, 0, 0);
         return Chrome {
             header: empty,
-            main: None,
+            main: empty,
             footer: empty,
         };
     }
@@ -45,6 +40,7 @@ pub fn chrome(area: Rect) -> Chrome {
         _ => 2,
     };
     let main_height = area.height.saturating_sub(1 + footer_height);
+    let main = Rect::new(area.x, area.y + 1, area.width, main_height);
     let footer = if footer_height == 0 {
         Rect::new(area.x, area.y + 1, area.width, 0)
     } else {
@@ -55,11 +51,6 @@ pub fn chrome(area: Rect) -> Chrome {
             footer_height,
         )
     };
-    let main = if main_height == 0 {
-        None
-    } else {
-        panes(Rect::new(area.x, area.y + 1, area.width, main_height))
-    };
     Chrome {
         header,
         main,
@@ -67,68 +58,114 @@ pub fn chrome(area: Rect) -> Chrome {
     }
 }
 
-/// Split a main area into a sidebar, a separator and the stream.
-fn panes(area: Rect) -> Option<MainPanes> {
-    if area.width < 20 || area.height == 0 {
+/// The stream's drawing area. The sidebar hides while the stream is shown, so
+/// the stream gets the whole main area; sessions are sized to it even when
+/// another view is on screen.
+pub fn stream_body_area(area: Rect) -> Option<Rect> {
+    let main = chrome(area).main;
+    (main.width > 0 && main.height > 0).then_some(main)
+}
+
+/// The sidebar's rows: a title, the device list, and the Settings button.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sidebar {
+    pub title: Rect,
+    pub list: Rect,
+    pub button: Rect,
+}
+
+/// Where the sidebar puts its parts, or `None` when there is no room.
+pub fn sidebar(area: Rect) -> Option<Sidebar> {
+    let main = chrome(area).main;
+    if main.height < 2 || main.width < 8 {
         return None;
     }
-    // The sidebar gives way first: the stream keeps at least 12 columns.
-    let sidebar_width = (area.width / 3).clamp(14, 30).min(area.width - 13);
-    if sidebar_width < 6 {
-        return None;
-    }
-    let sidebar = Rect::new(area.x, area.y, sidebar_width, area.height);
-    let stream = Rect::new(
-        area.x + sidebar_width + 1,
-        area.y,
-        area.width - sidebar_width - 1,
-        area.height,
-    );
-    let stream_body = (stream.height > 1 && stream.width > 0)
-        .then(|| Rect::new(stream.x, stream.y + 1, stream.width, stream.height - 1));
-    Some(MainPanes {
-        sidebar,
-        stream,
-        stream_body,
+    let title = Rect::new(main.x, main.y, main.width, 1);
+    let button = Rect::new(main.x, main.y + main.height - 1, main.width, 1);
+    let list_height = main.height - 2;
+    let list = Rect::new(main.x, main.y + 1, main.width, list_height);
+    Some(Sidebar {
+        title,
+        list,
+        button,
     })
 }
 
-/// Draw the whole UI into `buffer`, using `area` as the screen.
-pub fn render(state: &AppState, buffer: &mut Buffer, area: Rect) {
-    buffer.reset();
-    let chrome = chrome(area);
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    draw_header(state, buffer, chrome.header);
-    if let Some(main) = chrome.main {
-        draw_sidebar(state, buffer, main.sidebar);
-        // Separator.
-        for y in main.sidebar.y..main.sidebar.y + main.sidebar.height {
-            put(
-                buffer,
-                Rect::new(main.sidebar.right(), y, 1, 1),
-                0,
-                "│",
-                dim(),
-            );
-        }
-        draw_stream(state, buffer, main.stream);
-    }
-    draw_footer(state, buffer, chrome.footer);
-    draw_overlay(state, buffer, area);
+/// The Settings button's row, for the mouse and for tests.
+pub fn settings_button(area: Rect) -> Option<Rect> {
+    sidebar(area).map(|sidebar| sidebar.button)
 }
 
-/// The inner area of the stream pane (below its title line), if it is drawn.
-pub fn stream_body_area(area: Rect) -> Option<Rect> {
-    chrome(area).main.and_then(|main| main.stream_body)
+/// The settings rows: a title, the rows, and the key hints.
+pub fn settings_rows(area: Rect) -> Option<(Rect, Rect, Rect)> {
+    let main = chrome(area).main;
+    if main.height < 3 || main.width < 8 {
+        return None;
+    }
+    let title = Rect::new(main.x, main.y, main.width, 1);
+    let hints = Rect::new(main.x, main.y + main.height - 1, main.width, 1);
+    let rows = Rect::new(main.x, main.y + 1, main.width, main.height - 2);
+    Some((title, rows, hints))
+}
+
+/// What a click in the sidebar landed on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hit {
+    Device(usize),
+    Settings,
+}
+
+/// Hit test one click against the sidebar as it is drawn.
+pub fn hit_test(state: &AppState, area: Rect, column: u16, row: u16) -> Option<Hit> {
+    let sidebar = sidebar(area)?;
+    if in_rect(sidebar.button, column, row) {
+        return Some(Hit::Settings);
+    }
+    let list = sidebar.list;
+    if list.height == 0 || !in_rect(list, column, row) {
+        return None;
+    }
+    let index = (row - list.y) as usize + first_device_row(state, sidebar);
+    (index < state.devices.len()).then_some(Hit::Device(index))
+}
+
+/// The first device index the list shows, so the selection stays in view.
+fn first_device_row(state: &AppState, sidebar: Sidebar) -> usize {
+    let capacity = sidebar.list.height.max(1) as usize;
+    if state.selected >= capacity {
+        state.selected + 1 - capacity
+    } else {
+        0
+    }
+}
+
+fn in_rect(rect: Rect, column: u16, row: u16) -> bool {
+    column >= rect.x && column < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+}
+
+/// Draw the whole UI into `buffer`, using `area` as the screen, and return
+/// where the terminal cursor goes.
+pub fn render(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16, u16)> {
+    buffer.reset();
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    let chrome = chrome(area);
+    draw_header(state, buffer, chrome.header);
+    let cursor = match state.view {
+        View::Stream => draw_stream(state, buffer, chrome.main),
+        View::Devices => draw_sidebar(state, buffer, area),
+        View::Settings => draw_settings(state, buffer, area),
+    };
+    draw_footer(state, buffer, chrome.footer);
+    cursor
 }
 
 fn draw_header(state: &AppState, buffer: &mut Buffer, area: Rect) {
     if area.height == 0 {
         return;
     }
-    let device = state.selected_device();
+    let device = state.shown_device();
     let path = device
         .map(|device| device.path.as_str())
         .unwrap_or("no device selected");
@@ -146,17 +183,16 @@ fn draw_header(state: &AppState, buffer: &mut Buffer, area: Rect) {
     } else {
         "detached"
     };
-    let focus = match state.focus {
-        Focus::Devices => "devices",
-        Focus::Stream => "stream",
+    let view = match state.view {
+        View::Devices => "sidebar",
+        View::Stream => "stream",
+        View::Settings => "settings",
     };
 
     let brand = " SerialNexus ";
     let brand_width = display_width(brand);
     let details = format!("  {path}  {baud} baud  AI control: {control}  [{attached}]");
-    // The focus hint only appears when it leaves the brand and the device
-    // name room; otherwise the whole header is theirs.
-    let right = format!("focus: {focus} ");
+    let right = format!("{view} ");
     let right_width = display_width(&right);
     let hint_fits = area.width.saturating_sub(right_width) >= brand_width + display_width(&details);
     let left_width = if hint_fits {
@@ -193,55 +229,43 @@ fn draw_header(state: &AppState, buffer: &mut Buffer, area: Rect) {
     }
 }
 
-fn draw_sidebar(state: &AppState, buffer: &mut Buffer, area: Rect) {
-    let focused = state.focus == Focus::Devices && state.overlay.is_none();
-    let title_style = if focused {
-        RStyle::default()
-            .fg(RColor::Black)
-            .bg(RColor::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        dim()
-    };
+/// The sidebar: every device, then the Settings button, then room for more
+/// devices than fit.
+fn draw_sidebar(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16, u16)> {
+    let sidebar = sidebar(area)?;
     let title = format!(" Devices ({}) ", state.devices.len());
-    put(
-        buffer,
-        Rect::new(area.x, area.y, area.width, 1),
-        0,
-        &title,
-        title_style,
-    );
+    let title_style = RStyle::default()
+        .fg(RColor::Black)
+        .bg(RColor::Cyan)
+        .add_modifier(Modifier::BOLD);
+    put(buffer, sidebar.title, 0, &title, title_style);
 
-    // Keep the selected row visible when there are more devices than rows.
-    let capacity = (area.height.saturating_sub(1) / 2).max(1) as usize;
-    let start = if state.selected >= capacity {
-        state.selected + 1 - capacity
-    } else {
-        0
-    };
-    let mut y = area.y + 1;
-    if state.devices.is_empty() {
+    let list = sidebar.list;
+    if state.devices.is_empty() && list.height > 0 {
         put(
             buffer,
-            Rect::new(area.x, y, area.width, 1),
+            list,
             1,
-            "no serial devices",
+            "no serial devices — is the core running?",
             dim(),
         );
-        return;
     }
-    for (index, device) in state.devices.iter().enumerate().skip(start) {
-        if y >= area.y + area.height {
+    let first = first_device_row(state, sidebar);
+    for (offset, (index, device)) in state.devices.iter().enumerate().skip(first).enumerate() {
+        if offset >= list.height as usize {
             break;
         }
+        let y = list.y + offset as u16;
+        let row = Rect::new(list.x, y, list.width, 1);
         let selected = index == state.selected;
+        let marker = if selected { "›" } else { " " };
+        let dot = if device.open { "●" } else { "○" };
+        let label = format!("{marker} {dot} {}", device.path);
         let attached = state
             .sessions
             .values()
             .any(|session| session.path == device.path);
-        let marker = if selected { "›" } else { " " };
-        let dot = if device.open { "●" } else { "○" };
-        let status = if attached {
+        let mut status = if attached {
             format!(
                 "open {}",
                 device.baud.map(|b| b.to_string()).unwrap_or_default()
@@ -254,106 +278,125 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, area: Rect) {
         } else {
             "closed".to_string()
         };
-        let label = format!("{marker} {dot} {}", device.path);
-        let style = if selected {
-            RStyle::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
-        } else {
-            RStyle::default()
-        };
-        put(
-            buffer,
-            Rect::new(area.x, y, area.width, 1),
-            0,
-            &label,
-            style,
-        );
-        y += 1;
-        if y < area.y + area.height {
-            let mut details = format!("   {status}");
-            if let Some(control) = &device.control {
-                details.push_str(&format!(" · AI: {control}"));
-            }
-            if let Some(description) = &device.description {
-                details.push_str(&format!(" · {description}"));
-            }
-            put(
-                buffer,
-                Rect::new(area.x, y, area.width, 1),
-                0,
-                &details,
-                dim(),
-            );
-            y += 1;
+        if let Some(control) = &device.control {
+            status.push_str(&format!(" · AI: {control}"));
         }
+        if let Some(description) = &device.description {
+            status.push_str(&format!(" · {description}"));
+        }
+        draw_row(buffer, row, &label, &status, highlighted(selected));
+    }
+
+    // The Settings button is a real row: selected with the arrow keys and
+    // clickable with the mouse.
+    let selected = state.settings_button_selected();
+    let button = sidebar.button;
+    let style = if selected {
+        highlighted(true)
+    } else {
+        RStyle::default().fg(RColor::Cyan)
+    };
+    draw_row(
+        buffer,
+        button,
+        &format!("{} [ Settings ]", if selected { "›" } else { " " }),
+        "Enter opens",
+        style,
+    );
+
+    if selected {
+        Some((button.x + 1, button.y))
+    } else {
+        // The selected device row, which the list has kept in view.
+        let offset = state.selected.saturating_sub(first) as u16;
+        Some((list.x + 1, list.y + offset))
     }
 }
 
-fn draw_stream(state: &AppState, buffer: &mut Buffer, area: Rect) {
-    let focused = state.focus == Focus::Stream && state.overlay.is_none();
-    let title_style = if focused {
+/// The settings view in the terminal area: the two flags, edited as a draft.
+fn draw_settings(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16, u16)> {
+    let (title, rows, hints) = settings_rows(area)?;
+    put(
+        buffer,
+        title,
+        0,
+        " Settings ",
         RStyle::default()
             .fg(RColor::Black)
             .bg(RColor::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        dim()
-    };
-    let (title, right) = match state.selected_session() {
-        Some(session) => (
-            format!(" Stream · {} · {} baud ", session.path, session.baud),
-            format!(
-                "AI control: {} ",
-                session.control.as_deref().unwrap_or("none")
-            ),
-        ),
-        None => (" Stream ".to_string(), String::new()),
-    };
-    put(
-        buffer,
-        Rect::new(area.x, area.y, area.width, 1),
-        0,
-        &title,
-        title_style,
+            .add_modifier(Modifier::BOLD),
     );
-    let right_width = display_width(&right);
-    if area.width > right_width + display_width(&title) {
-        put(
+    for row in 0..SETTINGS_ROWS {
+        if row as u16 >= rows.height {
+            break;
+        }
+        let name = AppState::settings_row_name(row).unwrap_or_default();
+        let value = match state.draft_value(row) {
+            Some(true) => "on",
+            _ => "off",
+        };
+        let selected = row == state.settings_row;
+        let line = Rect::new(rows.x, rows.y + row as u16, rows.width, 1);
+        draw_row(
             buffer,
-            Rect::new(area.x + area.width - right_width, area.y, right_width, 1),
-            0,
-            &right,
-            dim(),
+            line,
+            &format!("{} {name}", if selected { "▸" } else { " " }),
+            value,
+            highlighted(selected),
         );
     }
-    if area.height <= 1 {
-        return;
-    }
+    put(
+        buffer,
+        hints,
+        0,
+        " Local echo and scrollback · Ctrl+S save · Esc cancel ",
+        dim(),
+    );
 
-    let body = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
+    let row = state.settings_row.min(SETTINGS_ROWS - 1);
+    let value = match state.draft_value(row) {
+        Some(true) => "on",
+        _ => "off",
+    };
+    // The cursor sits where the value is drawn, right-aligned at the edge.
+    let value_column = rows.width.saturating_sub(display_width(value));
+    Some((rows.x + value_column, rows.y + row as u16))
+}
+
+fn draw_stream(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16, u16)> {
+    if area.height == 0 || area.width == 0 {
+        return None;
+    }
     let Some(session) = state.selected_session() else {
         put(
             buffer,
-            body,
+            area,
             1,
-            "Select a device in the sidebar and press Enter to open or join it. F1 lists the keys.",
+            "Select a device in the sidebar and press Enter to open or join it.",
             dim(),
         );
-        return;
+        return Some((area.x + 1, area.y));
     };
-    for row in 0..body.height as usize {
-        let y = body.y + row as u16;
-        for col in 0..body.width as usize {
+    for row in 0..area.height as usize {
+        let y = area.y + row as u16;
+        for col in 0..area.width as usize {
             let cell = session.screen.cell(row, col);
             let symbol = cell.ch.to_string();
             put_cell(
                 buffer,
-                body.x + col as u16,
+                area.x + col as u16,
                 y,
                 &symbol,
                 screen_style(cell.style),
             );
         }
     }
+    // The device's own cursor, so typing happens where the device expects it.
+    let (row, col) = session.screen.cursor();
+    Some((
+        area.x + col.min(area.width.saturating_sub(1) as usize) as u16,
+        area.y + row.min(area.height.saturating_sub(1) as usize) as u16,
+    ))
 }
 
 fn draw_footer(state: &AppState, buffer: &mut Buffer, area: Rect) {
@@ -361,15 +404,10 @@ fn draw_footer(state: &AppState, buffer: &mut Buffer, area: Rect) {
         return;
     }
     let status = Rect::new(area.x, area.y, area.width, 1);
-    let hints = if area.height > 1 {
-        Some(Rect::new(area.x, area.y + 1, area.width, 1))
-    } else {
-        None
-    };
+    let hints = (area.height > 1).then(|| Rect::new(area.x, area.y + 1, area.width, 1));
     let status_drawn = draw_status(state, buffer, status);
     match hints {
         Some(hints) => draw_hints(state, buffer, hints),
-        // One row: a prompt or notice matters more than the key hints.
         None if !status_drawn => draw_hints(state, buffer, status),
         None => {}
     }
@@ -414,240 +452,81 @@ fn draw_status(state: &AppState, buffer: &mut Buffer, area: Rect) -> bool {
 }
 
 fn draw_hints(state: &AppState, buffer: &mut Buffer, area: Rect) {
-    let hints = match state.focus {
-        Focus::Devices => {
-            " Tab switch · ↑/↓ select · Enter open/join · b baud · d disconnect · F1 help · F2 settings "
+    let hints = match state.view {
+        View::Devices => {
+            " ↑/↓ select · Enter open/join · b baud · d disconnect · Ctrl+] stream · Ctrl+Q quit "
         }
-        Focus::Stream => {
-            " Typing sends to the device · Tab switch · F1 help · F2 settings · Ctrl+Q quit "
+        View::Stream => {
+            " Typing goes to the device (Tab and Ctrl+Q too) · Ctrl+] back to the sidebar "
         }
+        View::Settings => " Ctrl+S save · Esc cancel · Tab/↑↓ move · Space toggle ",
     };
     put(buffer, area, 0, hints, dim());
 }
 
-/// One line of a panel: a label on the left, an optional value kept at the
-/// right edge, and whether it is the selected row.
-struct PanelRow {
-    label: String,
-    value: String,
-    style: RStyle,
-    selected: bool,
-}
-
-/// How the visible rows are chosen when the list is taller than the box.
-enum PanelScroll {
-    /// Show the list from this row (the help list).
-    First(usize),
-    /// Scroll so this row stays visible (the selected setting).
-    KeepInView(usize),
-}
-
-/// One centred panel over everything else.
-fn draw_overlay(state: &AppState, buffer: &mut Buffer, area: Rect) {
-    match state.overlay {
-        Some(Overlay::Help) => {
-            let mut rows: Vec<PanelRow> = HELP
-                .iter()
-                .map(|(key, what)| PanelRow {
-                    label: format!("{key:<12} {what}"),
-                    value: String::new(),
-                    style: RStyle::default(),
-                    selected: false,
-                })
-                .collect();
-            rows.push(PanelRow {
-                label: "↑/↓ scrolls this list".to_string(),
-                value: String::new(),
-                style: dim(),
-                selected: false,
-            });
-            draw_panel(
-                buffer,
-                area,
-                "Keys",
-                &rows,
-                PanelScroll::First(state.help_offset),
-            );
-        }
-        Some(Overlay::Settings) => {
-            let mut rows: Vec<PanelRow> = (0..SETTINGS_ROWS)
-                .map(|row| {
-                    let name = AppState::settings_row_name(row).unwrap_or_default();
-                    let selected = row == state.settings_row;
-                    PanelRow {
-                        label: format!("{} {name}", if selected { "▸" } else { " " }),
-                        value: match state.settings_value(row) {
-                            Some(true) => "on".to_string(),
-                            _ => "off".to_string(),
-                        },
-                        style: if selected {
-                            RStyle::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
-                        } else {
-                            RStyle::default()
-                        },
-                        selected,
-                    }
-                })
-                .collect();
-            rows.push(PanelRow {
-                label: "Esc closes · Space toggles".to_string(),
-                value: String::new(),
-                style: dim(),
-                selected: false,
-            });
-            let selected = rows.iter().position(|row| row.selected).unwrap_or(0);
-            draw_panel(
-                buffer,
-                area,
-                "Settings",
-                &rows,
-                PanelScroll::KeepInView(selected),
-            );
-        }
-        None => {}
-    }
-}
-
-/// How many key rows the help panel has, for bounding its scroll position.
-pub fn help_rows() -> usize {
-    HELP.len()
-}
-
-/// The keys the help panel lists: what each one does.
-const HELP: [(&str, &str); 10] = [
-    ("Esc", "close this panel"),
-    ("Tab", "switch between devices and stream"),
-    ("↑/↓ j/k", "select a device, or a setting"),
-    ("Enter / o", "open or join the selected device"),
-    ("b", "open at a chosen baud rate"),
-    ("d", "disconnect the selected device"),
-    ("Space", "toggle the selected setting"),
-    ("F1", "this help"),
-    ("F2", "settings"),
-    ("Ctrl+Q", "quit"),
-];
-
-fn draw_panel(
-    buffer: &mut Buffer,
-    area: Rect,
-    title: &str,
-    rows: &[PanelRow],
-    scroll: PanelScroll,
-) {
-    // Too small for a box: one line still says the panel is open, so its keys
-    // are never swallowed silently.
-    if area.width < 12 || area.height < 4 {
-        // The way out comes first, so it survives a narrow terminal.
-        let text = fit(&format!(" Esc closes · {title} "), area.width as usize);
-        put(
-            buffer,
-            area,
-            0,
-            &text,
-            RStyle::default()
-                .fg(RColor::Black)
-                .bg(RColor::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+/// One sidebar or settings row: a label on the left, a value kept at the
+/// right edge, and the selection style.
+fn draw_row(buffer: &mut Buffer, area: Rect, label: &str, value: &str, style: RStyle) {
+    if area.height == 0 || area.width == 0 {
         return;
     }
-    let content_width = rows
-        .iter()
-        .map(|row| {
-            let mut width = display_width(&row.label) as usize;
-            if !row.value.is_empty() {
-                width += 1 + display_width(&row.value) as usize;
-            }
-            width
-        })
-        .max()
-        .unwrap_or(0)
-        .max(display_width(title) as usize);
-    let width = ((content_width + 4) as u16).min(area.width);
-    let height = ((rows.len() + 2) as u16).min(area.height);
-    if width < 8 || height < 4 {
-        return;
-    }
-    let x = area.x + (area.width - width) / 2;
-    let y = area.y + (area.height - height) / 2;
-    let inner = (width - 2) as usize;
-    let border = RStyle::default()
-        .fg(RColor::Cyan)
-        .add_modifier(Modifier::BOLD);
-
-    // A blank panel hides whatever it covers.
-    for row in 0..height {
-        put(
-            buffer,
-            Rect::new(x, y + row, width, 1),
-            0,
-            &" ".repeat(width as usize),
-            RStyle::default(),
-        );
-    }
-
-    // The title gives way to a narrow box instead of pushing the border off.
-    let title = clip(title, inner.saturating_sub(4));
-    let top = format!(
-        "┌─ {} {}┐",
-        title,
-        "─".repeat(inner.saturating_sub(display_width(&title) as usize + 3))
-    );
-    put(buffer, Rect::new(x, y, width, 1), 0, &top, border);
-
-    // When the box is shorter than the list it scrolls, and the stored
-    // position is clamped to the rows that exist.
-    let visible = (height - 2) as usize;
-    let last_first = rows.len().saturating_sub(visible);
-    let first = match scroll {
-        PanelScroll::First(first) => first.min(last_first),
-        PanelScroll::KeepInView(row) => row
-            .saturating_sub(visible.saturating_sub(1))
-            .min(last_first),
-    };
-    for (offset, row) in rows.iter().skip(first).take(visible).enumerate() {
-        let mut line = String::from("│");
-        line.push_str(&fit_row(row, inner));
-        line.push('│');
-        put(
-            buffer,
-            Rect::new(x, y + 1 + offset as u16, width, 1),
-            0,
-            &line,
-            row.style,
-        );
-    }
-    let bottom = format!("└{}┘", "─".repeat(inner));
-    put(
-        buffer,
-        Rect::new(x, y + height - 1, width, 1),
-        0,
-        &bottom,
-        border,
-    );
+    let text = row_text(label, value, area.width as usize);
+    put(buffer, area, 0, &text, style);
 }
 
-/// A row as exactly `inner` columns. The label gives way before the value, so
-/// the state being changed is not the part that gets clipped.
-fn fit_row(row: &PanelRow, inner: usize) -> String {
-    let label = format!(" {}", row.label);
-    if row.value.is_empty() {
-        return fit(&label, inner);
+fn row_text(label: &str, value: &str, width: usize) -> String {
+    if value.is_empty() {
+        return fit(label, width);
     }
-    let value_width = display_width(&row.value) as usize;
-    let label_width = display_width(&label) as usize;
-    if label_width + value_width < inner {
-        let mut line = label;
-        line.push_str(&" ".repeat(inner - label_width - value_width));
-        line.push_str(&row.value);
-        return fit(&line, inner);
+    let label_width = display_width(label) as usize;
+    let value_width = display_width(value) as usize;
+    if label_width + value_width < width {
+        let mut line = label.to_string();
+        line.push_str(&" ".repeat(width - label_width - value_width));
+        line.push_str(value);
+        fit(&line, width)
+    } else {
+        // Too narrow for both: keep the value, clip the label.
+        let keep = width.saturating_sub(value_width + 1);
+        let mut line = fit(&clip(label, keep), keep);
+        line.push(' ');
+        line.push_str(value);
+        fit(&line, width)
     }
-    // Too narrow for both: keep the value, clip the label.
-    let keep = inner.saturating_sub(value_width + 1);
-    let mut line = fit(&clip(&label, keep), keep);
-    line.push(' ');
-    line.push_str(&row.value);
-    fit(&line, inner)
+}
+
+fn highlighted(selected: bool) -> RStyle {
+    if selected {
+        RStyle::default()
+            .fg(RColor::Cyan)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else {
+        RStyle::default()
+    }
+}
+
+fn put(buffer: &mut Buffer, area: Rect, offset: u16, text: &str, style: RStyle) {
+    let x = area.x + offset;
+    let width = area.width.saturating_sub(offset);
+    if area.height == 0 || width == 0 || x >= buffer.area.right() || area.y >= buffer.area.bottom()
+    {
+        return;
+    }
+    let width = width.min(buffer.area.right().saturating_sub(x));
+    buffer.set_stringn(x, area.y, text, width as usize, style);
+}
+
+fn put_cell(buffer: &mut Buffer, x: u16, y: u16, symbol: &str, style: RStyle) {
+    if x >= buffer.area.right() || y >= buffer.area.bottom() {
+        return;
+    }
+    let cell = &mut buffer[(x, y)];
+    cell.set_symbol(symbol);
+    cell.set_style(style);
+}
+
+fn dim() -> RStyle {
+    RStyle::default().add_modifier(Modifier::DIM)
 }
 
 /// One line as exactly `width` display columns: clipped if longer, padded if
@@ -677,30 +556,6 @@ fn clip(text: &str, width: usize) -> String {
 
 fn display_width(text: &str) -> u16 {
     UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16
-}
-
-fn put(buffer: &mut Buffer, area: Rect, offset: u16, text: &str, style: RStyle) {
-    let x = area.x + offset;
-    let width = area.width.saturating_sub(offset);
-    if area.height == 0 || width == 0 || x >= buffer.area.right() || area.y >= buffer.area.bottom()
-    {
-        return;
-    }
-    let width = width.min(buffer.area.right().saturating_sub(x));
-    buffer.set_stringn(x, area.y, text, width as usize, style);
-}
-
-fn put_cell(buffer: &mut Buffer, x: u16, y: u16, symbol: &str, style: RStyle) {
-    if x >= buffer.area.right() || y >= buffer.area.bottom() {
-        return;
-    }
-    let cell = &mut buffer[(x, y)];
-    cell.set_symbol(symbol);
-    cell.set_style(style);
-}
-
-fn dim() -> RStyle {
-    RStyle::default().add_modifier(Modifier::DIM)
 }
 
 fn screen_style(style: Style) -> RStyle {
@@ -738,10 +593,10 @@ fn to_ratatui(colour: Color) -> RColor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{AppState, DeviceEntry, Overlay};
+    use crate::state::{AppState, DeviceEntry, View};
     use serial_nexus_protocol::{Event, Source};
 
-    fn lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
+    fn screen(state: &AppState, width: u16, height: u16) -> Vec<String> {
         let area = Rect::new(0, 0, width, height);
         let mut buffer = Buffer::empty(area);
         render(state, &mut buffer, area);
@@ -756,7 +611,7 @@ mod tests {
             .collect()
     }
 
-    fn demo_state() -> AppState {
+    fn demo() -> AppState {
         let mut state = AppState::new(12, 40);
         let mut first = DeviceEntry::new("/dev/ttyUSB0");
         first.description = Some("FTDI adapter".into());
@@ -765,83 +620,191 @@ mod tests {
         second.device_id = Some(7);
         second.baud = Some(57_600);
         state.set_devices(vec![first, second]);
-        state.selected = 0;
         state.add_session(7, "/dev/ttyUSB1", 57_600, None);
         state.select_path("/dev/ttyUSB1");
         state
     }
 
     #[test]
-    fn sidebar_lists_devices_with_state() {
-        let state = demo_state();
-        let screen = lines(&state, 100, 16).join("\n");
-        assert!(screen.contains("/dev/ttyUSB0"), "{screen}");
-        assert!(screen.contains("/dev/ttyUSB1"), "{screen}");
-        assert!(screen.contains("closed"), "{screen}");
-        assert!(screen.contains("open 57600"), "{screen}");
-        assert!(screen.contains("FTDI adapter"), "{screen}");
+    fn the_sidebar_lists_devices_with_state_and_a_settings_button() {
+        let state = demo();
+        let text = screen(&state, 100, 16).join("\n");
+        assert!(text.contains("Devices (2)"), "{text}");
+        assert!(text.contains("/dev/ttyUSB0"), "{text}");
+        assert!(text.contains("/dev/ttyUSB1"), "{text}");
+        assert!(text.contains("closed"), "{text}");
+        assert!(text.contains("open 57600"), "{text}");
+        assert!(text.contains("FTDI adapter"), "{text}");
+        assert!(text.contains("[ Settings ]"), "{text}");
     }
 
     #[test]
-    fn header_shows_active_baud_control_and_attachment() {
-        let mut state = demo_state();
-        state.focus = Focus::Stream;
+    fn the_stream_hides_the_sidebar_and_uses_the_whole_width() {
+        let mut state = demo();
+        state.view = View::Stream;
+        state.apply_event(&Event::device_output(7, b"ready\r\n"));
+        state.apply_event(&Event::write(7, Source::Ai, b"AT+GMR\r\n"));
+        let area = Rect::new(0, 0, 100, 16);
+        let mut buffer = Buffer::empty(area);
+        render(&state, &mut buffer, area);
+        let text = screen(&state, 100, 16).join("\n");
+        assert!(
+            !text.contains("Devices ("),
+            "no sidebar in the stream: {text}"
+        );
+        assert!(text.contains("ready"), "{text}");
+        assert!(text.contains("AT+GMR"), "{text}");
+        // The stream starts at the left edge, not after a sidebar.
+        assert_eq!(buffer[(0, 1)].symbol(), "r");
+        assert_eq!(chrome(area).main.height, 13, "header and footer only");
+    }
+
+    #[test]
+    fn the_header_names_the_device_and_the_view() {
+        let mut state = demo();
         state.sessions.get_mut(&7).unwrap().control = Some("claude".into());
-        let header = &lines(&state, 100, 16)[0];
+        let header = &screen(&state, 100, 16)[0];
         assert!(header.contains("/dev/ttyUSB1"), "{header}");
         assert!(header.contains("57600 baud"), "{header}");
         assert!(header.contains("AI control: claude"), "{header}");
         assert!(header.contains("attached"), "{header}");
-        assert!(header.contains("focus: stream"), "{header}");
+        assert!(header.contains("sidebar"), "{header}");
+
+        state.view = View::Stream;
+        assert!(screen(&state, 100, 16)[0].contains("stream"));
     }
 
     #[test]
-    fn stream_shows_device_output_and_ai_writes_but_not_human_writes() {
-        let mut state = demo_state();
-        state.apply_event(&Event::device_output(7, b"ready\r\n"));
-        state.apply_event(&Event::write(7, Source::Ai, b"AT+GMR\r\n"));
-        state.apply_event(&Event::write(7, Source::Human, b"secret-typing"));
-        let screen = lines(&state, 100, 16).join("\n");
-        assert!(screen.contains("ready"), "{screen}");
-        assert!(screen.contains("AT+GMR"), "{screen}");
-        assert!(!screen.contains("[AI]"), "{screen}");
-        assert!(!screen.contains("secret-typing"), "{screen}");
+    fn the_cursor_sits_on_the_device_cursor_in_the_stream() {
+        let mut state = demo();
+        state.view = View::Stream;
+        state.apply_event(&Event::device_output(7, b"boot> "));
+        let area = Rect::new(0, 0, 100, 16);
+        let mut buffer = Buffer::empty(area);
+        let cursor = render(&state, &mut buffer, area);
+        assert_eq!(cursor, Some((6, 1)), "six columns along the first row");
     }
 
     #[test]
-    fn unplug_notice_is_in_the_footer_and_not_in_the_stream() {
-        let mut state = demo_state();
-        state.apply_event(&Event::DeviceClosed {
-            device_id: 7,
-            path: "/dev/ttyUSB1".into(),
-            reason: "device failed".into(),
-        });
+    fn the_cursor_sits_on_the_selected_sidebar_row_and_the_button() {
+        let mut state = demo();
+        let area = Rect::new(0, 0, 100, 16);
+        let mut buffer = Buffer::empty(area);
+        let cursor = render(&state, &mut buffer, area).expect("cursor");
+        let list = sidebar(area).unwrap().list;
+        let first = first_device_row(&state, sidebar(area).unwrap());
+        assert_eq!(
+            cursor,
+            (list.x + 1, list.y + (state.selected - first) as u16)
+        );
+
+        state.select_settings_button();
+        let cursor = render(&state, &mut buffer, area).expect("cursor");
+        let button = settings_button(area).expect("button");
+        assert_eq!(cursor, (button.x + 1, button.y));
+    }
+
+    #[test]
+    fn clicks_find_device_rows_and_the_settings_button() {
+        let state = demo();
+        let area = Rect::new(0, 0, 100, 16);
+        let sidebar = sidebar(area).unwrap();
+        assert_eq!(
+            hit_test(&state, area, sidebar.list.x, sidebar.list.y),
+            Some(Hit::Device(0))
+        );
+        let offset = (state.devices.len() - 1) as u16;
+        assert_eq!(
+            hit_test(&state, area, sidebar.list.x, sidebar.list.y + offset),
+            Some(Hit::Device(1))
+        );
+        assert_eq!(
+            hit_test(&state, area, sidebar.button.x, sidebar.button.y),
+            Some(Hit::Settings)
+        );
+        assert_eq!(
+            hit_test(&state, area, 0, 0),
+            None,
+            "the header is not a control"
+        );
+    }
+
+    #[test]
+    fn the_settings_view_shows_both_flags_and_the_cursor_follows_the_selection() {
+        let mut state = demo();
+        state.begin_settings();
+        state.draft.local_echo = false;
+        let text = screen(&state, 100, 16).join("\n");
+        assert!(text.contains("Settings"), "{text}");
+        assert!(text.contains("Local echo"), "{text}");
+        assert!(text.contains("Scrollback"), "{text}");
+        let row = text
+            .lines()
+            .find(|line| line.contains("Local echo"))
+            .expect("local echo row");
+        assert!(row.contains("off"), "{row}");
+        let scrollback = text
+            .lines()
+            .find(|line| line.contains("Scrollback"))
+            .expect("scrollback row");
+        assert!(scrollback.contains("on"), "{scrollback}");
+        assert!(text.contains("Ctrl+S save"), "{text}");
+
+        let area = Rect::new(0, 0, 100, 16);
+        let mut buffer = Buffer::empty(area);
+        let cursor = render(&state, &mut buffer, area).expect("cursor");
+        let (_, rows, _) = settings_rows(area).unwrap();
+        assert_eq!(cursor.1, rows.y);
+
+        state.settings_row = 1;
+        let cursor = render(&state, &mut buffer, area).expect("cursor");
+        assert_eq!(cursor.1, rows.y + 1);
+    }
+
+    #[test]
+    fn the_footer_hints_match_the_view() {
+        let mut state = demo();
+        let sidebar_hints = screen(&state, 100, 16).join("\n");
+        assert!(sidebar_hints.contains("Ctrl+Q quit"), "{sidebar_hints}");
+        state.view = View::Stream;
+        let stream_hints = screen(&state, 100, 16).join("\n");
+        assert!(stream_hints.contains("Ctrl+] back"), "{stream_hints}");
+        assert!(!stream_hints.contains("Ctrl+Q quit"), "{stream_hints}");
+        state.begin_settings();
+        let settings_hints = screen(&state, 100, 16).join("\n");
+        assert!(settings_hints.contains("Esc cancel"), "{settings_hints}");
+    }
+
+    #[test]
+    fn a_notice_leads_the_footer_and_stays_out_of_the_stream() {
+        let mut state = demo();
+        state.view = View::Stream;
+        state.notice = Some(crate::state::Notice::error("write failed"));
         let area = Rect::new(0, 0, 100, 16);
         let footer_top = (area.y + area.height - chrome(area).footer.height) as usize;
-        let screen = lines(&state, 100, 16);
-        let footer = screen[footer_top..].join("\n");
-        assert!(footer.contains("unplugged"), "{footer}");
-        assert!(footer.contains("/dev/ttyUSB1"), "{footer}");
-        assert!(!screen[..footer_top]
+        let lines = screen(&state, 100, 16);
+        let footer = lines[footer_top..].join("\n");
+        assert!(footer.contains("write failed"), "{footer}");
+        assert!(!lines[..footer_top]
             .iter()
-            .any(|line| line.contains("unplugged")));
+            .any(|line| line.contains("write failed")));
     }
 
     #[test]
-    fn baud_prompt_is_drawn_with_the_default_and_typed_digits() {
-        let mut state = demo_state();
+    fn the_baud_prompt_is_drawn_with_the_default_and_typed_digits() {
+        let mut state = demo();
         state.select_path("/dev/ttyUSB0");
         assert!(state.begin_baud_prompt());
         state.prompt_push('9');
         state.prompt_push('6');
-        let screen = lines(&state, 100, 16).join("\n");
-        assert!(screen.contains("Baud for /dev/ttyUSB0"), "{screen}");
-        assert!(screen.contains("115200"), "{screen}");
-        assert!(screen.contains("96"), "{screen}");
+        let text = screen(&state, 100, 16).join("\n");
+        assert!(text.contains("Baud for /dev/ttyUSB0"), "{text}");
+        assert!(text.contains("115200"), "{text}");
+        assert!(text.contains("96"), "{text}");
     }
 
     #[test]
-    fn sidebar_scrolls_to_keep_the_selected_device_visible() {
+    fn the_sidebar_scrolls_to_keep_the_selection_visible() {
         let mut state = AppState::new(12, 40);
         state.set_devices(
             (0..12)
@@ -849,209 +812,63 @@ mod tests {
                 .collect(),
         );
         assert!(state.select_path("/dev/ttyUSB11"));
-        let screen = lines(&state, 80, 16).join("\n");
-        assert!(screen.contains("/dev/ttyUSB11"), "{screen}");
-    }
-
-    #[test]
-    fn empty_sidebar_says_so_and_stream_explains_opening() {
-        let state = AppState::new(12, 40);
-        let screen = lines(&state, 100, 16).join("\n");
-        assert!(screen.contains("no serial devices"), "{screen}");
-        assert!(screen.contains("press Enter"), "{screen}");
-        assert!(screen.contains("no device selected"), "{screen}");
-    }
-
-    #[test]
-    fn screen_cells_keep_device_style() {
-        let mut state = demo_state();
-        state.apply_event(&Event::device_output(7, b"\x1b[31mR\x1b[0mN"));
-        let area = Rect::new(0, 0, 100, 16);
-        let mut buffer = Buffer::empty(area);
-        render(&state, &mut buffer, area);
-        let stream_y = 2;
-        let mut found = false;
-        for x in 0..100 {
-            if buffer[(x, stream_y)].symbol() == "R" {
-                found = true;
-                assert_eq!(buffer[(x, stream_y)].fg, RColor::Indexed(1));
-            }
-        }
-        assert!(found, "R was not rendered");
-    }
-
-    #[test]
-    fn the_stream_body_area_is_where_the_stream_is_drawn() {
-        let mut state = demo_state();
-        state.apply_event(&Event::device_output(7, b"first"));
-        for (width, height) in [(100, 24), (60, 10), (40, 6), (24, 5)] {
-            let area = Rect::new(0, 0, width, height);
-            // The event loop sizes the stream screen to its body each draw.
-            if let Some(body) = stream_body_area(area) {
-                state.resize(body.height as usize, body.width as usize);
-            }
-            let mut buffer = Buffer::empty(area);
-            render(&state, &mut buffer, area);
-            let body = stream_body_area(area);
-            if let Some(body) = body {
-                assert_eq!(body.height as usize, state.sessions[&7].screen.rows());
-                let row = (0..body.width)
-                    .map(|col| buffer[(body.x + col, body.y)].symbol())
-                    .collect::<String>();
-                assert!(row.starts_with("first"), "{width}x{height}: {row:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn the_hints_change_with_the_pane_that_has_the_keys() {
-        let mut state = demo_state();
-        state.focus = Focus::Devices;
-        let devices = lines(&state, 100, 16).join("\n");
-        assert!(devices.contains("d disconnect"), "{devices}");
-        state.focus = Focus::Stream;
-        let stream = lines(&state, 100, 16).join("\n");
-        assert!(stream.contains("Typing sends to the device"), "{stream}");
-        assert!(!stream.contains("d disconnect"), "{stream}");
+        let text = screen(&state, 80, 16).join("\n");
+        assert!(text.contains("/dev/ttyUSB11"), "{text}");
+        // The Settings button is still there at the bottom.
+        assert!(text.contains("[ Settings ]"), "{text}");
     }
 
     #[test]
     fn a_short_terminal_keeps_the_stream_and_one_footer_row() {
-        let mut state = demo_state();
+        let mut state = demo();
+        state.view = View::Stream;
         state.notice = Some(crate::state::Notice::error("boom"));
-        let screen = lines(&state, 100, 5);
-        assert_eq!(screen.len(), 5);
-        assert!(screen[0].contains("SerialNexus"), "{screen:?}");
-        // A notice still wins over the hints in a one-row footer.
-        assert!(screen[4].contains("boom"), "{screen:?}");
+        let lines = screen(&state, 100, 5);
+        assert!(lines[0].contains("SerialNexus"), "{lines:?}");
+        assert!(lines[4].contains("boom"), "{lines:?}");
 
-        let tiny = lines(&state, 20, 4);
+        let tiny = screen(&state, 20, 4);
         assert!(tiny[0].contains("SerialNexus"), "{tiny:?}");
     }
 
     #[test]
-    fn help_lists_the_keys_and_hides_the_hints_behind_it() {
-        let mut state = demo_state();
-        state.overlay = Some(Overlay::Help);
-        let screen = lines(&state, 100, 24).join("\n");
-        assert!(screen.contains("┌─ Keys"), "{screen}");
-        assert!(
-            screen.contains("switch between devices and stream"),
-            "{screen}"
-        );
-        assert!(screen.contains("Ctrl+Q"), "{screen}");
+    fn the_sidebar_says_so_when_there_are_no_devices() {
+        let state = AppState::new(12, 40);
+        let text = screen(&state, 100, 16).join("\n");
+        assert!(text.contains("no serial devices"), "{text}");
+        assert!(text.contains("no device selected"), "{text}");
+        assert!(text.contains("[ Settings ]"), "{text}");
     }
 
     #[test]
-    fn the_settings_panel_shows_the_value_it_saves() {
-        let mut state = demo_state();
-        state.overlay = Some(Overlay::Settings);
-        let screen = lines(&state, 100, 24).join("\n");
-        assert!(screen.contains("┌─ Settings"), "{screen}");
-        let row = screen
-            .lines()
-            .find(|line| line.contains("Local echo"))
-            .expect("local echo row");
-        assert!(row.contains("off"), "{row}");
-        assert!(row.contains('▸'), "{row}");
-        assert!(
-            !screen.contains("Scrollback"),
-            "a control that does nothing is not offered: {screen}"
-        );
-
-        state.settings.local_echo = true;
-        let screen = lines(&state, 100, 24).join("\n");
-        let row = screen
-            .lines()
-            .find(|line| line.contains("Local echo"))
-            .expect("local echo row");
-        assert!(row.contains("on"), "{row}");
+    fn screen_cells_keep_the_device_style() {
+        let mut state = demo();
+        state.view = View::Stream;
+        state.apply_event(&Event::device_output(7, b"\x1b[31mR\x1b[0mN"));
+        let area = Rect::new(0, 0, 100, 16);
+        let mut buffer = Buffer::empty(area);
+        render(&state, &mut buffer, area);
+        assert_eq!(buffer[(0, 1)].symbol(), "R");
+        assert_eq!(buffer[(0, 1)].fg, RColor::Indexed(1));
     }
 
     #[test]
-    fn panels_stay_inside_a_small_terminal_and_stay_visible() {
-        let mut state = demo_state();
-        // A box that fits keeps its borders and its content within them.
-        state.overlay = Some(Overlay::Settings);
-        let screen = lines(&state, 20, 8);
-        let top = screen
-            .iter()
-            .position(|line| line.contains("┌─ Settings"))
-            .expect("panel top");
-        let bottom = screen
-            .iter()
-            .position(|line| line.contains("└"))
-            .expect("panel bottom");
-        assert!(bottom > top, "{screen:?}");
-        for line in &screen[top..=bottom] {
-            let width = UnicodeWidthStr::width(line.as_str());
-            let left = line
-                .chars()
-                .position(|ch| ch == '│' || ch == '┌' || ch == '└');
-            assert!(left.is_some(), "{line:?}");
-            assert!(width <= 20, "{line:?}");
-            assert!(
-                line.ends_with('│') || line.ends_with('┐') || line.ends_with('┘'),
-                "a clipped panel keeps both borders: {line:?}"
-            );
-        }
-
-        // Too small for a box: one line still says the panel is open.
-        for (width, height) in [(80, 3), (12, 2), (8, 3)] {
-            let area = Rect::new(0, 0, width, height);
-            let mut buffer = Buffer::empty(area);
-            render(&state, &mut buffer, area);
-            let screen = lines(&state, width, height).join("\n");
-            assert!(screen.contains("Esc"), "{width}x{height}: {screen}");
-        }
-    }
-
-    #[test]
-    fn a_narrow_settings_panel_still_shows_the_value() {
-        let mut state = demo_state();
-        state.overlay = Some(Overlay::Settings);
-        for width in [18, 20, 24] {
-            for echo in [false, true] {
-                state.settings.local_echo = echo;
-                let screen = lines(&state, width, 6).join("\n");
-                let row = screen
-                    .lines()
-                    .find(|line| line.contains("▸"))
-                    .unwrap_or_else(|| panic!("{width}: {screen}"));
-                let value = if echo { "on" } else { "off" };
-                assert!(row.contains(value), "{width}: {row:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn the_hint_and_the_panel_account_for_wide_characters() {
-        let mut state = demo_state();
-        state.sessions.get_mut(&7).unwrap().control = Some("界界界界界界".into());
-        let screen = lines(&state, 130, 24);
-        let title = screen
-            .iter()
-            .find(|line| line.contains("Stream ·"))
-            .expect("stream title");
-        assert!(
-            title.contains("AI control:") && title.matches('界').count() == 6,
-            "the whole holder fits: {title:?}"
-        );
-
-        // …and the focus hint is dropped when it would cover a wide device
-        // path rather than clipped into it.
-        let mut state = AppState::new(10, 60);
+    fn wide_characters_are_measured_in_columns() {
+        let mut state = demo();
         state.set_devices(vec![DeviceEntry::new(
             "/dev/界界界界界界界界界界界界界界界界界界界界",
         )]);
-        let header = &lines(&state, 60, 10)[0];
+        let header = &screen(&state, 60, 10)[0];
         assert!(
-            !header.contains("focus:"),
-            "the hint does not cover the device: {header:?}"
+            !header.contains("sidebar"),
+            "the view hint gives way: {header:?}"
         );
-        assert!(
-            header.contains("界面") || header.contains('界'),
-            "{header:?}"
-        );
+
+        let mut state = demo();
+        state.sessions.get_mut(&7).unwrap().control = Some("界界界界界界".into());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 16));
+        render(&state, &mut buffer, Rect::new(0, 0, 120, 16));
+        let header = &screen(&state, 120, 16)[0];
+        assert_eq!(header.matches('界').count(), 6, "{header:?}");
     }
 }

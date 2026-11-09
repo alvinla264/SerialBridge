@@ -12,21 +12,11 @@ use serde::{Deserialize, Serialize};
 /// File name under the per-user configuration directory.
 pub const SETTINGS_FILE: &str = "terminal.json";
 
-/// The meaning of the settings file. Version 0 is a file written before it
-/// carried one, when `local_echo` was a stored default with no effect.
-pub const SETTINGS_VERSION: u8 = 1;
-
 /// Preferences the terminal keeps between launches.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TerminalSettings {
-    /// The version this file was written with; see [`SETTINGS_VERSION`]. A
-    /// file that does not say is from before the version existed.
-    #[serde(default = "legacy_version")]
-    pub version: u8,
-    /// Echo keys typed in the stream back into the local view. Off by default:
-    /// most devices echo what they receive, so echoing here too would show
-    /// every keystroke twice. Turn it on for a device that stays quiet.
+    /// Echo keys typed in the stream back into the local view.
     pub local_echo: bool,
     /// Keep device output around for scrolling back.
     pub scrollback: bool,
@@ -35,15 +25,10 @@ pub struct TerminalSettings {
 impl Default for TerminalSettings {
     fn default() -> Self {
         Self {
-            version: SETTINGS_VERSION,
-            local_echo: false,
+            local_echo: true,
             scrollback: true,
         }
     }
-}
-
-fn legacy_version() -> u8 {
-    0
 }
 
 /// Why the settings file could not be read or written.
@@ -88,12 +73,11 @@ impl SettingsStore {
     }
 
     /// Read the settings file, creating it with the defaults when it does not
-    /// exist, and upgrading a file from an older version. An unreadable or
-    /// invalid file is returned as an error and left untouched, so a
-    /// hand-edited file is never silently overwritten.
+    /// exist. An unreadable or invalid file is returned as an error and left
+    /// untouched, so a hand-edited file is never silently overwritten.
     pub fn load_or_create(&self) -> Result<TerminalSettings, SettingsError> {
         match self.load()? {
-            Some(settings) => self.upgrade(settings),
+            Some(settings) => Ok(settings),
             None => {
                 let settings = TerminalSettings::default();
                 match self.save_defaults(&settings) {
@@ -102,29 +86,12 @@ impl SettingsStore {
                     Err(SettingsError::Io(error))
                         if error.kind() == io::ErrorKind::AlreadyExists =>
                     {
-                        Ok(self.upgrade(self.load()?.unwrap_or(settings))?)
+                        Ok(self.load()?.unwrap_or(settings))
                     }
                     Err(error) => Err(error),
                 }
             }
         }
-    }
-
-    /// Bring a file from an older version up to date, saving the result. A
-    /// save failure is an error, so the terminal says so instead of silently
-    /// upgrading again on every launch.
-    fn upgrade(&self, mut settings: TerminalSettings) -> Result<TerminalSettings, SettingsError> {
-        if settings.version >= SETTINGS_VERSION {
-            return Ok(settings);
-        }
-        // Version 0 turned local echo on as a stored default that then did
-        // nothing. Now that it echoes, turn it off once: a human who wants it
-        // can switch it back on in the settings panel, and no existing user
-        // gets every keystroke doubled on a device that echoes.
-        settings.local_echo = false;
-        settings.version = SETTINGS_VERSION;
-        self.save(&settings)?;
-        Ok(settings)
     }
 
     /// Write the settings, creating their directory. The write goes to a
@@ -231,15 +198,14 @@ mod tests {
         TerminalSettings {
             local_echo: false,
             scrollback: false,
-            ..TerminalSettings::default()
         }
     }
 
     #[test]
-    fn scrollback_is_kept_by_default_and_local_echo_is_left_to_the_device() {
+    fn the_defaults_are_both_on() {
         let settings = TerminalSettings::default();
-        assert!(!settings.local_echo);
-        assert!(settings.scrollback);
+        assert!(settings.local_echo, "local echo is on by default");
+        assert!(settings.scrollback, "scrollback is on by default");
     }
 
     #[test]
@@ -371,11 +337,7 @@ mod tests {
     fn an_existing_file_is_never_replaced_by_the_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("terminal.json");
-        std::fs::write(
-            &path,
-            "{\"version\":1,\"local_echo\":false,\"scrollback\":false}",
-        )
-        .unwrap();
+        std::fs::write(&path, "{\"local_echo\":false,\"scrollback\":false}").unwrap();
 
         assert_eq!(
             SettingsStore::at(&path).load_or_create().unwrap(),
@@ -383,39 +345,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "{\"version\":1,\"local_echo\":false,\"scrollback\":false}"
-        );
-    }
-
-    #[test]
-    fn a_file_from_before_the_version_turns_local_echo_off_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("terminal.json");
-        // What the previous release wrote on its first launch.
-        std::fs::write(&path, "{\"local_echo\":true,\"scrollback\":true}").unwrap();
-
-        let loaded = SettingsStore::at(&path).load_or_create().expect("upgraded");
-        assert!(
-            !loaded.local_echo,
-            "typing is not doubled for existing users"
-        );
-        assert!(loaded.scrollback);
-        assert_eq!(loaded.version, SETTINGS_VERSION);
-        let saved = std::fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("\"version\": 1"), "{saved}");
-        assert!(saved.contains("\"local_echo\": false"), "{saved}");
-
-        // A human who turns it back on keeps it: a current file is respected.
-        std::fs::write(
-            &path,
-            "{\"version\":1,\"local_echo\":true,\"scrollback\":true}",
-        )
-        .unwrap();
-        assert!(
-            SettingsStore::at(&path)
-                .load_or_create()
-                .expect("current file")
-                .local_echo
+            "{\"local_echo\":false,\"scrollback\":false}"
         );
     }
 
@@ -435,25 +365,6 @@ mod tests {
             "unexpected error: {error}"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), concurrent);
-    }
-
-    #[test]
-    fn a_migration_that_cannot_be_saved_is_an_error_not_a_silent_retry() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("terminal.json");
-        std::fs::write(&path, "{\"local_echo\":true,\"scrollback\":true}").unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
-
-        let result = SettingsStore::at(&path).load_or_create();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-
-        assert!(result.is_err(), "a failed upgrade save is reported");
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "{\"local_echo\":true,\"scrollback\":true}",
-            "the file is left as it was"
-        );
     }
 
     #[test]

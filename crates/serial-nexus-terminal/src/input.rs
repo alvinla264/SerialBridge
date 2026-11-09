@@ -1,7 +1,7 @@
 //! Key mapping for the two panes. Kept free of crossterm types so the input
 //! seam can be tested without a terminal.
 
-use crate::state::{AppState, Focus, Overlay};
+use crate::state::{AppState, View};
 
 /// A key the TUI understands, independent of the terminal library.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,28 +34,31 @@ pub enum Action {
     OpenSelected,
     DisconnectSelected,
     StartBaudPrompt,
-    ToggleFocus,
-    ToggleHelp,
-    ToggleSettings,
-    CloseOverlay,
-    SettingsMove(i32),
-    SettingsToggle,
-    /// Scroll the help list by this many rows.
-    HelpScroll(i32),
+    /// Show the stream or the sidebar.
+    ToggleView,
     PromptChar(char),
     PromptBackspace,
     PromptSubmit,
     PromptCancel,
-    /// Bytes for the selected device. Never drawn locally.
+    /// Bytes for the selected device. Never drawn locally unless local echo is
+    /// on.
     Write(Vec<u8>),
+    /// Open the settings that the sidebar button offers.
+    OpenSettings,
+    SettingsMove(i32),
+    SettingsToggle,
+    SettingsSave,
+    SettingsCancel,
     Ignore,
 }
 
 /// Map a key to an action for the current state.
+///
+/// The stream is a transparent terminal: every key it can encode goes to the
+/// device, `Tab` and `Ctrl+Q` included. Only `Ctrl+]` leaves it, which is why
+/// the sidebar's `]` sends a literal `Ctrl+]`. The sidebar is the command
+/// surface: `Ctrl+Q` quits there, and the settings button is a row of it.
 pub fn map_key(state: &AppState, key: Key) -> Action {
-    if matches!(key, Key::Ctrl('q') | Key::F(10)) {
-        return Action::Quit;
-    }
     if state.prompt.is_some() {
         return match key {
             Key::Char(ch) => Action::PromptChar(ch),
@@ -65,57 +68,43 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
             _ => Action::Ignore,
         };
     }
-    if let Some(overlay) = state.overlay {
-        return map_overlay_key(overlay, key);
+    if state.view == View::Settings {
+        return match key {
+            Key::Ctrl('s') => Action::SettingsSave,
+            Key::Esc => Action::SettingsCancel,
+            Key::Tab | Key::Down | Key::Char('j') => Action::SettingsMove(1),
+            Key::BackTab | Key::Up | Key::Char('k') => Action::SettingsMove(-1),
+            Key::Char(' ') | Key::Enter => Action::SettingsToggle,
+            _ => Action::Ignore,
+        };
     }
-    // The panels are on function keys: a stream writes every printable key,
-    // so a letter or `?` must never become a panel instead of device input.
-    if key == Key::F(1) {
-        return Action::ToggleHelp;
+    if key == Key::Ctrl(']') {
+        return Action::ToggleView;
     }
-    if key == Key::F(2) {
-        return Action::ToggleSettings;
-    }
-    if key == Key::Tab {
-        return Action::ToggleFocus;
-    }
-    match state.focus {
-        Focus::Devices => match key {
+    match state.view {
+        View::Devices => match key {
+            Key::Ctrl('q') | Key::F(10) => Action::Quit,
+            // The sidebar can still feed a device: `]` is the literal
+            // Ctrl+] the stream cannot send without leaving it, and Tab is
+            // ordinary terminal input.
+            Key::Char(']') => Action::Write(vec![0x1d]),
+            Key::Tab => Action::Write(vec![b'\t']),
             Key::Up | Key::Char('k') => Action::Select(-1),
             Key::Down | Key::Char('j') => Action::Select(1),
             Key::PageUp => Action::Select(-10),
             Key::PageDown => Action::Select(10),
+            Key::Home => Action::Select(i32::MIN),
+            Key::End => Action::Select(i32::MAX),
             Key::Enter | Key::Char('o') => Action::OpenSelected,
-            Key::Char('d') => Action::DisconnectSelected,
             Key::Char('b') => Action::StartBaudPrompt,
-            Key::Right => Action::ToggleFocus,
+            Key::Char('d') => Action::DisconnectSelected,
             _ => Action::Ignore,
         },
-        Focus::Stream => match encode_key(key) {
+        View::Stream => match encode_key(key) {
             Some(bytes) => Action::Write(bytes),
             None => Action::Ignore,
         },
-    }
-}
-
-/// Keys a panel takes while it is open. The panes take none of them.
-fn map_overlay_key(overlay: Overlay, key: Key) -> Action {
-    match overlay {
-        Overlay::Help => match key {
-            Key::Esc | Key::F(1) => Action::CloseOverlay,
-            Key::Up | Key::Char('k') => Action::HelpScroll(-1),
-            Key::Down | Key::Char('j') => Action::HelpScroll(1),
-            Key::PageUp => Action::HelpScroll(-5),
-            Key::PageDown => Action::HelpScroll(5),
-            _ => Action::Ignore,
-        },
-        Overlay::Settings => match key {
-            Key::Esc | Key::F(2) => Action::CloseOverlay,
-            Key::Up | Key::Char('k') => Action::SettingsMove(-1),
-            Key::Down | Key::Char('j') => Action::SettingsMove(1),
-            Key::Char(' ') | Key::Enter | Key::Left | Key::Right => Action::SettingsToggle,
-            _ => Action::Ignore,
-        },
+        View::Settings => Action::Ignore,
     }
 }
 
@@ -197,42 +186,77 @@ mod tests {
     use super::*;
     use crate::state::DeviceEntry;
 
-    #[test]
-    fn sidebar_keys_select_open_disconnect_and_prompt() {
+    fn state_with_device() -> AppState {
         let mut state = AppState::new(20, 80);
         state.set_devices(vec![DeviceEntry::new("/dev/ttyUSB0")]);
-        assert_eq!(map_key(&state, Key::Down), Action::Select(1));
-        assert_eq!(map_key(&state, Key::Enter), Action::OpenSelected);
-        assert_eq!(map_key(&state, Key::Char('d')), Action::DisconnectSelected);
-        assert_eq!(map_key(&state, Key::Char('b')), Action::StartBaudPrompt);
-        assert_eq!(map_key(&state, Key::Tab), Action::ToggleFocus);
-        assert_eq!(map_key(&state, Key::Ctrl('q')), Action::Quit);
+        state
     }
 
     #[test]
-    fn stream_keys_become_device_bytes() {
-        let mut state = AppState::new(20, 80);
-        state.focus = Focus::Stream;
+    fn sidebar_keys_select_open_disconnect_and_prompt() {
+        let state = state_with_device();
+        assert_eq!(map_key(&state, Key::Down), Action::Select(1));
+        assert_eq!(map_key(&state, Key::Enter), Action::OpenSelected);
+        assert_eq!(map_key(&state, Key::Char('o')), Action::OpenSelected);
+        assert_eq!(map_key(&state, Key::Char('d')), Action::DisconnectSelected);
+        assert_eq!(map_key(&state, Key::Char('b')), Action::StartBaudPrompt);
+        assert_eq!(map_key(&state, Key::Ctrl('q')), Action::Quit);
+        assert_eq!(map_key(&state, Key::F(10)), Action::Quit);
+    }
+
+    #[test]
+    fn ctrl_bracket_switches_views_from_either_side() {
+        let mut state = state_with_device();
+        assert_eq!(map_key(&state, Key::Ctrl(']')), Action::ToggleView);
+        state.view = View::Stream;
+        assert_eq!(map_key(&state, Key::Ctrl(']')), Action::ToggleView);
+    }
+
+    #[test]
+    fn the_stream_is_transparent_for_tab_and_ctrl_q() {
+        let mut state = state_with_device();
+        state.view = View::Stream;
+        assert_eq!(map_key(&state, Key::Tab), Action::Write(b"\t".to_vec()));
+        assert_eq!(
+            map_key(&state, Key::Ctrl('q')),
+            Action::Write(vec![0x11]),
+            "Ctrl+Q is the device's XON/XOFF, not a quit"
+        );
+        assert_eq!(
+            map_key(&state, Key::Char('?')),
+            Action::Write(b"?".to_vec())
+        );
         assert_eq!(
             map_key(&state, Key::Char('A')),
             Action::Write(b"A".to_vec())
         );
         assert_eq!(map_key(&state, Key::Enter), Action::Write(b"\r".to_vec()));
         assert_eq!(map_key(&state, Key::Up), Action::Write(b"\x1b[A".to_vec()));
-        assert_eq!(map_key(&state, Key::Ctrl('c')), Action::Write(vec![0x03]));
-        assert_eq!(map_key(&state, Key::Tab), Action::ToggleFocus);
-        assert_eq!(map_key(&state, Key::F(10)), Action::Quit);
+        assert_eq!(
+            map_key(&state, Key::F(10)),
+            Action::Write(b"\x1b[21~".to_vec())
+        );
+    }
+
+    #[test]
+    fn the_sidebar_sends_the_literal_ctrl_bracket_and_tab() {
+        let state = state_with_device();
+        assert_eq!(map_key(&state, Key::Char(']')), Action::Write(vec![0x1d]));
+        assert_eq!(map_key(&state, Key::Tab), Action::Write(b"\t".to_vec()));
+        // Printable commands are still commands here.
+        assert_eq!(map_key(&state, Key::Char('b')), Action::StartBaudPrompt);
     }
 
     #[test]
     fn prompt_takes_digits_enter_escape_backspace() {
-        let mut state = AppState::new(20, 80);
-        state.set_devices(vec![DeviceEntry::new("/dev/ttyUSB0")]);
+        let mut state = state_with_device();
         state.begin_baud_prompt();
         assert_eq!(map_key(&state, Key::Char('9')), Action::PromptChar('9'));
         assert_eq!(map_key(&state, Key::Enter), Action::PromptSubmit);
         assert_eq!(map_key(&state, Key::Esc), Action::PromptCancel);
         assert_eq!(map_key(&state, Key::Backspace), Action::PromptBackspace);
+        // The prompt owns the keys: Ctrl+] cannot pull the view away.
+        assert_eq!(map_key(&state, Key::Ctrl(']')), Action::Ignore);
     }
 
     #[test]
@@ -244,42 +268,21 @@ mod tests {
     }
 
     #[test]
-    fn function_keys_open_the_panels_and_printables_stay_device_input() {
-        let mut state = AppState::new(20, 80);
-        state.focus = Focus::Stream;
-        assert_eq!(map_key(&state, Key::F(1)), Action::ToggleHelp);
-        assert_eq!(map_key(&state, Key::F(2)), Action::ToggleSettings);
-        // Serial consoles need these: they must reach the device.
-        assert_eq!(
-            map_key(&state, Key::Char('?')),
-            Action::Write(b"?".to_vec())
-        );
-        assert_eq!(
-            map_key(&state, Key::Char('q')),
-            Action::Write(b"q".to_vec())
-        );
-    }
-
-    #[test]
-    fn an_open_panel_takes_the_keys_and_escape_closes_it() {
-        let mut state = AppState::new(20, 80);
-        state.overlay = Some(Overlay::Settings);
+    fn settings_takes_tab_arrows_space_ctrl_s_and_escape() {
+        let mut state = state_with_device();
+        state.begin_settings();
+        assert_eq!(state.view, View::Settings);
+        assert_eq!(map_key(&state, Key::Tab), Action::SettingsMove(1));
+        assert_eq!(map_key(&state, Key::BackTab), Action::SettingsMove(-1));
         assert_eq!(map_key(&state, Key::Down), Action::SettingsMove(1));
-        assert_eq!(map_key(&state, Key::Char('j')), Action::SettingsMove(1));
-        assert_eq!(map_key(&state, Key::Char('k')), Action::SettingsMove(-1));
+        assert_eq!(map_key(&state, Key::Up), Action::SettingsMove(-1));
         assert_eq!(map_key(&state, Key::Char(' ')), Action::SettingsToggle);
         assert_eq!(map_key(&state, Key::Enter), Action::SettingsToggle);
-        assert_eq!(map_key(&state, Key::Esc), Action::CloseOverlay);
-        assert_eq!(map_key(&state, Key::F(2)), Action::CloseOverlay);
-        // Typing into the device is off while a panel is open.
+        assert_eq!(map_key(&state, Key::Ctrl('s')), Action::SettingsSave);
+        assert_eq!(map_key(&state, Key::Esc), Action::SettingsCancel);
+        // Nothing typed here reaches a device.
         assert_eq!(map_key(&state, Key::Char('x')), Action::Ignore);
-
-        state.overlay = Some(Overlay::Help);
-        assert_eq!(map_key(&state, Key::Esc), Action::CloseOverlay);
-        assert_eq!(map_key(&state, Key::F(1)), Action::CloseOverlay);
-        assert_eq!(map_key(&state, Key::Char('x')), Action::Ignore);
-        // Quitting still works from a panel.
-        assert_eq!(map_key(&state, Key::Ctrl('q')), Action::Quit);
+        assert_eq!(map_key(&state, Key::Ctrl(']')), Action::Ignore);
     }
 
     #[test]

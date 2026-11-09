@@ -10,34 +10,20 @@ use serial_nexus_protocol::{Event, Holder, Source, DEFAULT_BAUD};
 use crate::screen::Screen;
 use crate::settings::TerminalSettings;
 
-/// Which pane receives keys.
+/// Which view receives keys. The sidebar is shown while choosing a device and
+/// hides itself in the stream, so the device gets the whole screen. Settings is
+/// its own view in the terminal area, opened from the sidebar's button.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Focus {
+pub enum View {
     Devices,
     Stream,
-}
-
-impl Focus {
-    pub fn toggled(self) -> Self {
-        match self {
-            Self::Devices => Self::Stream,
-            Self::Stream => Self::Devices,
-        }
-    }
-}
-
-/// A panel drawn over the panes that takes the keys while it is open.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Overlay {
-    Help,
     Settings,
 }
 
-/// The settings rows of the settings panel, in drawing order. Scrollback is
-/// stored in the file but has no row yet: the stream cannot scroll back until
-/// it keeps the rows that leave the screen, so offering the switch would be a
-/// control that does nothing.
-pub const SETTINGS_ROWS: usize = 1;
+/// The settings rows, in drawing order. Scrollback has a switch before the
+/// stream can scroll: the flag is part of the settings, and the terminal keeps
+/// it for the scrolling interface that follows.
+pub const SETTINGS_ROWS: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
@@ -143,21 +129,26 @@ impl BaudPrompt {
 /// Everything the renderer needs.
 pub struct AppState {
     pub devices: Vec<DeviceEntry>,
+    /// The selected sidebar row: a device, or the Settings button when it is
+    /// one past the last device.
     pub selected: usize,
-    pub focus: Focus,
+    pub view: View,
     pub sessions: BTreeMap<u64, Session>,
     pub notice: Option<Notice>,
     pub prompt: Option<BaudPrompt>,
     pub quit: bool,
-    /// Open panel, if any. While one is open the panes do not take keys.
-    pub overlay: Option<Overlay>,
-    /// Selected row of the settings panel.
+    /// Selected row of the settings view.
     pub settings_row: usize,
-    /// First key row the help panel shows; the list scrolls when it does not
-    /// fit.
-    pub help_offset: usize,
-    /// The human's preferences, loaded at launch and saved when changed.
+    /// The human's preferences in effect for this launch.
     pub settings: TerminalSettings,
+    /// The settings being edited; only Ctrl+S copies them into `settings` and
+    /// saves them. Escape throws them away.
+    pub draft: TerminalSettings,
+    /// The sidebar row the settings were opened from, put back on the way out.
+    selection_before_settings: usize,
+    /// The last device row that was selected, so leaving the Settings button
+    /// lands on a device.
+    last_device_selection: usize,
     rows: usize,
     cols: usize,
 }
@@ -173,21 +164,22 @@ impl AppState {
         Self {
             devices: Vec::new(),
             selected: 0,
-            focus: Focus::Devices,
+            view: View::Devices,
             sessions: BTreeMap::new(),
             notice: None,
             prompt: None,
             quit: false,
-            overlay: None,
             settings_row: 0,
-            help_offset: 0,
             settings: TerminalSettings::default(),
+            draft: TerminalSettings::default(),
+            selection_before_settings: 0,
+            last_device_selection: 0,
             rows: rows.max(1),
             cols: cols.max(1),
         }
     }
 
-    /// The value of one settings panel row: local echo first, then scrollback.
+    /// The value of one settings row: local echo first, then scrollback.
     pub fn settings_value(&self, row: usize) -> Option<bool> {
         match row {
             0 => Some(self.settings.local_echo),
@@ -196,25 +188,74 @@ impl AppState {
         }
     }
 
-    /// Move the settings panel selection, staying on a real row.
+    /// The value of one settings row as the settings view shows it.
+    pub fn draft_value(&self, row: usize) -> Option<bool> {
+        match row {
+            0 => Some(self.draft.local_echo),
+            1 => Some(self.draft.scrollback),
+            _ => None,
+        }
+    }
+
+    /// Move the settings selection, staying on a real row.
     pub fn move_settings_row(&mut self, delta: i32) {
         let last = SETTINGS_ROWS - 1;
         self.settings_row = (self.settings_row as i32 + delta).clamp(0, last as i32) as usize;
     }
 
-    /// Flip the setting on the selected row, returning its new value.
-    pub fn toggle_selected_setting(&mut self) -> Option<bool> {
+    /// Flip the selected setting in the draft, returning its new value.
+    pub fn toggle_draft(&mut self) -> Option<bool> {
         match self.settings_row {
             0 => {
-                self.settings.local_echo = !self.settings.local_echo;
-                Some(self.settings.local_echo)
+                self.draft.local_echo = !self.draft.local_echo;
+                Some(self.draft.local_echo)
             }
             1 => {
-                self.settings.scrollback = !self.settings.scrollback;
-                Some(self.settings.scrollback)
+                self.draft.scrollback = !self.draft.scrollback;
+                Some(self.draft.scrollback)
             }
             _ => None,
         }
+    }
+
+    /// Start editing the settings: the draft begins as a copy of what is in
+    /// effect, so Escape can throw every change away.
+    pub fn begin_settings(&mut self) {
+        self.draft = self.settings.clone();
+        self.settings_row = 0;
+        // Coming from the Settings button itself, fall back to the last device
+        // row, so leaving the settings lands on a device.
+        self.selection_before_settings = self
+            .last_device_selection
+            .min(self.devices.len().saturating_sub(1));
+        self.view = View::Settings;
+        self.notice = None;
+    }
+
+    /// Leave the settings without keeping the draft.
+    pub fn cancel_settings(&mut self) {
+        self.draft = self.settings.clone();
+        self.leave_settings();
+    }
+
+    /// Keep the draft as the settings in effect and leave the view.
+    pub fn commit_settings(&mut self) {
+        self.settings = self.draft.clone();
+        self.leave_settings();
+    }
+
+    fn leave_settings(&mut self) {
+        // The Settings button is not a device: go back to the row the settings
+        // were opened from, so Ctrl+] still has a device to show.
+        self.selected = self
+            .selection_before_settings
+            .min(self.devices.len().saturating_sub(1));
+        self.view = View::Devices;
+    }
+
+    /// Whether the sidebar's Settings button is the selected row.
+    pub fn settings_button_selected(&self) -> bool {
+        self.selected >= self.devices.len()
     }
 
     /// The name of one settings panel row.
@@ -258,19 +299,38 @@ impl AppState {
             .and_then(|id| self.sessions.get(&id))
     }
 
+    /// The device the header names: the selected one, or the last device row
+    /// when the Settings button is selected.
+    pub fn shown_device(&self) -> Option<&DeviceEntry> {
+        self.devices
+            .get(self.selected)
+            .or_else(|| self.devices.get(self.last_device_selection))
+    }
+
     pub fn selected_session_mut(&mut self) -> Option<&mut Session> {
         let id = self.selected_device_id()?;
         self.sessions.get_mut(&id)
     }
 
+    /// Move the sidebar selection over the devices and the Settings button,
+    /// which is the row just past the last device.
     pub fn select_delta(&mut self, delta: i32) {
-        if self.devices.is_empty() {
-            self.selected = 0;
-            return;
-        }
-        let last = self.devices.len() - 1;
+        let last = self.devices.len();
         let next = self.selected as i32 + delta;
         self.selected = next.clamp(0, last as i32) as usize;
+        self.remember_device_row();
+    }
+
+    /// Keep the last device row that was selected.
+    fn remember_device_row(&mut self) {
+        if self.selected < self.devices.len() {
+            self.last_device_selection = self.selected;
+        }
+    }
+
+    /// Point the sidebar selection at the Settings button.
+    pub fn select_settings_button(&mut self) {
+        self.selected = self.devices.len();
     }
 
     pub fn select_path(&mut self, path: &str) -> bool {
@@ -279,6 +339,7 @@ impl AppState {
             .position(|device| device.path == path)
             .map(|index| {
                 self.selected = index;
+                self.remember_device_row();
             })
             .is_some()
     }
@@ -322,7 +383,13 @@ impl AppState {
                 return;
             }
         }
-        self.selected = self.selected.min(self.devices.len().saturating_sub(1));
+        // The Settings button stays selected when it was; otherwise a row that
+        // disappeared falls back to the last device.
+        self.selected = self.selected.min(self.devices.len());
+        self.last_device_selection = self
+            .last_device_selection
+            .min(self.devices.len().saturating_sub(1));
+        self.remember_device_row();
     }
 
     /// Add a freshly opened session and point the sidebar at it. The screen
@@ -368,6 +435,7 @@ impl AppState {
         }
         if let Some(index) = self.devices.iter().position(|device| device.path == path) {
             self.selected = index;
+            self.remember_device_row();
         }
     }
 

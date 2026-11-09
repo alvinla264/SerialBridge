@@ -3,6 +3,7 @@
 
 use std::io;
 
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -49,20 +50,27 @@ impl<T: TerminalOps> Drop for CleanupGuard<T> {
     }
 }
 
-/// The real terminal: raw mode, alternate screen, hidden cursor.
+/// The real terminal: raw mode, alternate screen, mouse capture.
 pub struct CrosstermOps;
 
 impl TerminalOps for CrosstermOps {
     fn enter(&mut self) -> io::Result<()> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
+        // The mouse is captured so the sidebar's Settings button can be
+        // clicked; the cursor stays visible, on the device's own position.
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         Ok(())
     }
 
     fn leave(&mut self) -> io::Result<()> {
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, cursor::Show, LeaveAlternateScreen);
+        let _ = execute!(
+            stdout,
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            cursor::Show
+        );
         disable_raw_mode()
     }
 }

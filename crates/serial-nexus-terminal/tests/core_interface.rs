@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use serial_nexus_client::{Client, ClientInfo};
 use serial_nexus_terminal::app::App;
 use serial_nexus_terminal::input::Key;
-use serial_nexus_terminal::state::{Focus, Overlay};
+use serial_nexus_terminal::state::AppState;
+use serial_nexus_terminal::state::View;
 use support::{connect, start_core, SimulatedDevice};
 
 fn app(socket: &std::path::PathBuf) -> App {
@@ -62,11 +63,11 @@ fn opens_two_devices_switches_and_keeps_both_connected() {
         .expect("first device opened")
         .device_id;
     assert_eq!(app.state.selected_session().unwrap().baud, 19_200);
-    assert_eq!(app.state.focus, Focus::Stream);
+    assert_eq!(app.state.view, View::Stream);
 
-    app.handle_key(Key::Tab); // back to the sidebar
-                              // Re-seed: PTYs are not enumerated, and the refresh after the first open
-                              // drops the seeded closed entry for the second one.
+    app.handle_key(Key::Ctrl(']')); // back to the sidebar
+                                    // Re-seed: PTYs are not enumerated, and the refresh after the first open
+                                    // drops the seeded closed entry for the second one.
     app.state.set_devices(vec![
         serial_nexus_terminal::state::DeviceEntry::new(&first.path),
         serial_nexus_terminal::state::DeviceEntry::new(&second.path),
@@ -88,10 +89,10 @@ fn opens_two_devices_switches_and_keeps_both_connected() {
 
     // Switch back: the first device is still attached (same device id), and
     // typing goes there without reopening.
-    app.handle_key(Key::Tab); // sidebar
+    app.handle_key(Key::Ctrl(']')); // sidebar
     app.state.select_path(&first.path);
     assert_eq!(app.state.selected_session().unwrap().device_id, first_id);
-    app.handle_key(Key::Tab); // stream
+    app.handle_key(Key::Ctrl(']')); // stream
     app.handle_key(Key::Char('a'));
     first.read_until(b"a", Duration::from_secs(3));
     assert_eq!(app.state.selected_session().unwrap().device_id, first_id);
@@ -162,7 +163,7 @@ fn joins_an_already_open_device_at_its_active_rate() {
     assert_eq!(session.screen.lines().len(), 40);
 
     // A human may write while an AI holds control, and does not take it.
-    app.state.focus = Focus::Stream;
+    app.state.view = View::Stream;
     app.handle_key(Key::Char('q'));
     device.read_until(b"q", Duration::from_secs(3));
     let status = ai.status(opened.device_id).expect("status");
@@ -179,13 +180,18 @@ fn joins_an_already_open_device_at_its_active_rate() {
 }
 
 #[test]
-fn human_typing_is_not_echoed_but_device_echo_and_ai_writes_are_visible() {
+fn with_local_echo_off_typing_is_not_echoed_but_device_echo_and_ai_writes_are_visible() {
     let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
     let mut device = SimulatedDevice::new();
     let ai = connect(&socket, ClientInfo::ai("claude-desktop"));
-    let mut app = app(&socket);
+    let settings = serial_nexus_terminal::settings::TerminalSettings {
+        local_echo: false,
+        scrollback: true,
+    };
+    let client = Client::connect_to_socket(&socket, ClientInfo::human("terminal-no-echo"))
+        .expect("terminal connects");
+    let mut app = App::with_settings(client, 40, 120, settings);
     app.open_path(&device.path, Some(115_200)).expect("open");
-    app.state.focus = Focus::Stream;
 
     for ch in "hello".chars() {
         app.handle_key(Key::Char(ch));
@@ -319,7 +325,7 @@ fn rejoin_after_a_shared_device_disconnect_still_reports_the_next_unplug() {
     );
 
     // Disconnect while the AI keeps the device open: no DeviceClosed event.
-    app.handle_key(Key::Tab);
+    app.handle_key(Key::Ctrl(']'));
     app.handle_key(Key::Char('d'));
     app.pump();
     assert!(app.state.sessions.is_empty());
@@ -369,7 +375,7 @@ fn explicit_disconnect_leaves_the_other_device_connected() {
     let first_id = app.open_path(&first.path, Some(115_200)).expect("open");
     let second_id = app.open_path(&second.path, Some(115_200)).expect("open");
 
-    app.handle_key(Key::Tab); // sidebar
+    app.handle_key(Key::Ctrl(']')); // sidebar
     app.state.select_path(&first.path);
     app.handle_key(Key::Char('d'));
     app.pump();
@@ -403,7 +409,6 @@ fn launch_settings_are_loaded_into_the_app_and_do_not_change_baud_behavior() {
     let settings = serial_nexus_terminal::settings::TerminalSettings {
         local_echo: false,
         scrollback: false,
-        ..Default::default()
     };
     let client = Client::connect_to_socket(&socket, ClientInfo::human("terminal-settings"))
         .expect("terminal connects");
@@ -424,19 +429,13 @@ fn launch_settings_are_loaded_into_the_app_and_do_not_change_baud_behavior() {
 }
 
 #[test]
-fn local_echo_shows_typed_keys_only_while_it_is_on() {
+fn local_echo_is_on_by_default_and_stops_when_it_is_turned_off() {
     let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
     let mut device = SimulatedDevice::new();
-    let settings = serial_nexus_terminal::settings::TerminalSettings {
-        local_echo: true,
-        scrollback: true,
-        ..Default::default()
-    };
-    let client = Client::connect_to_socket(&socket, ClientInfo::human("terminal-echo"))
-        .expect("terminal connects");
-    let mut app = App::with_settings(client, 40, 120, settings);
+    let mut app = app(&socket);
+    assert!(app.settings().local_echo, "local echo is on by default");
     app.open_path(&device.path, Some(115_200)).expect("open");
-    app.state.focus = Focus::Stream;
+    assert_eq!(app.state.view, View::Stream);
 
     for ch in "ab".chars() {
         app.handle_key(Key::Char(ch));
@@ -448,12 +447,25 @@ fn local_echo_shows_typed_keys_only_while_it_is_on() {
         stream_text(&app)
     );
 
-    // Turning it off in the settings panel stops the local echo at once.
-    app.handle_key(Key::F(2));
-    assert_eq!(app.state.overlay, Some(Overlay::Settings));
+    // The sidebar button opens the settings; the change is a draft until
+    // Ctrl+S keeps it.
+    app.handle_key(Key::Ctrl(']'));
+    assert_eq!(app.state.view, View::Devices);
+    app.state.select_settings_button();
+    app.handle_key(Key::Enter);
+    assert_eq!(app.state.view, View::Settings);
     app.handle_key(Key::Char(' '));
-    assert!(!app.state.settings.local_echo);
-    app.handle_key(Key::Esc);
+    assert!(!app.state.draft.local_echo, "the draft flips");
+    assert!(
+        app.state.settings.local_echo,
+        "nothing is in effect before saving"
+    );
+    app.handle_key(Key::Ctrl('s'));
+    assert_eq!(app.state.view, View::Devices);
+    assert!(!app.state.settings.local_echo, "Ctrl+S keeps the change");
+
+    app.handle_key(Key::Ctrl(']'));
+    assert_eq!(app.state.view, View::Stream);
     for ch in "cd".chars() {
         app.handle_key(Key::Char(ch));
     }
@@ -469,30 +481,67 @@ fn local_echo_shows_typed_keys_only_while_it_is_on() {
 }
 
 #[test]
-fn the_help_list_stops_scrolling_at_its_last_row() {
+fn settings_escape_throws_the_draft_away_and_shows_both_flags() {
     let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
     let mut app = app(&socket);
-    app.handle_key(Key::F(1));
-    assert_eq!(app.state.overlay, Some(Overlay::Help));
-    for _ in 0..20 {
-        app.handle_key(Key::Down);
-    }
+    app.open_settings();
+    assert_eq!(app.state.view, View::Settings);
+    // Both flags are there, scrollback included, before it scrolls anything.
+    assert_eq!(AppState::settings_row_name(0), Some("Local echo"));
+    assert_eq!(AppState::settings_row_name(1), Some("Scrollback"));
+    app.handle_key(Key::Char(' '));
+    assert!(!app.state.draft.local_echo);
+    app.handle_key(Key::Tab);
+    assert_eq!(app.state.settings_row, 1);
+    app.handle_key(Key::Char(' '));
+    assert!(!app.state.draft.scrollback);
+    // Escape keeps neither change.
     assert_eq!(
-        app.state.help_offset,
-        serial_nexus_terminal::render::help_rows() - 1,
-        "scrolling stops at the last row"
+        app.state.settings,
+        serial_nexus_terminal::settings::TerminalSettings::default()
     );
-    // One press back moves at once: there is no invisible overscroll.
-    app.handle_key(Key::Up);
+    app.handle_key(Key::Esc);
+    assert_eq!(app.state.view, View::Devices);
     assert_eq!(
-        app.state.help_offset,
-        serial_nexus_terminal::render::help_rows() - 2
+        app.state.settings,
+        serial_nexus_terminal::settings::TerminalSettings::default()
     );
     app.shutdown();
 }
 
 #[test]
-fn a_setting_changed_in_the_panel_is_written_back_and_kept_for_the_next_launch() {
+fn the_stream_owns_tab_and_ctrl_q_and_the_sidebar_ctrl_q_quits() {
+    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let mut device = SimulatedDevice::new();
+    let mut app = app(&socket);
+    app.open_path(&device.path, Some(115_200)).expect("open");
+    assert_eq!(app.state.view, View::Stream);
+
+    // Live keys are the device's, Tab and Ctrl+Q included.
+    app.handle_key(Key::Tab);
+    device.read_until(b"\t", Duration::from_secs(3));
+    app.handle_key(Key::Ctrl('q'));
+    device.read_until(&[0x11], Duration::from_secs(3));
+    app.pump();
+    assert!(
+        !app.state.quit,
+        "Ctrl+Q in the stream is the device's XON/XOFF"
+    );
+
+    // Back in the sidebar, Ctrl+Q is the terminal's quit, and `]` sends the
+    // literal Ctrl+] the stream cannot send.
+    app.handle_key(Key::Ctrl(']'));
+    assert_eq!(app.state.view, View::Devices);
+    app.handle_key(Key::Char(']'));
+    device.read_until(&[0x1d], Duration::from_secs(3));
+    app.handle_key(Key::Ctrl('q'));
+    assert!(app.state.quit, "Ctrl+Q quits from the sidebar");
+
+    app.shutdown();
+}
+
+#[test]
+fn a_setting_changed_in_the_settings_view_is_saved_on_ctrl_s() {
     let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("terminal.json");
@@ -502,17 +551,22 @@ fn a_setting_changed_in_the_panel_is_written_back_and_kept_for_the_next_launch()
     let client = Client::connect_to_socket(&socket, ClientInfo::human("terminal-save"))
         .expect("terminal connects");
     let mut app = App::with_preferences(client, 40, 120, settings, Some(store.clone()));
-    app.handle_key(Key::F(2));
-    assert_eq!(app.state.overlay, Some(Overlay::Settings));
-    // Local echo is the first row and starts off.
+    // The keyboard route: the Settings button is the last sidebar row.
+    app.state.select_settings_button();
+    app.handle_key(Key::Enter);
+    assert_eq!(app.state.view, View::Settings);
     app.handle_key(Key::Char(' '));
-    assert!(app.state.settings.local_echo);
     assert!(
         store.load().expect("load").expect("file").local_echo,
-        "the change was saved"
+        "the draft alone is not written"
+    );
+    app.handle_key(Key::Ctrl('s'));
+    assert!(
+        !store.load().expect("load").expect("file").local_echo,
+        "Ctrl+S wrote the change"
     );
 
-    // A failing save is reported, and the preference still applies here.
+    // A failing save is reported, and the setting still applies for this run.
     let blocked = dir.path().join("not-a-directory");
     std::fs::write(&blocked, "x").unwrap();
     let mut app = App::with_preferences(
@@ -525,11 +579,42 @@ fn a_setting_changed_in_the_panel_is_written_back_and_kept_for_the_next_launch()
             blocked.join("terminal.json"),
         )),
     );
-    app.handle_key(Key::F(2));
+    app.state.select_settings_button();
+    app.handle_key(Key::Enter);
     app.handle_key(Key::Char(' '));
-    assert!(!app.state.settings.local_echo);
+    app.handle_key(Key::Ctrl('s'));
+    assert!(app.state.settings.local_echo, "the change still applies");
     let notice = app.state.notice.as_ref().expect("save failure reported");
     assert!(notice.text.contains("not saved"), "{}", notice.text);
+
+    app.shutdown();
+}
+
+#[test]
+fn clicking_the_settings_button_opens_the_settings_and_a_device_row_selects_it() {
+    use ratatui::layout::Rect;
+    use serial_nexus_terminal::render::{settings_button, sidebar};
+
+    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let device = SimulatedDevice::new();
+    let mut app = app(&socket);
+    app.open_path(&device.path, Some(115_200)).expect("open");
+    app.handle_key(Key::Ctrl(']'));
+    assert_eq!(app.state.view, View::Devices);
+
+    let area = Rect::new(0, 0, 100, 16);
+    let button = settings_button(area).expect("the button is drawn");
+    app.handle_click(area, button.x + 2, button.y);
+    assert_eq!(app.state.view, View::Settings);
+
+    app.handle_key(Key::Esc);
+    assert_eq!(app.state.view, View::Devices);
+    let list = sidebar(area).expect("the list is drawn").list;
+    app.handle_click(area, list.x, list.y);
+    assert_eq!(app.state.selected, 0, "the first device row is selected");
+    // A click outside the controls does nothing.
+    app.handle_click(area, 0, 0);
+    assert_eq!(app.state.selected, 0);
 
     app.shutdown();
 }

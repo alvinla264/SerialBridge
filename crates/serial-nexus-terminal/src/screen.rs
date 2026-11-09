@@ -129,6 +129,12 @@ impl Screen {
             .collect()
     }
 
+    /// Where the device's cursor is: (row, column). A cursor waiting to wrap
+    /// stays on the last column.
+    pub fn cursor(&self) -> (usize, usize) {
+        (self.y, self.x)
+    }
+
     pub fn cell(&self, row: usize, col: usize) -> Cell {
         if row < self.rows && col < self.cols {
             self.grid[row * self.cols + col]

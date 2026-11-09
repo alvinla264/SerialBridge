@@ -7,10 +7,12 @@ use crossbeam_channel::Receiver;
 use serial_nexus_client::{Client, ClientError};
 use serial_nexus_protocol::{DeviceSummary, Event};
 
+use ratatui::layout::Rect;
+
 use crate::input::{echo_key, map_key, Action, Key};
-use crate::render::help_rows;
+use crate::render::{hit_test, Hit};
 use crate::settings::{SettingsStore, TerminalSettings};
-use crate::state::{short_holder, AppState, DeviceEntry, Focus, Notice, Overlay};
+use crate::state::{short_holder, AppState, DeviceEntry, Notice, View};
 
 /// Wire the app to a connected core. The core is started by
 /// [`Client::connect`] (the auto-start seam), not by the TUI.
@@ -96,62 +98,104 @@ impl App {
         }
     }
 
-    /// Handle one key. Typing in the stream writes to the selected device and
-    /// is echoed locally only when the `local_echo` setting is on.
+    /// Handle one key. In the stream, keys go to the device and only Ctrl+]
+    /// leaves; in the sidebar, the command keys act and Ctrl+Q quits.
     pub fn handle_key(&mut self, key: Key) {
         let action = map_key(&self.state, key);
         match action {
             Action::Quit => self.state.quit = true,
-            Action::Select(delta) => self.state.select_delta(delta),
-            Action::ToggleFocus => self.state.focus = self.state.focus.toggled(),
-            Action::OpenSelected => self.open_selected(),
+            Action::Select(delta) => self.select_row(delta),
+            Action::OpenSelected => {
+                if self.state.settings_button_selected() {
+                    self.open_settings();
+                } else {
+                    self.open_selected();
+                }
+            }
             Action::DisconnectSelected => self.disconnect_selected(),
             Action::StartBaudPrompt => self.start_baud_prompt(),
+            Action::ToggleView => self.toggle_view(),
             Action::PromptChar(ch) => self.state.prompt_push(ch),
             Action::PromptBackspace => self.state.prompt_backspace(),
             Action::PromptCancel => self.state.prompt = None,
             Action::PromptSubmit => self.submit_baud_prompt(),
             Action::Write(bytes) => self.write_selected(&bytes, key),
-            Action::ToggleHelp => self.toggle_overlay(Overlay::Help),
-            Action::ToggleSettings => self.toggle_overlay(Overlay::Settings),
-            Action::CloseOverlay => self.state.overlay = None,
+            Action::OpenSettings => self.open_settings(),
             Action::SettingsMove(delta) => self.state.move_settings_row(delta),
-            Action::SettingsToggle => self.toggle_setting(),
-            Action::HelpScroll(delta) => {
-                // Clamp to the rows that exist: scrolling past the end would
-                // make scrolling back look broken.
-                let last = help_rows().saturating_sub(1);
-                self.state.help_offset =
-                    (self.state.help_offset as i32 + delta).clamp(0, last as i32) as usize;
+            Action::SettingsToggle => {
+                self.state.toggle_draft();
             }
+            Action::SettingsSave => self.save_settings(),
+            Action::SettingsCancel => self.state.cancel_settings(),
             Action::Ignore => {}
         }
     }
 
-    /// Open a panel, or close it when the same one is already open.
-    fn toggle_overlay(&mut self, overlay: Overlay) {
-        self.state.overlay = (self.state.overlay != Some(overlay)).then_some(overlay);
-        if self.state.overlay == Some(Overlay::Help) {
-            self.state.help_offset = 0;
+    /// Move the sidebar selection over the devices and the Settings button.
+    /// A huge delta (Home/End) lands on the first or last row.
+    fn select_row(&mut self, delta: i32) {
+        if delta == i32::MIN {
+            self.state.selected = 0;
+        } else if delta == i32::MAX {
+            self.state.select_settings_button();
+        } else {
+            self.state.select_delta(delta);
         }
     }
 
-    /// Flip the selected setting and save it. A save failure is reported and
-    /// leaves the preference in effect for this launch only.
-    fn toggle_setting(&mut self) {
-        let Some(row) = AppState::settings_row_name(self.state.settings_row) else {
+    /// Handle a click at one cell of the screen. Only the sidebar has
+    /// clickable controls: a device row selects it, the Settings button opens
+    /// the settings.
+    pub fn handle_click(&mut self, area: Rect, column: u16, row: u16) {
+        if self.state.view != View::Devices {
             return;
-        };
-        let Some(value) = self.state.toggle_selected_setting() else {
-            return;
-        };
-        let state = if value { "on" } else { "off" };
+        }
+        match hit_test(&self.state, area, column, row) {
+            Some(Hit::Device(index)) => self.select_row_index(index),
+            Some(Hit::Settings) => self.open_settings(),
+            None => {}
+        }
+    }
+
+    /// Point the sidebar at one of its rows (a mouse click or a test).
+    pub fn select_row_index(&mut self, index: usize) {
+        self.state.selected = index.min(self.state.devices.len());
+    }
+
+    /// Open the settings view. The current settings are copied into a draft,
+    /// so Escape can throw every change away.
+    pub fn open_settings(&mut self) {
+        self.state.begin_settings();
+    }
+
+    /// Show the stream for the attached device, or go back to the sidebar.
+    fn toggle_view(&mut self) {
+        match self.state.view {
+            View::Devices => {
+                if self.state.selected_session().is_none() {
+                    self.state.notice = Some(Notice::error(
+                        "open a device first: select it and press Enter",
+                    ));
+                    return;
+                }
+                self.state.view = View::Stream;
+                self.state.notice = None;
+            }
+            View::Stream => self.state.view = View::Devices,
+            // Another view owns the keys; Ctrl+] is not a shortcut out of it.
+            View::Settings => {}
+        }
+    }
+
+    /// Keep the draft settings, save them, and go back to the sidebar.
+    fn save_settings(&mut self) {
+        self.state.commit_settings();
         self.state.notice = Some(match &self.settings_store {
             Some(store) => match store.save(&self.state.settings) {
-                Ok(()) => Notice::info(format!("{row}: {state}")),
-                Err(error) => Notice::error(format!("{row}: {state} (not saved: {error})")),
+                Ok(()) => Notice::info("settings saved"),
+                Err(error) => Notice::error(format!("settings not saved: {error}")),
             },
-            None => Notice::info(format!("{row}: {state} (this launch only)")),
+            None => Notice::info("settings applied for this launch"),
         });
     }
 
@@ -163,7 +207,7 @@ impl App {
             return;
         };
         if self.state.selected_session().is_some() {
-            self.state.focus = Focus::Stream;
+            self.state.view = View::Stream;
             self.state.notice = Some(Notice::info("already attached"));
             return;
         }
@@ -191,7 +235,7 @@ impl App {
             opened.baud,
             opened.control.holder.clone(),
         );
-        self.state.focus = Focus::Stream;
+        self.state.view = View::Stream;
         self.state.notice = Some(Notice::info(format!(
             "opened {} at {} baud",
             opened.port, opened.baud

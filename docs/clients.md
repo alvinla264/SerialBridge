@@ -93,59 +93,61 @@ public for wrappers with their own launch strategy.
 (so a missing core is started automatically) as a human client and never takes
 AI write control.
 
-- The header names the selected device, its active baud, the AI control holder
-  and whether this terminal is attached; its right side says which pane has the
-  keys. The sidebar lists every device the core can see, with open/closed state
-  (`●`/`○`), its baud, the AI control holder and its description. `Tab` switches
-  between the sidebar and the stream.
-- In the sidebar, `Enter` (or `o`) opens a closed device (after the baud prompt,
-  default `115200`) or joins an open one at its active rate, `b` opens the baud
-  prompt, `d` disconnects explicitly, and the arrow keys (or `j`/`k`) select.
-  Opened devices stay attached while switching.
-- In the stream, keys are written to the selected device as-is: arrows are ANSI
-  sequences, Enter is CR and Backspace is DEL. Nothing typed is echoed locally
-  unless the `local_echo` setting is on; the device's own echo is still shown.
+- The terminal has two working views and a settings view. `Ctrl+]` switches
+  between the sidebar and the stream. The sidebar is where a device is chosen;
+  it hides while the stream is shown, so the stream gets the whole screen. A
+  visible cursor sits on the device's own cursor position in the stream, on the
+  selected row in the sidebar, and on the selected flag in the settings.
+- The header names the selected device, its active baud, the AI control holder,
+  whether this terminal is attached and which view is showing.
+- In the sidebar, `↑`/`↓` (or `j`/`k`) select, `Enter` (or `o`) opens a closed
+  device (after the baud prompt, default `115200`) or rejoins an open one at its
+  active rate, `b` opens the baud prompt and `d` disconnects. Opened devices
+  stay attached while switching. The bottom row is the Settings button: select
+  it with the arrow keys and open it with `Enter`, or click it with the mouse.
+  `Ctrl+Q` quits from here. `]` sends a literal `Ctrl+]` to the selected device
+  and `Tab` sends a tab.
+- In the stream, keys are sent to the device as-is: arrows are ANSI sequences,
+  Enter is CR and Backspace is DEL, and `Tab`, `Ctrl+Q` and every printable key
+  go to the device. `Ctrl+]` is the only key the terminal keeps, to return to
+  the sidebar; that is why the sidebar's `]` sends the literal byte.
 - Device output is rendered through a small ANSI screen (cursor movement,
   erase, SGR colours/attributes, OSC titles ignored). AI writes appear inline in
-  a distinct colour, without labels; human writes are never added to the stream
-  as events. With local echo on, the keys a person types are shown in the
-  screen's default style, after the device accepted the write.
+  a distinct colour, without labels; human writes are not added to the stream as
+  events.
+- Local echo is on by default: the keys a person types in the stream are shown
+  in the screen's default style once the device accepted the write, so typing
+  is visible on a device that does not echo. Turn it off in the settings when
+  the device echoes what it receives.
+- The settings view lists both flags, `local_echo` and `scrollback`. `Tab`,
+  `Shift+Tab` and `↑`/`↓` move between them, `Space` (or `Enter`) toggles the
+  selection, `Ctrl+S` keeps the changes and saves the file, and `Esc` throws
+  every change away. Scrollback is stored before the stream can scroll: it is
+  part of the settings, and the scrolling interface reads the same flag.
 - The footer has a status line (errors, unplug notices, setting changes, the
-  baud prompt) and a line of key hints for the focused pane. A short terminal
+  baud prompt) and a line of key hints for the current view. A short terminal
   keeps the status line and hides the hints.
-- `F1` opens a list of every key, scrolled with `↑`/`↓` or `PageUp`/`PageDown`
-  when it does not fit; `Esc` closes it. `F2` opens the settings panel: `↑`/`↓`
-  (or `k`/`j`) select a setting, `Space`/`Enter` (or `←`/`→`) flips it, and each
-  change is saved at once. Function keys, not letters, open the panels, so a
-  serial console still receives every printable key, `?` included. A terminal
-  too small for a panel says it is open in one line, so its keys are never
-  swallowed silently.
 - Settings are stored per user in `$XDG_CONFIG_HOME/serial-nexus/terminal.json`
   (`~/.config/serial-nexus/terminal.json` when `XDG_CONFIG_HOME` is unset and
-  `HOME` is set). The file holds `version`, `local_echo` and `scrollback`.
-  `local_echo` is off by default because most devices echo what they receive,
-  so echoing here too would show each keystroke twice. A file written before
-  `version` existed had `local_echo` on as a stored default that then had no
-  effect; it is upgraded once on the next launch (echo left off, `version` set
-  to 1), and the panel can turn echo back on. `scrollback` is stored but has no
-  panel row yet: the stream does not keep the rows that leave the screen, so
-  offering the switch would be a control that does nothing.
-- The terminal loads the settings at launch and writes the defaults on the
+  `HOME` is set). The file holds `local_echo` and `scrollback`, both on by
+  default; the terminal loads them at launch and writes the defaults on the
   first launch. An invalid or unreadable file is reported in the footer and
   left untouched, never silently replaced, and settings changed in that launch
   are not saved; saves go to a temporary file and are renamed into place, and a
   failed save is reported.
-- `Ctrl+Q` (or `F10`) quits. Normal exit, I/O errors and panics restore raw
-  mode and the alternate screen, and explicitly disconnect every device.
-  Catchable termination signals (SIGTERM, SIGHUP) are not handled and may
-  leave the terminal in raw mode; SIGKILL cannot be handled.
+- `Ctrl+Q` in the sidebar (or `F10`) quits. Normal exit, I/O errors and panics
+  restore raw mode, the alternate screen and mouse capture, and explicitly
+  disconnect every device. Catchable termination signals (SIGTERM, SIGHUP) are
+  not handled and may leave the terminal in raw mode; SIGKILL cannot be
+  handled.
 
 Tests drive the real client/core seam through PTY-backed simulated devices:
-opening by prompt and joining, switching without reopening, no local echo,
-local echo turned on and off from the settings panel, a setting saved for the
-next launch, device echo, visible AI writes, baud conflicts, unplug notices,
-explicit disconnect and shutdown. State/input/render (including the panels and
-the footer layout) and the terminal cleanup guard are tested without a real
+opening by prompt and joining, switching without reopening, local echo on by
+default and off after a saved change, the stream owning `Tab` and `Ctrl+Q` while
+the sidebar quits on `Ctrl+Q`, the sidebar sending a literal `Ctrl+]`, settings
+drafts saved on `Ctrl+S` and discarded on `Esc`, device echo, visible AI writes,
+baud conflicts, unplug notices, explicit disconnect and shutdown.
+State/input/render and the terminal cleanup guard are tested without a real
 terminal.
 
 ### Core CLI
