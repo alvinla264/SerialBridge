@@ -96,17 +96,10 @@ AI write control.
 - The sidebar lists every device the core can see, with open/closed state, its
   active baud and the AI control holder. `Tab` switches between the sidebar
   and the stream.
-- In the sidebar, `Enter` opens a closed device (after the baud prompt, whose
-  default is the saved rate) or joins an open one at its active rate, `b` opens
-  the baud prompt, `d` disconnects explicitly, and the arrow keys select.
-  Opened devices stay attached while switching.
-- Settings are saved per user in `$XDG_CONFIG_HOME/serial-nexus/terminal.json`
-  (`~/.config/serial-nexus/terminal.json` when `XDG_CONFIG_HOME` is unset;
-  `SERIAL_NEXUS_TERMINAL_SETTINGS` names another file). The file holds
-  `default_baud`: the rate the baud prompt offers when left empty, updated to
-  the rate typed at the prompt. A missing, unreadable or invalid file falls
-  back to `115200`, and a failed save is reported in the footer without
-  stopping the open.
+- In the sidebar, `Enter` opens a closed device (after the baud prompt, default
+  `115200`) or joins an open one at its active rate, `b` opens the baud prompt,
+  `d` disconnects explicitly, and the arrow keys select. Opened devices stay
+  attached while switching.
 - In the stream, keys are written to the selected device as-is: arrows are ANSI
   sequences, Enter is CR and Backspace is DEL. Nothing typed is echoed locally;
   the device's own echo is still shown.
@@ -115,6 +108,13 @@ AI write control.
   a distinct colour, without labels; human writes are never added to the stream.
 - The header shows the selected path, active baud, AI control holder and
   attachment; the footer shows errors, unplug notices and the baud prompt.
+- Settings are stored per user in `$XDG_CONFIG_HOME/serial-nexus/terminal.json`
+  (`~/.config/serial-nexus/terminal.json` when `XDG_CONFIG_HOME` is unset and
+  `HOME` is set). The file holds `local_echo` and `scrollback`, both on by
+  default; the terminal loads them at launch and writes the defaults on the
+  first launch. An invalid or unreadable file is reported in the footer and
+  left untouched, never silently replaced; saves go to a temporary file and
+  are renamed into place, and a failed save is reported.
 - `Ctrl+Q` (or `F10`) quits. Normal exit, I/O errors and panics restore raw
   mode and the alternate screen, and explicitly disconnect every device.
   Catchable termination signals (SIGTERM, SIGHUP) are not handled and may

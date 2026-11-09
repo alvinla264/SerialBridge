@@ -271,7 +271,7 @@ fn draw_footer(state: &AppState, buffer: &mut Buffer, area: Rect) {
         let text = format!(
             " Baud for {} [{}]: {}{}",
             prompt.path,
-            prompt.default_baud,
+            serial_nexus_protocol::DEFAULT_BAUD,
             prompt.input,
             if prompt.error.is_some() { "" } else { "_" }
         );
@@ -456,13 +456,12 @@ mod tests {
     fn baud_prompt_is_drawn_with_the_default_and_typed_digits() {
         let mut state = demo_state();
         state.select_path("/dev/ttyUSB0");
-        state.default_baud = 57_600;
         assert!(state.begin_baud_prompt());
         state.prompt_push('9');
         state.prompt_push('6');
         let screen = lines(&state, 100, 16).join("\n");
         assert!(screen.contains("Baud for /dev/ttyUSB0"), "{screen}");
-        assert!(screen.contains("57600"), "{screen}");
+        assert!(screen.contains("115200"), "{screen}");
         assert!(screen.contains("96"), "{screen}");
     }
 

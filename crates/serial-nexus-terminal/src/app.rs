@@ -2,14 +2,13 @@
 //! not depend on a real terminal.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 
 use crossbeam_channel::Receiver;
 use serial_nexus_client::{Client, ClientError};
 use serial_nexus_protocol::{DeviceSummary, Event};
 
 use crate::input::{map_key, Action, Key};
-use crate::settings::{self, TerminalSettings};
+use crate::settings::TerminalSettings;
 use crate::state::{short_holder, AppState, DeviceEntry, Focus, Notice};
 
 /// Wire the app to a connected core. The core is started by
@@ -21,41 +20,35 @@ pub struct App {
     /// Closures this terminal asked for; their `DeviceClosed` is not an unplug.
     expected_closes: HashSet<u64>,
     settings: TerminalSettings,
-    /// Where settings are saved; `None` keeps them in memory only.
-    settings_path: Option<PathBuf>,
-    /// A save failed, so the next prompt submission tries again even for the
-    /// same rate.
-    settings_dirty: bool,
 }
 
 impl App {
     pub fn new(client: Client, rows: usize, cols: usize) -> Self {
-        Self::with_settings(client, rows, cols, TerminalSettings::default(), None)
+        Self::with_settings(client, rows, cols, TerminalSettings::default())
     }
 
-    /// Like [`App::new`], with settings loaded from disk and saved back to
-    /// `settings_path`.
+    /// Like [`App::new`], with settings loaded for this launch.
     pub fn with_settings(
         client: Client,
         rows: usize,
         cols: usize,
         settings: TerminalSettings,
-        settings_path: Option<PathBuf>,
     ) -> Self {
         let events = client.subscribe();
-        let mut state = AppState::new(rows, cols);
-        state.default_baud = settings.default_baud;
         let mut app = Self {
-            state,
+            state: AppState::new(rows, cols),
             client,
             events,
             expected_closes: HashSet::new(),
             settings,
-            settings_path,
-            settings_dirty: false,
         };
         app.refresh_devices();
         app
+    }
+
+    /// The settings this launch loaded.
+    pub fn settings(&self) -> &TerminalSettings {
+        &self.settings
     }
 
     pub fn client(&self) -> &Client {
@@ -156,50 +149,18 @@ impl App {
             return;
         };
         match prompt.value() {
-            Ok(baud) => {
-                let save_error = self.remember_baud(baud);
-                match self.open_path(&prompt.path, Some(baud)) {
-                    Ok(_) => {
-                        if let Some(message) = save_error {
-                            self.state.notice = Some(Notice::error(message));
-                        }
-                    }
-                    Err(error) => {
-                        let mut prompt = prompt;
-                        prompt.error = Some(error.to_string());
-                        self.state.prompt = Some(prompt);
-                    }
+            Ok(baud) => match self.open_path(&prompt.path, Some(baud)) {
+                Ok(_) => {}
+                Err(error) => {
+                    let mut prompt = prompt;
+                    prompt.error = Some(error.to_string());
+                    self.state.prompt = Some(prompt);
                 }
-            }
+            },
             Err(message) => {
                 let mut prompt = prompt;
                 prompt.error = Some(message);
                 self.state.prompt = Some(prompt);
-            }
-        }
-    }
-
-    /// Keep the rate the human just chose as the next prompt's default.
-    /// Returns the problem when it could not be written to disk; the terminal
-    /// still opens the device, and a later submission retries the save.
-    fn remember_baud(&mut self, baud: u32) -> Option<String> {
-        if baud == self.settings.default_baud && !self.settings_dirty {
-            return None;
-        }
-        self.settings.default_baud = baud;
-        self.state.default_baud = baud;
-        let path = self.settings_path.as_ref()?;
-        match settings::save(path, &self.settings) {
-            Ok(()) => {
-                self.settings_dirty = false;
-                None
-            }
-            Err(error) => {
-                self.settings_dirty = true;
-                Some(format!(
-                    "could not save settings {}: {error}",
-                    path.display()
-                ))
             }
         }
     }

@@ -10,7 +10,7 @@ use serial_nexus_client::{Client, ClientConfig, ClientInfo};
 use serial_nexus_terminal::app::App;
 use serial_nexus_terminal::input::Key;
 use serial_nexus_terminal::render::{render, stream_body_area};
-use serial_nexus_terminal::settings::{self, TerminalSettings};
+use serial_nexus_terminal::settings::{SettingsStore, TerminalSettings};
 use serial_nexus_terminal::state::Notice;
 use serial_nexus_terminal::terminal::{CleanupGuard, CrosstermOps};
 
@@ -29,21 +29,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = ClientConfig::new(ClientInfo::human("serial-nexus-terminal"));
     let client = Client::connect(config)?;
 
-    // Saved settings are a convenience: an unreadable file falls back to the
-    // defaults and is reported, not fatal.
-    let settings_path = settings::default_path();
-    let (saved, load_error) = match &settings_path {
-        Some(path) => match settings::load(path) {
-            Ok(saved) => (saved, None),
+    // Settings are a convenience: an unreadable or invalid file leaves the
+    // defaults in effect, is reported, and is never overwritten.
+    let (settings, settings_error) = match SettingsStore::from_env() {
+        Some(store) => match store.load_or_create() {
+            Ok(settings) => (settings, None),
             Err(error) => (
                 TerminalSettings::default(),
-                Some(format!("could not read {}: {error}", path.display())),
+                Some(format!("settings {}: {error}", store.path().display())),
             ),
         },
         None => (TerminalSettings::default(), None),
     };
-    let mut app = App::with_settings(client, 24, 80, saved, settings_path);
-    if let Some(message) = load_error {
+    let mut app = App::with_settings(client, 24, 80, settings);
+    if let Some(message) = settings_error {
         app.state.notice = Some(Notice::error(message));
     }
 

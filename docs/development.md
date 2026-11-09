@@ -66,7 +66,9 @@ path as a real serial port and the test drives the master. Covered end to end:
   path, a missing binary, and the started core owning a separate session);
 - the terminal's sidebar/prompt/switch/disconnect flows, no local echo,
   visible AI writes, unplug and shutdown through the same core. The terminal's
-  stream parsing and key mapping are covered by unit tests.
+  stream parsing and key mapping are covered by unit tests, and its settings
+  cover defaults, a missing file, round trips, invalid and unreadable files
+  left untouched, and save failures.
 
 `serial-nexus-mcp` additionally has end-to-end tests over real MCP stdio framing:
 handshake and tool listing, protocol errors, default and joined baud, rejected

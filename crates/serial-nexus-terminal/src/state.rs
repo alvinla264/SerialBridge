@@ -101,36 +101,26 @@ pub struct BaudPrompt {
     pub path: String,
     pub input: String,
     pub error: Option<String>,
-    /// Rate used when the field is left empty (the saved setting).
-    pub default_baud: u32,
 }
 
 impl BaudPrompt {
     pub fn new(path: impl Into<String>) -> Self {
-        Self::with_default(path, DEFAULT_BAUD)
-    }
-
-    pub fn with_default(path: impl Into<String>, default_baud: u32) -> Self {
         Self {
             path: path.into(),
             input: String::new(),
             error: None,
-            default_baud,
         }
     }
 
-    /// Typed rate, or [`Self::default_baud`] when the field is left empty.
+    /// Typed rate, or [`DEFAULT_BAUD`] when the field is left empty.
     pub fn value(&self) -> Result<u32, String> {
         let text = self.input.trim();
         if text.is_empty() {
-            return Ok(self.default_baud);
+            return Ok(DEFAULT_BAUD);
         }
         match text.parse::<u32>() {
-            Ok(baud) if (1..=crate::settings::MAX_BAUD).contains(&baud) => Ok(baud),
-            Ok(_) => Err(format!(
-                "{text} is outside 1..{}",
-                crate::settings::MAX_BAUD
-            )),
+            Ok(baud) if (1..=4_000_000).contains(&baud) => Ok(baud),
+            Ok(_) => Err(format!("{text} is outside 1..4000000")),
             Err(_) => Err(format!("{text} is not a baud rate")),
         }
     }
@@ -144,8 +134,6 @@ pub struct AppState {
     pub sessions: BTreeMap<u64, Session>,
     pub notice: Option<Notice>,
     pub prompt: Option<BaudPrompt>,
-    /// Rate the baud prompt offers when left empty.
-    pub default_baud: u32,
     pub quit: bool,
     rows: usize,
     cols: usize,
@@ -166,7 +154,6 @@ impl AppState {
             sessions: BTreeMap::new(),
             notice: None,
             prompt: None,
-            default_baud: DEFAULT_BAUD,
             quit: false,
             rows: rows.max(1),
             cols: cols.max(1),
@@ -429,7 +416,7 @@ impl AppState {
             return false;
         }
         let path = device.path.clone();
-        self.prompt = Some(BaudPrompt::with_default(path, self.default_baud));
+        self.prompt = Some(BaudPrompt::new(path));
         true
     }
 
@@ -454,33 +441,5 @@ pub fn short_holder(holder: &Holder) -> String {
     match &holder.name {
         Some(name) => name.clone(),
         None => format!("client {}", holder.client_id),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_baud_prompt_offers_the_configured_default() {
-        let mut state = AppState::new(24, 80);
-        state.set_devices(vec![DeviceEntry::new("/dev/ttyUSB0")]);
-        state.default_baud = 57_600;
-        assert!(state.begin_baud_prompt());
-        let prompt = state.prompt.clone().expect("prompt");
-        assert_eq!(prompt.default_baud, 57_600);
-        assert_eq!(prompt.value(), Ok(57_600));
-    }
-
-    #[test]
-    fn a_typed_rate_wins_over_the_configured_default() {
-        let mut state = AppState::new(24, 80);
-        state.set_devices(vec![DeviceEntry::new("/dev/ttyUSB0")]);
-        state.default_baud = 57_600;
-        assert!(state.begin_baud_prompt());
-        for ch in "19200".chars() {
-            state.prompt_push(ch);
-        }
-        assert_eq!(state.prompt.clone().expect("prompt").value(), Ok(19_200));
     }
 }

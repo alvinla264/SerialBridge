@@ -73,14 +73,14 @@ fn opens_two_devices_switches_and_keeps_both_connected() {
     ]);
     app.state.select_path(&second.path);
     app.handle_key(Key::Enter); // closed: prompt again
-    app.handle_key(Key::Enter); // empty input: the last rate chosen, 19200
+    app.handle_key(Key::Enter); // empty input: documented default 115200
     let second_id = app
         .state
         .selected_session()
         .expect("second device opened")
         .device_id;
     assert_eq!(app.state.sessions.len(), 2);
-    assert_eq!(app.state.selected_session().unwrap().baud, 19_200);
+    assert_eq!(app.state.selected_session().unwrap().baud, 115_200);
 
     // Typing goes to the selected device.
     app.handle_key(Key::Char('b'));
@@ -109,7 +109,7 @@ fn opens_two_devices_switches_and_keeps_both_connected() {
         .find(|device| device.path == second.path)
         .expect("second listed");
     assert!(second_summary.open);
-    assert_eq!(second_summary.baud, Some(19_200));
+    assert_eq!(second_summary.baud, Some(115_200));
     assert!(app.client().status(first_id).is_ok());
     assert!(app.client().status(second_id).is_ok());
 
@@ -397,119 +397,27 @@ fn explicit_disconnect_leaves_the_other_device_connected() {
 }
 
 #[test]
-fn the_baud_prompt_remembers_the_last_rate_in_settings() {
-    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
-    let first = SimulatedDevice::new();
-    let settings_dir = tempfile::tempdir().unwrap();
-    let path = settings_dir.path().join("serial-nexus/terminal.json");
-
-    // First run: the human types a rate at the prompt and it is saved.
-    let client = Client::connect_to_socket(&socket, ClientInfo::human("terminal-settings-1"))
-        .expect("terminal connects");
-    let mut app = App::with_settings(
-        client,
-        40,
-        120,
-        serial_nexus_terminal::settings::TerminalSettings::default(),
-        Some(path.clone()),
-    );
-    app.state
-        .set_devices(vec![serial_nexus_terminal::state::DeviceEntry::new(
-            &first.path,
-        )]);
-    app.handle_key(Key::Char('b'));
-    for ch in "19200".chars() {
-        app.handle_key(Key::Char(ch));
-    }
-    app.handle_key(Key::Enter);
-    assert_eq!(app.state.selected_session().expect("opened").baud, 19_200);
-    assert_eq!(
-        serial_nexus_terminal::settings::load(&path)
-            .expect("settings saved")
-            .default_baud,
-        19_200
-    );
-    app.shutdown();
-
-    // Next run: the prompt offers that rate, and Enter opens at it.
-    let second = SimulatedDevice::new();
-    let saved = serial_nexus_terminal::settings::load(&path).expect("settings loaded");
-    let client = Client::connect_to_socket(&socket, ClientInfo::human("terminal-settings-2"))
-        .expect("terminal connects");
-    let mut app = App::with_settings(client, 40, 120, saved, Some(path.clone()));
-    app.state
-        .set_devices(vec![serial_nexus_terminal::state::DeviceEntry::new(
-            &second.path,
-        )]);
-    app.handle_key(Key::Char('b'));
-    assert_eq!(
-        app.state.prompt.as_ref().expect("prompt").default_baud,
-        19_200
-    );
-    app.handle_key(Key::Enter);
-    assert_eq!(app.state.selected_session().expect("opened").baud, 19_200);
-
-    app.shutdown();
-}
-
-#[test]
-fn an_unwritable_settings_file_does_not_stop_the_terminal_opening_a_device() {
+fn launch_settings_are_loaded_into_the_app_and_do_not_change_baud_behavior() {
     let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
     let device = SimulatedDevice::new();
-    let settings_dir = tempfile::tempdir().unwrap();
-    // A regular file where the settings directory should be makes saving fail.
-    let blocker = settings_dir.path().join("serial-nexus");
-    std::fs::write(&blocker, "not a directory").unwrap();
-    let path = blocker.join("terminal.json");
-
-    let client = Client::connect_to_socket(&socket, ClientInfo::human("terminal-settings-3"))
+    let settings = serial_nexus_terminal::settings::TerminalSettings {
+        local_echo: false,
+        scrollback: false,
+    };
+    let client = Client::connect_to_socket(&socket, ClientInfo::human("terminal-settings"))
         .expect("terminal connects");
-    let mut app = App::with_settings(
-        client,
-        40,
-        120,
-        serial_nexus_terminal::settings::TerminalSettings::default(),
-        Some(path.clone()),
-    );
+    let mut app = App::with_settings(client, 40, 120, settings.clone());
+    assert_eq!(app.settings(), &settings);
+
+    // Settings do not touch device opening: an empty baud prompt still asks
+    // the core for the documented default rate.
     app.state
         .set_devices(vec![serial_nexus_terminal::state::DeviceEntry::new(
             &device.path,
         )]);
     app.handle_key(Key::Char('b'));
-    for ch in "9600".chars() {
-        app.handle_key(Key::Char(ch));
-    }
     app.handle_key(Key::Enter);
-
-    assert_eq!(app.state.selected_session().expect("opened").baud, 9_600);
-    let notice = app.state.notice.as_ref().expect("save failure is reported");
-    assert!(
-        notice.text.contains("settings"),
-        "notice should name the settings file: {notice:?}"
-    );
-
-    // Once storage works again, submitting the same rate retries the save
-    // instead of treating the in-memory value as already persisted.
-    std::fs::remove_file(&blocker).unwrap();
-    let second = SimulatedDevice::new();
-    app.state
-        .set_devices(vec![serial_nexus_terminal::state::DeviceEntry::new(
-            &second.path,
-        )]);
-    assert!(app.state.select_path(&second.path));
-    app.state.focus = Focus::Devices;
-    app.handle_key(Key::Char('b'));
-    for ch in "9600".chars() {
-        app.handle_key(Key::Char(ch));
-    }
-    app.handle_key(Key::Enter);
-    assert_eq!(app.state.selected_session().expect("opened").baud, 9_600);
-    assert_eq!(
-        serial_nexus_terminal::settings::load(&path)
-            .expect("settings saved after recovery")
-            .default_baud,
-        9_600
-    );
+    assert_eq!(app.state.selected_session().expect("opened").baud, 115_200);
 
     app.shutdown();
 }

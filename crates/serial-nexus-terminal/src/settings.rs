@@ -1,4 +1,4 @@
-//! The human terminal's own settings, persisted between runs.
+//! The human terminal's own settings, stored between launches.
 //!
 //! The file is small JSON so it stays readable and hand-editable. It belongs
 //! to the terminal, not the core: each human's preferences are their own.
@@ -8,36 +8,25 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use serial_nexus_protocol::DEFAULT_BAUD;
 
-/// Environment variable naming an explicit settings file.
-pub const SETTINGS_ENV: &str = "SERIAL_NEXUS_TERMINAL_SETTINGS";
+/// File name under the per-user configuration directory.
+pub const SETTINGS_FILE: &str = "terminal.json";
 
-/// Same bound the baud prompt accepts.
-pub const MAX_BAUD: u32 = 4_000_000;
-
-/// Preferences the terminal keeps between runs.
+/// Preferences the terminal keeps between launches.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TerminalSettings {
-    /// Rate offered when the baud prompt is left empty.
-    pub default_baud: u32,
+    /// Echo keys typed in the stream back into the local view.
+    pub local_echo: bool,
+    /// Keep device output around for scrolling back.
+    pub scrollback: bool,
 }
 
 impl Default for TerminalSettings {
     fn default() -> Self {
         Self {
-            default_baud: DEFAULT_BAUD,
-        }
-    }
-}
-
-impl TerminalSettings {
-    /// Reject values the baud prompt would reject, so a hand-edited or stale
-    /// file cannot make the terminal unusable.
-    fn sanitise(&mut self) {
-        if !(1..=MAX_BAUD).contains(&self.default_baud) {
-            self.default_baud = DEFAULT_BAUD;
+            local_echo: true,
+            scrollback: true,
         }
     }
 }
@@ -51,149 +40,242 @@ pub enum SettingsError {
     Json(#[from] serde_json::Error),
 }
 
-/// The settings file to use, if this machine has a place for one.
+/// One user's settings file.
+#[derive(Clone, Debug)]
+pub struct SettingsStore {
+    path: PathBuf,
+}
+
+impl SettingsStore {
+    /// The store for this user, or `None` when the environment names no
+    /// configuration directory.
+    pub fn from_env() -> Option<Self> {
+        default_path().map(|path| Self { path })
+    }
+
+    /// A store for an explicit file (tests, embedding).
+    pub fn at(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Read the settings file. `Ok(None)` means the file does not exist yet;
+    /// an unreadable or invalid file is an error, never silently replaced.
+    pub fn load(&self) -> Result<Option<TerminalSettings>, SettingsError> {
+        match fs::read_to_string(&self.path) {
+            Ok(text) => Ok(Some(serde_json::from_str(&text)?)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Read the settings file, creating it with the defaults when it does not
+    /// exist. An unreadable or invalid file is returned as an error and left
+    /// untouched, so a hand-edited file is never silently overwritten.
+    pub fn load_or_create(&self) -> Result<TerminalSettings, SettingsError> {
+        match self.load()? {
+            Some(settings) => Ok(settings),
+            None => {
+                let settings = TerminalSettings::default();
+                self.save(&settings)?;
+                Ok(settings)
+            }
+        }
+    }
+
+    /// Write the settings, creating their directory. The write goes to a
+    /// sibling temporary file first, so an interrupted save cannot truncate
+    /// the file the terminal loaded.
+    pub fn save(&self, settings: &TerminalSettings) -> Result<(), SettingsError> {
+        if let Some(parent) = self.path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let text = serde_json::to_string_pretty(settings)? + "\n";
+        let name = self
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| SETTINGS_FILE.to_string());
+        let temporary = self
+            .path
+            .with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+        if let Err(error) = fs::write(&temporary, text) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+        if let Err(error) = fs::rename(&temporary, &self.path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+        Ok(())
+    }
+}
+
+/// The settings file for this user, if the environment names a place for it.
 pub fn default_path() -> Option<PathBuf> {
-    let explicit = std::env::var_os(SETTINGS_ENV).map(PathBuf::from);
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    settings_path(explicit, xdg, home)
+    settings_path(xdg, home)
 }
 
-/// The pure form of [`default_path`]: inputs are explicit so the naming can be
-/// tested without touching the environment.
-fn settings_path(
-    explicit: Option<PathBuf>,
-    xdg: Option<PathBuf>,
-    home: Option<PathBuf>,
-) -> Option<PathBuf> {
-    if let Some(path) = explicit.filter(|path| !path.as_os_str().is_empty()) {
-        return Some(path);
-    }
-    if let Some(dir) = xdg.filter(|dir| !dir.as_os_str().is_empty()) {
-        return Some(dir.join("serial-nexus").join("terminal.json"));
-    }
-    home.filter(|dir| !dir.as_os_str().is_empty()).map(|dir| {
-        dir.join(".config")
-            .join("serial-nexus")
-            .join("terminal.json")
-    })
-}
-
-/// Load settings from `path`. A missing file means the defaults.
-pub fn load(path: &Path) -> Result<TerminalSettings, SettingsError> {
-    match fs::read_to_string(path) {
-        Ok(text) => {
-            let mut settings: TerminalSettings = serde_json::from_str(&text)?;
-            settings.sanitise();
-            Ok(settings)
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(TerminalSettings::default()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-/// Save settings to `path`, creating its directory. The write goes to a
-/// sibling temporary file first so an interrupted save cannot truncate the
-/// settings the terminal loaded.
-pub fn save(path: &Path, settings: &TerminalSettings) -> Result<(), SettingsError> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
-    }
-    let text = serde_json::to_string_pretty(settings)? + "\n";
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "terminal.json".to_string());
-    let temporary = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
-    fs::write(&temporary, text)?;
-    if let Err(error) = fs::rename(&temporary, path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error.into());
-    }
-    Ok(())
+/// The pure form of [`default_path`]: the inputs are explicit so the naming
+/// can be tested without touching the environment.
+fn settings_path(xdg: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    let directory = match xdg.filter(|dir| !dir.as_os_str().is_empty()) {
+        Some(dir) => dir,
+        None => home
+            .filter(|dir| !dir.as_os_str().is_empty())?
+            .join(".config"),
+    };
+    Some(directory.join("serial-nexus").join(SETTINGS_FILE))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::os::unix::fs::PermissionsExt;
 
-    #[test]
-    fn a_missing_file_loads_the_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        let settings = load(&dir.path().join("terminal.json")).expect("missing file is fine");
-        assert_eq!(settings, TerminalSettings::default());
-        assert_eq!(settings.default_baud, DEFAULT_BAUD);
-    }
-
-    #[test]
-    fn save_then_load_round_trips_and_creates_its_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nested/config/terminal.json");
-        let settings = TerminalSettings {
-            default_baud: 19_200,
-        };
-        save(&path, &settings).expect("save");
-        assert_eq!(load(&path).expect("load"), settings);
-    }
-
-    #[test]
-    fn an_invalid_file_is_an_error_not_a_crash() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("terminal.json");
-        std::fs::write(&path, "this is not json").unwrap();
-        assert!(load(&path).is_err());
-    }
-
-    #[test]
-    fn an_out_of_range_rate_falls_back_to_the_default() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("terminal.json");
-        for bad in ["0", "4000001"] {
-            std::fs::write(&path, format!("{{\"default_baud\":{bad}}}")).unwrap();
-            assert_eq!(
-                load(&path).expect("load").default_baud,
-                DEFAULT_BAUD,
-                "default_baud {bad} should be ignored"
-            );
+    fn both_off() -> TerminalSettings {
+        TerminalSettings {
+            local_echo: false,
+            scrollback: false,
         }
     }
 
     #[test]
-    fn unknown_keys_are_ignored_and_missing_ones_take_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("terminal.json");
-        std::fs::write(&path, "{\"future\":true}").unwrap();
-        assert_eq!(load(&path).expect("load"), TerminalSettings::default());
-        std::fs::write(&path, "{\"future\":true,\"default_baud\":9600}").unwrap();
-        assert_eq!(load(&path).expect("load").default_baud, 9600);
+    fn the_defaults_are_both_on() {
+        let settings = TerminalSettings::default();
+        assert!(settings.local_echo);
+        assert!(settings.scrollback);
     }
 
     #[test]
-    fn the_path_prefers_the_environment_then_xdg_then_home() {
-        let explicit = Path::new("/tmp/own.json");
+    fn a_missing_file_is_not_an_error_and_is_created_with_the_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SettingsStore::at(dir.path().join("config/terminal.json"));
+
+        assert_eq!(store.load().expect("missing is fine"), None);
         assert_eq!(
-            settings_path(
-                Some(explicit.to_path_buf()),
-                Some(PathBuf::from("/xdg")),
-                Some(PathBuf::from("/home/a"))
-            ),
-            Some(explicit.to_path_buf())
+            store.load_or_create().expect("created"),
+            TerminalSettings::default()
         );
+
+        // The next launch reads what the first one wrote.
         assert_eq!(
-            settings_path(
-                None,
-                Some(PathBuf::from("/xdg")),
-                Some(PathBuf::from("/home/a"))
-            ),
+            store.load().expect("load").expect("the file exists"),
+            TerminalSettings::default()
+        );
+    }
+
+    #[test]
+    fn settings_round_trip_across_launches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serial-nexus/terminal.json");
+        SettingsStore::at(&path)
+            .save(&both_off())
+            .expect("save both off");
+
+        // A fresh store is a later launch.
+        let loaded = SettingsStore::at(&path)
+            .load()
+            .expect("load")
+            .expect("file");
+        assert_eq!(loaded, both_off());
+    }
+
+    #[test]
+    fn unknown_keys_are_ignored_and_missing_fields_stay_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal.json");
+        std::fs::write(&path, "{\"local_echo\":false,\"future\":true}").unwrap();
+        let settings = SettingsStore::at(&path)
+            .load()
+            .expect("load")
+            .expect("file");
+        assert!(!settings.local_echo);
+        assert!(settings.scrollback, "a missing field keeps its default");
+    }
+
+    #[test]
+    fn an_invalid_file_is_an_error_and_is_left_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal.json");
+        let broken = "{\"local_echo\": not a bool";
+        std::fs::write(&path, broken).unwrap();
+
+        assert!(SettingsStore::at(&path).load_or_create().is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no temporary file or replacement is left behind"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_file_is_an_error_and_is_left_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal.json");
+        std::fs::write(&path, "{\"local_echo\":false}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        assert!(SettingsStore::at(&path).load_or_create().is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"local_echo\":false}"
+        );
+    }
+
+    #[test]
+    fn save_creates_directories_and_leaves_only_the_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/config/terminal.json");
+        SettingsStore::at(&path).save(&both_off()).expect("save");
+
+        assert_eq!(SettingsStore::at(&path).load().unwrap(), Some(both_off()));
+        let names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("terminal.json")]);
+    }
+
+    #[test]
+    fn a_save_that_cannot_reach_its_directory_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("serial-nexus");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let store = SettingsStore::at(blocker.join("terminal.json"));
+
+        assert!(store.save(&both_off()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&blocker).unwrap(),
+            "not a directory"
+        );
+    }
+
+    #[test]
+    fn the_path_is_isolated_under_xdg_then_home() {
+        assert_eq!(
+            settings_path(Some(PathBuf::from("/xdg")), Some(PathBuf::from("/home/a"))),
             Some(PathBuf::from("/xdg/serial-nexus/terminal.json"))
         );
+        // An unset or empty XDG_CONFIG_HOME falls back to the home default.
         assert_eq!(
-            settings_path(None, None, Some(PathBuf::from("/home/a"))),
+            settings_path(None, Some(PathBuf::from("/home/a"))),
             Some(PathBuf::from("/home/a/.config/serial-nexus/terminal.json"))
         );
-        assert_eq!(settings_path(None, None, None), None);
+        assert_eq!(
+            settings_path(Some(PathBuf::new()), Some(PathBuf::from("/home/a"))),
+            Some(PathBuf::from("/home/a/.config/serial-nexus/terminal.json"))
+        );
+        assert_eq!(settings_path(None, None), None);
+        assert_eq!(settings_path(Some(PathBuf::new()), None), None);
     }
 }
