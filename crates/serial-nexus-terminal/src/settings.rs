@@ -80,8 +80,16 @@ impl SettingsStore {
             Some(settings) => Ok(settings),
             None => {
                 let settings = TerminalSettings::default();
-                self.save(&settings)?;
-                Ok(settings)
+                match self.save_defaults(&settings) {
+                    Ok(()) => Ok(settings),
+                    // Another launch created the file first: use theirs.
+                    Err(SettingsError::Io(error))
+                        if error.kind() == io::ErrorKind::AlreadyExists =>
+                    {
+                        Ok(self.load()?.unwrap_or(settings))
+                    }
+                    Err(error) => Err(error),
+                }
             }
         }
     }
@@ -91,13 +99,31 @@ impl SettingsStore {
     /// file the terminal loaded. The staging file is created exclusively, so
     /// an existing entry (even a symlink) cannot redirect the write.
     pub fn save(&self, settings: &TerminalSettings) -> Result<(), SettingsError> {
+        self.create_directory()?;
+        let text = serde_json::to_string_pretty(settings)? + "\n";
+        write_atomic(&self.path, &staging_path(&self.path), &text)
+    }
+
+    /// Write the defaults only when no file exists yet: a concurrent launch
+    /// that created one first wins, and is never replaced.
+    fn save_defaults(&self, settings: &TerminalSettings) -> Result<(), SettingsError> {
+        self.create_directory()?;
+        let text = serde_json::to_string_pretty(settings)? + "\n";
+        let temporary = staging_path(&self.path);
+        write_staging(&temporary, &text)?;
+        let linked = fs::hard_link(&temporary, &self.path);
+        let _ = fs::remove_file(&temporary);
+        linked?;
+        Ok(())
+    }
+
+    fn create_directory(&self) -> Result<(), SettingsError> {
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
             }
         }
-        let text = serde_json::to_string_pretty(settings)? + "\n";
-        write_atomic(&self.path, &staging_path(&self.path), &text)
+        Ok(())
     }
 }
 
@@ -105,6 +131,16 @@ impl SettingsStore {
 /// is created exclusively, so an existing entry (even a symlink) cannot
 /// redirect the write or make it destroy another file.
 fn write_atomic(path: &Path, temporary: &Path, text: &str) -> Result<(), SettingsError> {
+    write_staging(temporary, text)?;
+    if let Err(error) = fs::rename(temporary, path) {
+        let _ = fs::remove_file(temporary);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+/// Write `text` to an exclusively created staging file.
+fn write_staging(temporary: &Path, text: &str) -> Result<(), SettingsError> {
     let mut staging = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -114,11 +150,6 @@ fn write_atomic(path: &Path, temporary: &Path, text: &str) -> Result<(), Setting
         .and_then(|()| staging.sync_all())
     {
         drop(staging);
-        let _ = fs::remove_file(temporary);
-        return Err(error.into());
-    }
-    drop(staging);
-    if let Err(error) = fs::rename(temporary, path) {
         let _ = fs::remove_file(temporary);
         return Err(error.into());
     }
@@ -300,6 +331,40 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "sentinel");
         assert!(!path.exists(), "nothing was renamed into place");
+    }
+
+    #[test]
+    fn an_existing_file_is_never_replaced_by_the_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal.json");
+        std::fs::write(&path, "{\"local_echo\":false,\"scrollback\":false}").unwrap();
+
+        assert_eq!(
+            SettingsStore::at(&path).load_or_create().unwrap(),
+            both_off()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"local_echo\":false,\"scrollback\":false}"
+        );
+    }
+
+    #[test]
+    fn publishing_defaults_refuses_to_replace_a_file_that_appeared_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal.json");
+        let concurrent = "{\"local_echo\":invalid user edit}";
+        std::fs::write(&path, concurrent).unwrap();
+
+        let error = SettingsStore::at(&path)
+            .save_defaults(&TerminalSettings::default())
+            .expect_err("an existing file is not replaced");
+
+        assert!(
+            matches!(&error, SettingsError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists),
+            "unexpected error: {error}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), concurrent);
     }
 
     #[test]
