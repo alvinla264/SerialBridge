@@ -156,14 +156,21 @@ impl App {
     /// Leave the scrollback view for the live stream. The stream starts at the
     /// live screen, so its keys reach the device from where they land.
     fn leave_scrollback(&mut self) {
+        if self.state.selected_session().is_some() {
+            self.show_live_stream();
+        } else {
+            self.state.view = View::Devices;
+        }
+    }
+
+    /// Show the selected device's live stream, never a scrolled-back view.
+    /// Every route into the stream goes through here: the stream forwards keys
+    /// to the device, so what is drawn has to be where they land.
+    fn show_live_stream(&mut self) {
         if let Some(session) = self.state.selected_session_mut() {
             session.screen.scroll_to_bottom();
         }
-        self.state.view = if self.state.selected_session().is_some() {
-            View::Stream
-        } else {
-            View::Devices
-        };
+        self.state.view = View::Stream;
     }
 
     /// Scroll the scrollback view: positive goes back into the kept output,
@@ -252,11 +259,7 @@ impl App {
                     ));
                     return;
                 }
-                // The stream is the live screen, never a scrolled-back view.
-                if let Some(session) = self.state.selected_session_mut() {
-                    session.screen.scroll_to_bottom();
-                }
-                self.state.view = View::Stream;
+                self.show_live_stream();
                 self.state.notice = None;
             }
             View::Stream | View::Scrollback => self.state.view = View::Devices,
@@ -296,7 +299,7 @@ impl App {
             return;
         };
         if self.state.selected_session().is_some() {
-            self.state.view = View::Stream;
+            self.show_live_stream();
             self.state.notice = Some(Notice::info("already attached"));
             return;
         }
@@ -324,7 +327,7 @@ impl App {
             opened.baud,
             opened.control.holder.clone(),
         );
-        self.state.view = View::Stream;
+        self.show_live_stream();
         self.state.notice = Some(Notice::info(format!(
             "opened {} at {} baud",
             opened.port, opened.baud

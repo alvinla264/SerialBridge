@@ -1029,6 +1029,23 @@ fn b_from_the_sidebar_opens_scrollback_and_escape_returns_to_live() {
     let got = device.read_until(b"x", Duration::from_secs(3));
     assert_eq!(got, b"x", "scrollback keys never reach the device: {got:?}");
 
+    // Every way back to the stream shows the live screen: opening the
+    // attached device from the sidebar must not leave a scrolled-back view
+    // forwarding keys to the device.
+    app.handle_key(Key::Ctrl(']'));
+    app.handle_key(Key::Char('b'));
+    app.handle_key(Key::PageUp);
+    assert!(app.state.selected_session().unwrap().screen.scroll() > 0);
+    app.handle_key(Key::Ctrl(']'));
+    app.handle_key(Key::Enter);
+    assert_eq!(app.state.view, View::Stream);
+    assert_eq!(
+        app.state.selected_session().unwrap().screen.scroll(),
+        0,
+        "re-entering the stream returns to live"
+    );
+    assert!(view_text(&app).contains("line11"), "{}", view_text(&app));
+
     app.shutdown();
 }
 
