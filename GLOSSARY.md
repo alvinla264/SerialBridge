@@ -52,6 +52,11 @@ these words in their tool names and user-facing text.
   shown while a device is chosen. It hides in the **stream**.
 - **Stream**: the terminal view that shows a device's output and sends the
   keys typed in it to that device.
+- **Scrollback**: the rows a **stream** keeps after they scroll off the top of
+  the live view, so a human can scroll back through earlier output. Bounded,
+  in memory, per session, and kept only while the `scrollback` **setting** is
+  on. **Scrolled back** is a view showing those kept rows instead of the live
+  screen; it returns to live on the next key typed into the stream.
 - **Settings view**: the terminal view opened from the sidebar's Settings
   button, where `local_echo` and `scrollback` are edited and saved with
   `Ctrl+S`.

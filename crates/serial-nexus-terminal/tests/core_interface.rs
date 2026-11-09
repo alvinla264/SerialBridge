@@ -948,3 +948,99 @@ fn a_mouse_save_that_fails_changes_nothing_and_stays_on_the_page() {
 
     app.shutdown();
 }
+
+/// The view as the stream draws it: the live screen, or the rows the view is
+/// scrolled back to.
+fn view_text(app: &App) -> String {
+    let Some(session) = app.state.selected_session() else {
+        return String::new();
+    };
+    let screen = &session.screen;
+    (0..screen.rows())
+        .map(|row| {
+            (0..screen.cols())
+                .map(|col| screen.view_cell(row, col).ch)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn the_stream_scrolls_back_through_device_output_and_returns_to_live() {
+    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let mut device = SimulatedDevice::new();
+    let mut app = app(&socket);
+    app.open_path(&device.path, Some(115_200)).expect("open");
+    app.resize_stream(6, 40);
+
+    let lines: String = (0..12).map(|index| format!("line{index}\r\n")).collect();
+    device.write(lines.as_bytes());
+    pump_until(&mut app, Duration::from_secs(3), |app| {
+        stream_text(app).contains("line11")
+    });
+    assert!(
+        app.state.selected_session().unwrap().screen.history_len() > 0,
+        "the rows above the live view were kept"
+    );
+
+    // Shift+PageUp is the terminal's own key: a page back, not a device write.
+    app.handle_key(Key::ShiftPageUp);
+    let session = app.state.selected_session().unwrap();
+    assert!(session.screen.scroll() > 0);
+    let scrolled = view_text(&app);
+    assert!(scrolled.contains("line1"), "{scrolled}");
+    assert!(!scrolled.contains("line11"), "{scrolled}");
+
+    // Shift+Home shows the oldest kept line; Shift+End jumps back to live.
+    app.handle_key(Key::ShiftHome);
+    assert!(view_text(&app).contains("line0"), "{}", view_text(&app));
+    app.handle_key(Key::ShiftEnd);
+    assert_eq!(app.state.selected_session().unwrap().screen.scroll(), 0);
+    assert!(view_text(&app).contains("line11"));
+
+    // Typing goes to the device and brings the view back to live.
+    app.handle_key(Key::ShiftPageUp);
+    assert!(app.state.selected_session().unwrap().screen.scroll() > 0);
+    app.handle_key(Key::Char('x'));
+    device.read_until(b"x", Duration::from_secs(3));
+    assert_eq!(
+        app.state.selected_session().unwrap().screen.scroll(),
+        0,
+        "typing shows the live view again"
+    );
+
+    app.shutdown();
+}
+
+#[test]
+fn without_scrollback_output_is_not_kept_and_the_keys_do_nothing() {
+    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let mut device = SimulatedDevice::new();
+    let client = Client::connect_to_socket(&socket, ClientInfo::human("terminal-no-scrollback"))
+        .expect("terminal connects");
+    let settings = serial_nexus_terminal::settings::TerminalSettings {
+        local_echo: true,
+        scrollback: false,
+    };
+    let mut app = App::with_settings(client, 40, 120, settings);
+    app.open_path(&device.path, Some(115_200)).expect("open");
+    app.resize_stream(6, 40);
+
+    let lines: String = (0..12).map(|index| format!("line{index}\r\n")).collect();
+    device.write(lines.as_bytes());
+    pump_until(&mut app, Duration::from_secs(3), |app| {
+        stream_text(app).contains("line11")
+    });
+    assert_eq!(
+        app.state.selected_session().unwrap().screen.history_len(),
+        0,
+        "the setting turns keeping output off"
+    );
+    app.handle_key(Key::ShiftPageUp);
+    assert_eq!(app.state.selected_session().unwrap().screen.scroll(), 0);
+
+    app.shutdown();
+}

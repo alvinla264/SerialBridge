@@ -110,8 +110,16 @@ AI write control.
   settings abandons an open baud prompt.
 - In the stream, keys are sent to the device as-is: arrows are ANSI sequences,
   Enter is CR and Backspace is DEL, and `Tab`, `Ctrl+Q` and every printable key
-  go to the device. `Ctrl+]` is the only key the terminal keeps, to return to
-  the sidebar; that is why the sidebar's `]` sends the literal byte.
+  go to the device. `Ctrl+]` is the only plain key the terminal keeps, to return
+  to the sidebar; that is why the sidebar's `]` sends the literal byte.
+- The stream keeps its scrolled-off rows (up to 1000) while the `scrollback`
+  setting is on, so earlier output can be read again. `Shift+PageUp` and
+  `Shift+PageDown` scroll a page at a time, `Shift+Home` shows the oldest kept
+  line, `Shift+End` returns to the live view, and the mouse wheel scrolls three
+  lines a notch. The footer says how far back the view is, and the cursor is
+  hidden while it is scrolled back. Typing a key into the stream brings the
+  view back to live. With the setting off nothing is kept and those keys do
+  nothing; turning it off frees what was kept.
 - Device output is rendered through a small ANSI screen (cursor movement,
   erase, SGR colours/attributes, OSC titles ignored). AI writes appear inline in
   a distinct colour, without labels; human writes are not added to the stream as
@@ -129,9 +137,9 @@ AI write control.
   `Ctrl+S`. A save that fails — including a
   launch with no settings file to write — leaves the options as they were, says
   so in the footer, and stays in the settings so the draft is not lost; the
-  terminal never reports a save it did not make. Scrollback is stored before
-  the stream can scroll: it is part of the settings, and the scrolling
-  interface reads the same flag.
+  terminal never reports a save it did not make. Scrollback is saved like the
+  other flag: turning it off frees every session's kept rows and brings the
+  view back to live, and turning it on starts keeping rows from then on.
 - The footer has a status line (errors, unplug notices, setting changes, the
   baud prompt) and a line of key hints for the current view. A short terminal
   keeps the status line and hides the hints.
@@ -152,9 +160,11 @@ AI write control.
 Tests drive the real client/core seam through PTY-backed simulated devices:
 opening by prompt and joining, switching without reopening, local echo on by
 default and off after a saved change, the stream owning `Tab` and `Ctrl+Q` while
-the sidebar quits on `Ctrl+Q`, the sidebar sending a literal `Ctrl+]`, settings
-drafts saved on `Ctrl+S` and discarded on `Esc`, device echo, visible AI writes,
-baud conflicts, unplug notices, explicit disconnect and shutdown.
+the sidebar quits on `Ctrl+Q`, the sidebar sending a literal `Ctrl+]`, scrolling
+back through output kept by the `scrollback` setting (and nothing kept when it
+is off), typing returning the view to live, settings drafts saved on `Ctrl+S`
+and discarded on `Esc`, device echo, visible AI writes, baud conflicts, unplug
+notices, explicit disconnect and shutdown.
 State/input/render and the terminal cleanup guard are tested without a real
 terminal.
 

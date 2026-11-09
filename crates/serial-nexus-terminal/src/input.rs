@@ -24,6 +24,14 @@ pub enum Key {
     End,
     PageUp,
     PageDown,
+    /// Shift+PageUp: scroll the stream view back a page.
+    ShiftPageUp,
+    /// Shift+PageDown: scroll it forward a page.
+    ShiftPageDown,
+    /// Shift+Home: the oldest kept line.
+    ShiftHome,
+    /// Shift+End: back to the live view.
+    ShiftEnd,
     F(u8),
     Ctrl(char),
 }
@@ -45,6 +53,12 @@ pub enum Action {
     /// Bytes for the selected device. Never drawn locally unless local echo is
     /// on.
     Write(Vec<u8>),
+    /// Scroll the stream view back (`> 0`) or forward by lines.
+    Scroll(i32),
+    /// Scroll the stream view to the oldest kept line.
+    ScrollTop,
+    /// Scroll the stream view back to live.
+    ScrollBottom,
     /// Open the settings that the sidebar button offers.
     OpenSettings,
     SettingsMove(i32),
@@ -105,9 +119,17 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
             Key::Char('d') => Action::DisconnectSelected,
             _ => Action::Ignore,
         },
-        View::Stream => match encode_key(key) {
-            Some(bytes) => Action::Write(bytes),
-            None => Action::Ignore,
+        View::Stream => match key {
+            // Shift is the terminal's own scrollback, so the device keeps the
+            // plain page and home/end keys.
+            Key::ShiftPageUp => Action::Scroll(state.rows().max(1) as i32),
+            Key::ShiftPageDown => Action::Scroll(-(state.rows().max(1) as i32)),
+            Key::ShiftHome => Action::ScrollTop,
+            Key::ShiftEnd => Action::ScrollBottom,
+            key => match encode_key(key) {
+                Some(bytes) => Action::Write(bytes),
+                None => Action::Ignore,
+            },
         },
         View::Settings => Action::Ignore,
     }
@@ -121,7 +143,12 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
 /// Both spell the same key here, so the toggle works either way.
 pub fn translate(event: KeyEvent) -> Option<Key> {
     let control = event.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = event.modifiers.contains(KeyModifiers::SHIFT);
     match event.code {
+        KeyCode::PageUp if shift => Some(Key::ShiftPageUp),
+        KeyCode::PageDown if shift => Some(Key::ShiftPageDown),
+        KeyCode::Home if shift => Some(Key::ShiftHome),
+        KeyCode::End if shift => Some(Key::ShiftEnd),
         KeyCode::Char(']') if control => Some(Key::Ctrl(']')),
         KeyCode::Char('5') if control => Some(Key::Ctrl(']')),
         KeyCode::Char(ch) if control => Some(Key::Ctrl(ch.to_ascii_lowercase())),
@@ -195,6 +222,8 @@ pub fn encode_key(key: Key) -> Option<Vec<u8>> {
                 return None;
             }
         }
+        // The terminal's own scrolling never reaches a device.
+        Key::ShiftPageUp | Key::ShiftPageDown | Key::ShiftHome | Key::ShiftEnd => return None,
     };
     Some(bytes)
 }
@@ -353,6 +382,56 @@ mod tests {
         // Nothing typed here reaches a device.
         assert_eq!(map_key(&state, Key::Char('x')), Action::Ignore);
         assert_eq!(map_key(&state, Key::Ctrl(']')), Action::Ignore);
+    }
+
+    #[test]
+    fn shift_page_and_home_end_scroll_the_stream_view() {
+        let mut state = state_with_device();
+        assert_eq!(
+            map_key(&state, Key::ShiftPageUp),
+            Action::Ignore,
+            "the sidebar is not the stream"
+        );
+        state.view = View::Stream;
+        assert_eq!(map_key(&state, Key::ShiftPageUp), Action::Scroll(20));
+        assert_eq!(map_key(&state, Key::ShiftPageDown), Action::Scroll(-20));
+        assert_eq!(map_key(&state, Key::ShiftHome), Action::ScrollTop);
+        assert_eq!(map_key(&state, Key::ShiftEnd), Action::ScrollBottom);
+
+        // Plain page keys stay the device's.
+        assert_eq!(
+            map_key(&state, Key::PageUp),
+            Action::Write(b"\x1b[5~".to_vec())
+        );
+        assert_eq!(
+            map_key(&state, Key::PageDown),
+            Action::Write(b"\x1b[6~".to_vec())
+        );
+    }
+
+    #[test]
+    fn the_shifted_scroll_keys_come_through_translate() {
+        use crossterm::event::KeyEvent;
+        assert_eq!(
+            translate(KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT)),
+            Some(Key::ShiftPageUp)
+        );
+        assert_eq!(
+            translate(KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT)),
+            Some(Key::ShiftPageDown)
+        );
+        assert_eq!(
+            translate(KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT)),
+            Some(Key::ShiftHome)
+        );
+        assert_eq!(
+            translate(KeyEvent::new(KeyCode::End, KeyModifiers::SHIFT)),
+            Some(Key::ShiftEnd)
+        );
+        assert_eq!(
+            translate(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            Some(Key::PageUp)
+        );
     }
 
     #[test]

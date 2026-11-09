@@ -120,6 +120,9 @@ impl App {
             Action::PromptCancel => self.state.prompt = None,
             Action::PromptSubmit => self.submit_baud_prompt(),
             Action::Write(bytes) => self.write_selected(&bytes, key),
+            Action::Scroll(delta) => self.scroll_stream(delta),
+            Action::ScrollTop => self.scroll_stream_to_top(),
+            Action::ScrollBottom => self.scroll_stream_to_bottom(),
             Action::OpenSettings => self.open_settings(),
             Action::SettingsMove(delta) => self.state.move_settings_row(delta),
             Action::SettingsToggle => {
@@ -129,6 +132,40 @@ impl App {
             Action::SettingsCancel => self.state.cancel_settings(),
             Action::Ignore => {}
         }
+    }
+
+    /// Scroll the stream view: positive goes back into the kept output,
+    /// negative returns towards live.
+    fn scroll_stream(&mut self, delta: i32) {
+        let Some(session) = self.state.selected_session_mut() else {
+            return;
+        };
+        if delta > 0 {
+            session.screen.scroll_back(delta as usize);
+        } else {
+            session.screen.scroll_forward(delta.unsigned_abs() as usize);
+        }
+    }
+
+    fn scroll_stream_to_top(&mut self) {
+        if let Some(session) = self.state.selected_session_mut() {
+            session.screen.scroll_to_top();
+        }
+    }
+
+    fn scroll_stream_to_bottom(&mut self) {
+        if let Some(session) = self.state.selected_session_mut() {
+            session.screen.scroll_to_bottom();
+        }
+    }
+
+    /// One mouse-wheel notch in the stream: three lines back or forward.
+    pub fn handle_scroll(&mut self, up: bool) {
+        if self.state.view != View::Stream {
+            return;
+        }
+        const NOTCH: i32 = 3;
+        self.scroll_stream(if up { NOTCH } else { -NOTCH });
     }
 
     /// Move the sidebar selection over the devices and the Settings button.
@@ -350,11 +387,16 @@ impl App {
             self.state.notice = Some(Notice::error(format!("write to {path}: {error}")));
             return;
         }
-        if self.state.settings.local_echo {
-            if let (Some(echo), Some(session)) =
-                (echo_key(key), self.state.sessions.get_mut(&device_id))
-            {
-                session.screen.echo(&echo);
+        // Typing is a live action: it brings a scrolled-back view to the live
+        // screen, so the person sees the device's answer where it lands.
+        let local_echo = self.state.settings.local_echo;
+        let echo = echo_key(key);
+        if let Some(session) = self.state.sessions.get_mut(&device_id) {
+            session.screen.scroll_to_bottom();
+            if local_echo {
+                if let Some(echo) = echo {
+                    session.screen.echo(&echo);
+                }
             }
         }
     }

@@ -542,10 +542,11 @@ fn draw_stream(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16
         );
         return Some((area.x + 1, area.y));
     };
+    let scroll = session.screen.scroll();
     for row in 0..area.height as usize {
         let y = area.y + row as u16;
         for col in 0..area.width as usize {
-            let cell = session.screen.cell(row, col);
+            let cell = session.screen.view_cell(row, col);
             let symbol = cell.ch.to_string();
             put_cell(
                 buffer,
@@ -555,6 +556,10 @@ fn draw_stream(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16
                 screen_style(cell.style),
             );
         }
+    }
+    // Scrolled back, the device's cursor is not in view.
+    if scroll > 0 {
+        return None;
     }
     // The device's own cursor, so typing happens where the device expects it.
     let (row, col) = session.screen.cursor();
@@ -617,16 +622,26 @@ fn draw_status(state: &AppState, buffer: &mut Buffer, area: Rect) -> bool {
 }
 
 fn draw_hints(state: &AppState, buffer: &mut Buffer, area: Rect) {
-    let hints = match state.view {
+    let hints: String = match state.view {
         View::Devices => {
             " ↑/↓ select · Enter open/join · b baud · d disconnect · Ctrl+] stream · Ctrl+Q quit "
+                .to_string()
         }
-        View::Stream => {
-            " Typing goes to the device (Tab and Ctrl+Q too) · Ctrl+] back to the sidebar "
-        }
-        View::Settings => " Ctrl+S save · Esc cancel · Tab/↑↓ move · Space toggle ",
+        View::Stream => match state.selected_session() {
+            // Say where the view is and how to come back, rather than the keys
+            // of a live stream the human is not looking at.
+            Some(session) if session.screen.is_scrolled_back() => format!(
+                " Scrolled back {} lines · Shift+PageDown returns · Shift+End jumps to live ",
+                session.screen.scroll()
+            ),
+            _ => {
+                " Typing goes to the device (Tab and Ctrl+Q too) · Shift+PageUp scrolls back · Ctrl+] back to the sidebar "
+                    .to_string()
+            }
+        },
+        View::Settings => " Ctrl+S save · Esc cancel · Tab/↑↓ move · Space toggle ".to_string(),
     };
-    put(buffer, area, 0, hints, dim());
+    put(buffer, area, 0, &hints, dim());
 }
 
 /// One sidebar or settings row: a label on the left, a value kept at the
@@ -1018,6 +1033,63 @@ mod tests {
             .map(|x| buffer[(x, cursor.1)].symbol())
             .collect();
         assert!(row_text.contains("Scrollback"), "{row_text:?}");
+    }
+
+    #[test]
+    fn the_stream_draws_the_scrollback_and_says_it_is_scrolled_back() {
+        let mut state = demo();
+        state.view = View::Stream;
+        state.resize(4, 40);
+        for index in 0..8u8 {
+            let line = format!("line{index}\r\n");
+            state.apply_event(&Event::device_output(7, line.as_bytes()));
+        }
+        let live = screen(&state, 100, 7).join("\n");
+        assert!(live.contains("line7"), "{live}");
+        assert!(!live.contains("Scrolled back"), "{live}");
+
+        let history = state.sessions.get(&7).unwrap().screen.history_len();
+        assert!(history > 0, "the rows above the live view were kept");
+        state
+            .sessions
+            .get_mut(&7)
+            .unwrap()
+            .screen
+            .scroll_back(history);
+
+        let scrolled = screen(&state, 100, 7).join("\n");
+        assert!(scrolled.contains("line0"), "{scrolled}");
+        assert!(!scrolled.contains("line7"), "{scrolled}");
+        assert!(scrolled.contains("Scrolled back"), "{scrolled}");
+    }
+
+    #[test]
+    fn the_cursor_is_hidden_while_the_stream_is_scrolled_back() {
+        let mut state = demo();
+        state.view = View::Stream;
+        state.resize(4, 40);
+        state.apply_event(&Event::device_output(
+            7,
+            b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n",
+        ));
+        let area = Rect::new(0, 0, 100, 7);
+        let mut buffer = Buffer::empty(area);
+        assert!(render(&state, &mut buffer, area).is_some(), "live cursor");
+
+        state.sessions.get_mut(&7).unwrap().screen.scroll_back(2);
+        assert_eq!(
+            render(&state, &mut buffer, area),
+            None,
+            "the device cursor is not in the scrolled-back view"
+        );
+    }
+
+    #[test]
+    fn the_stream_hints_name_the_scrollback_keys() {
+        let mut state = demo();
+        state.view = View::Stream;
+        let hints = screen(&state, 100, 16).join("\n");
+        assert!(hints.contains("Shift+PageUp"), "{hints}");
     }
 
     #[test]
