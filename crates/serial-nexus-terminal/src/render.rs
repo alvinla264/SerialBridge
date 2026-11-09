@@ -631,13 +631,13 @@ fn draw_hints(state: &AppState, buffer: &mut Buffer, area: Rect) {
             // Say where the view is and how to come back, rather than the keys
             // of a live stream the human is not looking at.
             Some(session) if session.screen.is_scrolled_back() => format!(
-                " Scrolled back {} lines · Shift+PageDown returns · Shift+End jumps to live ",
+                " Scrolled back {} lines · Shift+PageDown forward · Shift+End live ",
                 session.screen.scroll()
             ),
-            _ => {
-                " Typing goes to the device (Tab and Ctrl+Q too) · Shift+PageUp scrolls back · Ctrl+] back to the sidebar "
-                    .to_string()
-            }
+            // Both hints have to stay readable in a narrow terminal: the
+            // stream forwards every ordinary key, so Ctrl+] is the way out.
+            _ => " Typing goes to the device · Shift+PageUp scrolls back · Ctrl+] leaves "
+                .to_string(),
         },
         View::Settings => " Ctrl+S save · Esc cancel · Tab/↑↓ move · Space toggle ".to_string(),
     };
@@ -1093,13 +1093,32 @@ mod tests {
     }
 
     #[test]
+    fn both_the_scroll_and_the_way_out_stay_readable_in_80_columns() {
+        let mut state = demo();
+        state.view = View::Stream;
+        state.resize(4, 80);
+        state.apply_event(&Event::device_output(
+            7,
+            b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\n",
+        ));
+        let live = screen(&state, 80, 24).join("\n");
+        assert!(live.contains("Shift+PageUp"), "{live}");
+        assert!(live.contains("Ctrl+]"), "{live}");
+
+        state.sessions.get_mut(&7).unwrap().screen.scroll_back(2);
+        let scrolled = screen(&state, 80, 24).join("\n");
+        assert!(scrolled.contains("Scrolled back 2 lines"), "{scrolled}");
+        assert!(scrolled.contains("Shift+End"), "{scrolled}");
+    }
+
+    #[test]
     fn the_footer_hints_match_the_view() {
         let mut state = demo();
         let sidebar_hints = screen(&state, 100, 16).join("\n");
         assert!(sidebar_hints.contains("Ctrl+Q quit"), "{sidebar_hints}");
         state.view = View::Stream;
         let stream_hints = screen(&state, 100, 16).join("\n");
-        assert!(stream_hints.contains("Ctrl+] back"), "{stream_hints}");
+        assert!(stream_hints.contains("Ctrl+] leaves"), "{stream_hints}");
         assert!(!stream_hints.contains("Ctrl+Q quit"), "{stream_hints}");
         state.begin_settings();
         let settings_hints = screen(&state, 100, 16).join("\n");

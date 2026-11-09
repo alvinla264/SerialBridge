@@ -568,10 +568,12 @@ impl Screen {
                 }
             }
             2 => self.grid.fill(Cell::default()),
-            // 3 erases the saved lines too, as a real terminal does.
+            // 3 erases the saved lines too, as a real terminal does. The view
+            // comes back to live: there is nothing left behind it.
             3 => {
                 self.grid.fill(Cell::default());
                 self.history.clear();
+                self.scroll = 0;
             }
             _ => {}
         }
@@ -756,8 +758,10 @@ mod tests {
         assert_eq!(screen.history_len(), 1);
         screen.feed(b"\x1b[2J");
         assert_eq!(screen.history_len(), 1, "CSI 2J keeps the saved lines");
+        screen.scroll_to_top();
         screen.feed(b"\x1b[3J");
         assert_eq!(screen.history_len(), 0, "CSI 3J erases them");
+        assert_eq!(screen.scroll(), 0, "and the view goes back to live");
     }
 
     #[test]
