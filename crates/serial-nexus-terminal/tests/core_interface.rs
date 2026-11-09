@@ -403,6 +403,7 @@ fn launch_settings_are_loaded_into_the_app_and_do_not_change_baud_behavior() {
     let settings = serial_nexus_terminal::settings::TerminalSettings {
         local_echo: false,
         scrollback: false,
+        ..Default::default()
     };
     let client = Client::connect_to_socket(&socket, ClientInfo::human("terminal-settings"))
         .expect("terminal connects");
@@ -429,6 +430,7 @@ fn local_echo_shows_typed_keys_only_while_it_is_on() {
     let settings = serial_nexus_terminal::settings::TerminalSettings {
         local_echo: true,
         scrollback: true,
+        ..Default::default()
     };
     let client = Client::connect_to_socket(&socket, ClientInfo::human("terminal-echo"))
         .expect("terminal connects");

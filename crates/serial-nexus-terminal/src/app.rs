@@ -116,6 +116,9 @@ impl App {
             Action::CloseOverlay => self.state.overlay = None,
             Action::SettingsMove(delta) => self.state.move_settings_row(delta),
             Action::SettingsToggle => self.toggle_setting(),
+            Action::HelpScroll(delta) => {
+                self.state.help_offset = (self.state.help_offset as i32 + delta).max(0) as usize;
+            }
             Action::Ignore => {}
         }
     }
@@ -123,6 +126,9 @@ impl App {
     /// Open a panel, or close it when the same one is already open.
     fn toggle_overlay(&mut self, overlay: Overlay) {
         self.state.overlay = (self.state.overlay != Some(overlay)).then_some(overlay);
+        if self.state.overlay == Some(Overlay::Help) {
+            self.state.help_offset = 0;
+        }
     }
 
     /// Flip the selected setting and save it. A save failure is reported and

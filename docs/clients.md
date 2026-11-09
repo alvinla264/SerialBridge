@@ -113,21 +113,28 @@ AI write control.
 - The footer has a status line (errors, unplug notices, setting changes, the
   baud prompt) and a line of key hints for the focused pane. A short terminal
   keeps the status line and hides the hints.
-- `F1` opens a list of every key; `Esc` closes it. `F2` opens the settings
-  panel: `↑`/`↓` (or `k`/`j`) select a setting, `Space`/`Enter` (or `←`/`→`)
-  flips it, and each change is saved at once. Function keys, not letters, open
-  the panels, so a serial console still receives every printable key, `?`
-  included.
+- `F1` opens a list of every key, scrolled with `↑`/`↓` or `PageUp`/`PageDown`
+  when it does not fit; `Esc` closes it. `F2` opens the settings panel: `↑`/`↓`
+  (or `k`/`j`) select a setting, `Space`/`Enter` (or `←`/`→`) flips it, and each
+  change is saved at once. Function keys, not letters, open the panels, so a
+  serial console still receives every printable key, `?` included. A terminal
+  too small for a panel says it is open in one line, so its keys are never
+  swallowed silently.
 - Settings are stored per user in `$XDG_CONFIG_HOME/serial-nexus/terminal.json`
   (`~/.config/serial-nexus/terminal.json` when `XDG_CONFIG_HOME` is unset and
-  `HOME` is set). The file holds `local_echo` and `scrollback`; `local_echo` is
-  off by default because most devices echo what they receive, so echoing here
-  too would show each keystroke twice, and `scrollback` is on. The terminal
-  loads them at launch and writes the defaults on the first launch. An invalid
-  or unreadable file is reported in the footer and left untouched, never
-  silently replaced, and settings changed in that launch are not saved; saves
-  go to a temporary file and are renamed into place, and a failed save is
-  reported.
+  `HOME` is set). The file holds `version`, `local_echo` and `scrollback`.
+  `local_echo` is off by default because most devices echo what they receive,
+  so echoing here too would show each keystroke twice. A file written before
+  `version` existed had `local_echo` on as a stored default that then had no
+  effect; it is upgraded once on the next launch (echo left off, `version` set
+  to 1), and the panel can turn echo back on. `scrollback` is stored but has no
+  panel row yet: the stream does not keep the rows that leave the screen, so
+  offering the switch would be a control that does nothing.
+- The terminal loads the settings at launch and writes the defaults on the
+  first launch. An invalid or unreadable file is reported in the footer and
+  left untouched, never silently replaced, and settings changed in that launch
+  are not saved; saves go to a temporary file and are renamed into place, and a
+  failed save is reported.
 - `Ctrl+Q` (or `F10`) quits. Normal exit, I/O errors and panics restore raw
   mode and the alternate screen, and explicitly disconnect every device.
   Catchable termination signals (SIGTERM, SIGHUP) are not handled and may

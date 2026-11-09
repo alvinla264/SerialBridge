@@ -191,13 +191,42 @@ impl Screen {
     }
 
     /// Echo human keystrokes into the local view. The bytes come from
-    /// [`crate::input::echo_key`]: printable text plus CR, LF, BS and TAB only,
-    /// so nothing here can move the cursor around. The device's current SGR
-    /// style is set aside, so typed text never borrows the device's colours.
+    /// [`crate::input::echo_key`]: printable text plus CR, LF, BS and TAB only.
+    ///
+    /// Echo has its own path, not [`Screen::feed`]: the device parser may be
+    /// in the middle of an escape sequence or a UTF-8 sequence, and typed keys
+    /// must not complete (or corrupt) it. Typed text also always uses the
+    /// default style, so it never borrows the device's colours.
     pub fn echo(&mut self, bytes: &[u8]) {
-        let style = std::mem::take(&mut self.style);
-        self.feed(bytes);
-        self.style = style;
+        for ch in String::from_utf8_lossy(bytes).chars() {
+            match ch {
+                '\r' => {
+                    self.x = 0;
+                    self.pending_wrap = false;
+                }
+                '\n' => self.line_feed(),
+                '\t' => {
+                    self.pending_wrap = false;
+                    let next = (self.x / 8 + 1) * 8;
+                    self.x = next.min(self.cols - 1);
+                }
+                '\x08' => self.echo_backspace(),
+                c if c.is_control() => {}
+                c => self.put(c, Style::default()),
+            }
+        }
+    }
+
+    /// Erase the character before the cursor. At the right margin the cursor
+    /// has not advanced yet (`pending_wrap`), so the last written cell is the
+    /// one to erase.
+    fn echo_backspace(&mut self) {
+        if !self.pending_wrap && self.x > 0 {
+            self.x -= 1;
+        }
+        self.pending_wrap = false;
+        let index = self.index(self.y, self.x);
+        self.grid[index] = Cell::default();
     }
 
     /// Show an AI write inline in the stream, in a distinct style. Control
@@ -621,6 +650,48 @@ mod tests {
         let lines = text(&screen);
         assert_eq!(lines[0], "boot> AT\\rOK", "{lines:?}");
         assert!(!lines[0].contains("[AI]"), "{lines:?}");
+    }
+
+    #[test]
+    fn local_echo_leaves_a_pending_device_sequence_alone() {
+        let mut screen = Screen::new(4, 40);
+        screen.feed(b"prompt> \x1b[3");
+        screen.echo(b"A");
+        screen.feed(b"1mhello");
+        let lines = text(&screen);
+        // The typed key sits where the device cursor was, and the device's own
+        // text carries on after it in the colour its sequence asked for.
+        assert_eq!(lines[0], "prompt> Ahello", "{lines:?}");
+        assert_eq!(
+            screen.cell(0, 8).style.fg,
+            None,
+            "typed text keeps the default style"
+        );
+        assert_eq!(screen.cell(0, 9).style.fg, Some(Color::Indexed(1)));
+
+        // The same for a device character split across two reads.
+        let mut screen = Screen::new(2, 20);
+        screen.feed(&[0xc3]);
+        screen.echo(b"A");
+        screen.feed(&[0xa9]);
+        let lines = text(&screen);
+        assert_eq!(lines[0], "Aé", "{lines:?}");
+    }
+
+    #[test]
+    fn echo_backspace_erases_the_last_character_at_the_right_margin() {
+        let mut screen = Screen::new(4, 4);
+        screen.echo(b"abcd");
+        screen.echo(b"\x08");
+        screen.echo(b"X");
+        assert_eq!(text(&screen)[0], "abcX");
+
+        // …and in the middle of a line.
+        let mut screen = Screen::new(2, 10);
+        screen.echo(b"ab");
+        screen.echo(b"\x08");
+        screen.echo(b"c");
+        assert_eq!(text(&screen)[0], "ac");
     }
 
     #[test]

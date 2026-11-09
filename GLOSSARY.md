@@ -42,9 +42,9 @@ these words in their tool names and user-facing text.
 - **Tool call**: one MCP request from the host to `serial-nexus-mcp`
   (`list_devices`, `connect`, `disconnect`, `read`, `send`). It returns one
   bounded result; there is no continuous stream.
-- **Settings**: the human terminal's own preferences, stored per user in
-  `terminal.json` (`local_echo` off by default, `scrollback` on). Not core
-  configuration.
+- **Settings**: the human terminal's own preferences, stored per user and
+  versioned in `terminal.json` (`local_echo` off by default, `scrollback` on).
+  Not core configuration.
 - **Local echo**: showing the keys a human types in the **stream** in the
   terminal's own view, for a device that does not echo them. Off by default so
   a device's echo is not shown twice; saved as the `local_echo` **setting**.

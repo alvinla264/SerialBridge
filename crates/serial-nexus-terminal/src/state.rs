@@ -33,8 +33,11 @@ pub enum Overlay {
     Settings,
 }
 
-/// The settings rows of the settings panel, in drawing order.
-pub const SETTINGS_ROWS: usize = 2;
+/// The settings rows of the settings panel, in drawing order. Scrollback is
+/// stored in the file but has no row yet: the stream cannot scroll back until
+/// it keeps the rows that leave the screen, so offering the switch would be a
+/// control that does nothing.
+pub const SETTINGS_ROWS: usize = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
@@ -150,6 +153,9 @@ pub struct AppState {
     pub overlay: Option<Overlay>,
     /// Selected row of the settings panel.
     pub settings_row: usize,
+    /// First key row the help panel shows; the list scrolls when it does not
+    /// fit.
+    pub help_offset: usize,
     /// The human's preferences, loaded at launch and saved when changed.
     pub settings: TerminalSettings,
     rows: usize,
@@ -174,6 +180,7 @@ impl AppState {
             quit: false,
             overlay: None,
             settings_row: 0,
+            help_offset: 0,
             settings: TerminalSettings::default(),
             rows: rows.max(1),
             cols: cols.max(1),

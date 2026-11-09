@@ -4,6 +4,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color as RColor, Modifier, Style as RStyle};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::screen::{Color, Style};
 use crate::state::{AppState, Focus, Overlay, Severity, SETTINGS_ROWS};
@@ -68,11 +69,12 @@ pub fn chrome(area: Rect) -> Chrome {
 
 /// Split a main area into a sidebar, a separator and the stream.
 fn panes(area: Rect) -> Option<MainPanes> {
-    if area.width < 24 || area.height == 0 {
+    if area.width < 20 || area.height == 0 {
         return None;
     }
-    let sidebar_width = (area.width / 3).clamp(20, 30).min(area.width - 21);
-    if sidebar_width < 8 {
+    // The sidebar gives way first: the stream keeps at least 12 columns.
+    let sidebar_width = (area.width / 3).clamp(14, 30).min(area.width - 13);
+    if sidebar_width < 6 {
         return None;
     }
     let sidebar = Rect::new(area.x, area.y, sidebar_width, area.height);
@@ -150,14 +152,13 @@ fn draw_header(state: &AppState, buffer: &mut Buffer, area: Rect) {
     };
 
     let brand = " SerialNexus ";
-    let brand_width = brand.chars().count() as u16;
+    let brand_width = display_width(brand);
     let details = format!("  {path}  {baud} baud  AI control: {control}  [{attached}]");
     // The focus hint only appears when it leaves the brand and the device
     // name room; otherwise the whole header is theirs.
     let right = format!("focus: {focus} ");
-    let right_width = right.chars().count() as u16;
-    let hint_fits =
-        area.width.saturating_sub(right_width) >= brand_width + details.chars().count() as u16;
+    let right_width = display_width(&right);
+    let hint_fits = area.width.saturating_sub(right_width) >= brand_width + display_width(&details);
     let left_width = if hint_fits {
         area.width - right_width
     } else {
@@ -314,8 +315,8 @@ fn draw_stream(state: &AppState, buffer: &mut Buffer, area: Rect) {
         &title,
         title_style,
     );
-    let right_width = right.chars().count() as u16;
-    if area.width > right_width + title.chars().count() as u16 {
+    let right_width = display_width(&right);
+    if area.width > right_width + display_width(&title) {
         put(
             buffer,
             Rect::new(area.x + area.width - right_width, area.y, right_width, 1),
@@ -428,14 +429,14 @@ fn draw_hints(state: &AppState, buffer: &mut Buffer, area: Rect) {
 fn draw_overlay(state: &AppState, buffer: &mut Buffer, area: Rect) {
     match state.overlay {
         Some(Overlay::Help) => {
-            let lines: Vec<(String, RStyle)> = HELP
+            let lines: Vec<(String, RStyle, bool)> = HELP
                 .iter()
-                .map(|(key, what)| (format!("{key:<12} {what}"), RStyle::default()))
+                .map(|(key, what)| (format!("{key:<12} {what}"), RStyle::default(), false))
                 .collect();
-            draw_panel(buffer, area, "Keys", &lines);
+            draw_panel(buffer, area, "Keys", &lines, state.help_offset);
         }
         Some(Overlay::Settings) => {
-            let rows: Vec<(String, RStyle)> = (0..SETTINGS_ROWS)
+            let mut rows: Vec<(String, RStyle, bool)> = (0..SETTINGS_ROWS)
                 .map(|row| {
                     let name = AppState::settings_row_name(row).unwrap_or_default();
                     let value = match state.settings_value(row) {
@@ -448,46 +449,75 @@ fn draw_overlay(state: &AppState, buffer: &mut Buffer, area: Rect) {
                         " "
                     };
                     let text = format!("{marker} {name:<12} {value}");
-                    let style = if row == state.settings_row {
+                    let selected = row == state.settings_row;
+                    let style = if selected {
                         RStyle::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
                     } else {
                         RStyle::default()
                     };
-                    (text, style)
+                    (text, style, selected)
                 })
                 .collect();
-            draw_panel(buffer, area, "Settings", &rows);
+            rows.push(("Esc closes · Space toggles".to_string(), dim(), false));
+            let selected = rows
+                .iter()
+                .position(|(_, _, selected)| *selected)
+                .unwrap_or(0);
+            draw_panel(buffer, area, "Settings", &rows, selected);
         }
         None => {}
     }
 }
 
 /// The keys the help panel lists: what each one does.
-const HELP: [(&str, &str); 9] = [
+const HELP: [(&str, &str); 10] = [
+    ("Esc", "close this panel"),
     ("Tab", "switch between devices and stream"),
-    ("↑/↓ j/k", "select a device"),
+    ("↑/↓ j/k", "select a device, or a setting"),
     ("Enter / o", "open or join the selected device"),
     ("b", "open at a chosen baud rate"),
     ("d", "disconnect the selected device"),
+    ("Space", "toggle the selected setting"),
     ("F1", "this help"),
     ("F2", "settings"),
     ("Ctrl+Q", "quit"),
-    ("typing", "sends the keys to the device"),
 ];
 
-fn draw_panel(buffer: &mut Buffer, area: Rect, title: &str, lines: &[(String, RStyle)]) {
+fn draw_panel(
+    buffer: &mut Buffer,
+    area: Rect,
+    title: &str,
+    lines: &[(String, RStyle, bool)],
+    keep_in_view: usize,
+) {
+    // Too small for a box: one line still says the panel is open, so its keys
+    // are never swallowed silently.
     if area.width < 12 || area.height < 4 {
+        // The way out comes first, so it survives a narrow terminal.
+        let text = fit(&format!(" Esc closes · {title} "), area.width as usize);
+        put(
+            buffer,
+            area,
+            0,
+            &text,
+            RStyle::default()
+                .fg(RColor::Black)
+                .bg(RColor::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
         return;
     }
     let content_width = lines
         .iter()
-        .map(|(line, _)| line.chars().count())
+        .map(|(line, _, _)| display_width(line) as usize)
         .max()
         .unwrap_or(0)
-        .max(title.chars().count());
+        .max(display_width(title) as usize);
     let width = ((content_width + 4) as u16).min(area.width);
-    let height = ((lines.len() + 2) as u16).min(area.height);
-    if width < 8 || height < 3 {
+    // Room for both borders and at least two content rows, or the one-line
+    // fallback above says the panel is open.
+    let height = ((lines.len() + 2) as u16).max(4).min(area.height);
+    if width < 8 || height < 4 {
         return;
     }
     let x = area.x + (area.width - width) / 2;
@@ -508,23 +538,32 @@ fn draw_panel(buffer: &mut Buffer, area: Rect, title: &str, lines: &[(String, RS
         );
     }
 
+    // The title gives way to a narrow box instead of pushing the border off.
+    let title = clip(title, inner.saturating_sub(4));
     let top = format!(
         "┌─ {} {}┐",
         title,
-        "─".repeat(inner.saturating_sub(title.len() + 3))
+        "─".repeat(inner.saturating_sub(display_width(&title) as usize + 3))
     );
     put(buffer, Rect::new(x, y, width, 1), 0, &top, border);
-    for (index, (line, style)) in lines.iter().enumerate() {
-        if index as u16 + 1 >= height {
+
+    // When the box is shorter than the list, scroll it: the selected row (or
+    // the help list's own scroll position) stays in view.
+    let visible = (height - 2) as usize;
+    let last_first = lines.len().saturating_sub(visible);
+    let first = keep_in_view
+        .saturating_sub(visible.saturating_sub(1))
+        .min(last_first);
+    for (offset, (line, style, _)) in lines.iter().skip(first).enumerate() {
+        if offset >= visible {
             break;
         }
-        let padded = format!(" {line:<pad$} ", pad = inner.saturating_sub(2));
         let mut row = String::from("│");
-        row.push_str(&padded);
+        row.push_str(&fit(&format!(" {line}"), inner));
         row.push('│');
         put(
             buffer,
-            Rect::new(x, y + 1 + index as u16, width, 1),
+            Rect::new(x, y + 1 + offset as u16, width, 1),
             0,
             &row,
             *style,
@@ -538,6 +577,35 @@ fn draw_panel(buffer: &mut Buffer, area: Rect, title: &str, lines: &[(String, RS
         &bottom,
         border,
     );
+}
+
+/// One line as exactly `width` display columns: clipped if longer, padded if
+/// shorter. Wide characters are never split down the middle.
+fn fit(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let cell = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + cell > width {
+            break;
+        }
+        out.push(ch);
+        used += cell;
+    }
+    while used < width {
+        out.push(' ');
+        used += 1;
+    }
+    out
+}
+
+/// The first `width` display columns of `text`.
+fn clip(text: &str, width: usize) -> String {
+    fit(text, width).trim_end().to_string()
+}
+
+fn display_width(text: &str) -> u16 {
+    UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16
 }
 
 fn put(buffer: &mut Buffer, area: Rect, offset: u16, text: &str, style: RStyle) {
@@ -804,38 +872,97 @@ mod tests {
     }
 
     #[test]
-    fn the_settings_panel_shows_each_value_and_follows_the_selection() {
+    fn the_settings_panel_shows_the_value_it_saves() {
         let mut state = demo_state();
         state.overlay = Some(Overlay::Settings);
         let screen = lines(&state, 100, 24).join("\n");
         assert!(screen.contains("┌─ Settings"), "{screen}");
-        assert!(screen.contains("Local echo"), "{screen}");
-        assert!(screen.contains("Scrollback"), "{screen}");
-        assert!(screen.contains("on"), "{screen}");
-
-        state.settings.local_echo = false;
-        state.settings_row = 1;
-        let screen = lines(&state, 100, 24).join("\n");
         let row = screen
             .lines()
             .find(|line| line.contains("Local echo"))
             .expect("local echo row");
         assert!(row.contains("off"), "{row}");
-        let selected = screen
+        assert!(row.contains('▸'), "{row}");
+        assert!(
+            !screen.contains("Scrollback"),
+            "a control that does nothing is not offered: {screen}"
+        );
+
+        state.settings.local_echo = true;
+        let screen = lines(&state, 100, 24).join("\n");
+        let row = screen
             .lines()
-            .find(|line| line.contains("Scrollback"))
-            .expect("scrollback row");
-        assert!(selected.contains('▸'), "{selected}");
+            .find(|line| line.contains("Local echo"))
+            .expect("local echo row");
+        assert!(row.contains("on"), "{row}");
     }
 
     #[test]
-    fn panels_stay_inside_a_small_terminal() {
+    fn panels_stay_inside_a_small_terminal_and_stay_visible() {
         let mut state = demo_state();
-        for (width, height) in [(20, 5), (12, 4), (8, 3)] {
-            state.overlay = Some(Overlay::Help);
+        // A box that fits keeps its borders and its content within them.
+        state.overlay = Some(Overlay::Settings);
+        let screen = lines(&state, 20, 8);
+        let top = screen
+            .iter()
+            .position(|line| line.contains("┌─ Settings"))
+            .expect("panel top");
+        let bottom = screen
+            .iter()
+            .position(|line| line.contains("└"))
+            .expect("panel bottom");
+        assert!(bottom > top, "{screen:?}");
+        for line in &screen[top..=bottom] {
+            let width = UnicodeWidthStr::width(line.as_str());
+            let left = line
+                .chars()
+                .position(|ch| ch == '│' || ch == '┌' || ch == '└');
+            assert!(left.is_some(), "{line:?}");
+            assert!(width <= 20, "{line:?}");
+            assert!(
+                line.ends_with('│') || line.ends_with('┐') || line.ends_with('┘'),
+                "a clipped panel keeps both borders: {line:?}"
+            );
+        }
+
+        // Too small for a box: one line still says the panel is open.
+        for (width, height) in [(80, 3), (12, 2), (8, 3)] {
             let area = Rect::new(0, 0, width, height);
             let mut buffer = Buffer::empty(area);
             render(&state, &mut buffer, area);
+            let screen = lines(&state, width, height).join("\n");
+            assert!(screen.contains("Esc"), "{width}x{height}: {screen}");
         }
+    }
+
+    #[test]
+    fn the_hint_and_the_panel_account_for_wide_characters() {
+        let mut state = demo_state();
+        state.sessions.get_mut(&7).unwrap().control = Some("界界界界界界".into());
+        let screen = lines(&state, 130, 24);
+        let title = screen
+            .iter()
+            .find(|line| line.contains("Stream ·"))
+            .expect("stream title");
+        assert!(
+            title.contains("AI control:") && title.matches('界').count() == 6,
+            "the whole holder fits: {title:?}"
+        );
+
+        // …and the focus hint is dropped when it would cover a wide device
+        // path rather than clipped into it.
+        let mut state = AppState::new(10, 60);
+        state.set_devices(vec![DeviceEntry::new(
+            "/dev/界界界界界界界界界界界界界界界界界界界界",
+        )]);
+        let header = &lines(&state, 60, 10)[0];
+        assert!(
+            !header.contains("focus:"),
+            "the hint does not cover the device: {header:?}"
+        );
+        assert!(
+            header.contains("界面") || header.contains('界'),
+            "{header:?}"
+        );
     }
 }

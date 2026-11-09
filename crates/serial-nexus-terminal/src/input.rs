@@ -40,6 +40,8 @@ pub enum Action {
     CloseOverlay,
     SettingsMove(i32),
     SettingsToggle,
+    /// Scroll the help list by this many rows.
+    HelpScroll(i32),
     PromptChar(char),
     PromptBackspace,
     PromptSubmit,
@@ -101,6 +103,10 @@ fn map_overlay_key(overlay: Overlay, key: Key) -> Action {
     match overlay {
         Overlay::Help => match key {
             Key::Esc | Key::F(1) => Action::CloseOverlay,
+            Key::Up | Key::Char('k') => Action::HelpScroll(-1),
+            Key::Down | Key::Char('j') => Action::HelpScroll(1),
+            Key::PageUp => Action::HelpScroll(-5),
+            Key::PageDown => Action::HelpScroll(5),
             _ => Action::Ignore,
         },
         Overlay::Settings => match key {
