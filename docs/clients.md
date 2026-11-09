@@ -93,28 +93,41 @@ public for wrappers with their own launch strategy.
 (so a missing core is started automatically) as a human client and never takes
 AI write control.
 
-- The sidebar lists every device the core can see, with open/closed state, its
-  active baud and the AI control holder. `Tab` switches between the sidebar
-  and the stream.
-- In the sidebar, `Enter` opens a closed device (after the baud prompt, default
-  `115200`) or joins an open one at its active rate, `b` opens the baud prompt,
-  `d` disconnects explicitly, and the arrow keys select. Opened devices stay
-  attached while switching.
+- The header names the selected device, its active baud, the AI control holder
+  and whether this terminal is attached; its right side says which pane has the
+  keys. The sidebar lists every device the core can see, with open/closed state
+  (`●`/`○`), its baud, the AI control holder and its description. `Tab` switches
+  between the sidebar and the stream.
+- In the sidebar, `Enter` (or `o`) opens a closed device (after the baud prompt,
+  default `115200`) or joins an open one at its active rate, `b` opens the baud
+  prompt, `d` disconnects explicitly, and the arrow keys (or `j`/`k`) select.
+  Opened devices stay attached while switching.
 - In the stream, keys are written to the selected device as-is: arrows are ANSI
-  sequences, Enter is CR and Backspace is DEL. Nothing typed is echoed locally;
-  the device's own echo is still shown.
+  sequences, Enter is CR and Backspace is DEL. Nothing typed is echoed locally
+  unless the `local_echo` setting is on; the device's own echo is still shown.
 - Device output is rendered through a small ANSI screen (cursor movement,
   erase, SGR colours/attributes, OSC titles ignored). AI writes appear inline in
-  a distinct colour, without labels; human writes are never added to the stream.
-- The header shows the selected path, active baud, AI control holder and
-  attachment; the footer shows errors, unplug notices and the baud prompt.
+  a distinct colour, without labels; human writes are never added to the stream
+  as events. With local echo on, the keys a person types are shown in the
+  screen's default style, after the device accepted the write.
+- The footer has a status line (errors, unplug notices, setting changes, the
+  baud prompt) and a line of key hints for the focused pane. A short terminal
+  keeps the status line and hides the hints.
+- `F1` opens a list of every key; `Esc` closes it. `F2` opens the settings
+  panel: `↑`/`↓` (or `k`/`j`) select a setting, `Space`/`Enter` (or `←`/`→`)
+  flips it, and each change is saved at once. Function keys, not letters, open
+  the panels, so a serial console still receives every printable key, `?`
+  included.
 - Settings are stored per user in `$XDG_CONFIG_HOME/serial-nexus/terminal.json`
   (`~/.config/serial-nexus/terminal.json` when `XDG_CONFIG_HOME` is unset and
-  `HOME` is set). The file holds `local_echo` and `scrollback`, both on by
-  default; the terminal loads them at launch and writes the defaults on the
-  first launch. An invalid or unreadable file is reported in the footer and
-  left untouched, never silently replaced; saves go to a temporary file and
-  are renamed into place, and a failed save is reported.
+  `HOME` is set). The file holds `local_echo` and `scrollback`; `local_echo` is
+  off by default because most devices echo what they receive, so echoing here
+  too would show each keystroke twice, and `scrollback` is on. The terminal
+  loads them at launch and writes the defaults on the first launch. An invalid
+  or unreadable file is reported in the footer and left untouched, never
+  silently replaced, and settings changed in that launch are not saved; saves
+  go to a temporary file and are renamed into place, and a failed save is
+  reported.
 - `Ctrl+Q` (or `F10`) quits. Normal exit, I/O errors and panics restore raw
   mode and the alternate screen, and explicitly disconnect every device.
   Catchable termination signals (SIGTERM, SIGHUP) are not handled and may
@@ -122,9 +135,11 @@ AI write control.
 
 Tests drive the real client/core seam through PTY-backed simulated devices:
 opening by prompt and joining, switching without reopening, no local echo,
-device echo, visible AI writes, baud conflicts, unplug notices, explicit
-disconnect and shutdown. State/input/render and the terminal cleanup guard are
-tested without a real terminal.
+local echo turned on and off from the settings panel, a setting saved for the
+next launch, device echo, visible AI writes, baud conflicts, unplug notices,
+explicit disconnect and shutdown. State/input/render (including the panels and
+the footer layout) and the terminal cleanup guard are tested without a real
+terminal.
 
 ### Core CLI
 

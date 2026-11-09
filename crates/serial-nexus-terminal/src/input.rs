@@ -1,7 +1,7 @@
 //! Key mapping for the two panes. Kept free of crossterm types so the input
 //! seam can be tested without a terminal.
 
-use crate::state::{AppState, Focus};
+use crate::state::{AppState, Focus, Overlay};
 
 /// A key the TUI understands, independent of the terminal library.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +35,11 @@ pub enum Action {
     DisconnectSelected,
     StartBaudPrompt,
     ToggleFocus,
+    ToggleHelp,
+    ToggleSettings,
+    CloseOverlay,
+    SettingsMove(i32),
+    SettingsToggle,
     PromptChar(char),
     PromptBackspace,
     PromptSubmit,
@@ -58,6 +63,17 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
             _ => Action::Ignore,
         };
     }
+    if let Some(overlay) = state.overlay {
+        return map_overlay_key(overlay, key);
+    }
+    // The panels are on function keys: a stream writes every printable key,
+    // so a letter or `?` must never become a panel instead of device input.
+    if key == Key::F(1) {
+        return Action::ToggleHelp;
+    }
+    if key == Key::F(2) {
+        return Action::ToggleSettings;
+    }
     if key == Key::Tab {
         return Action::ToggleFocus;
     }
@@ -80,10 +96,28 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
     }
 }
 
+/// Keys a panel takes while it is open. The panes take none of them.
+fn map_overlay_key(overlay: Overlay, key: Key) -> Action {
+    match overlay {
+        Overlay::Help => match key {
+            Key::Esc | Key::F(1) => Action::CloseOverlay,
+            _ => Action::Ignore,
+        },
+        Overlay::Settings => match key {
+            Key::Esc | Key::F(2) => Action::CloseOverlay,
+            Key::Up | Key::Char('k') => Action::SettingsMove(-1),
+            Key::Down | Key::Char('j') => Action::SettingsMove(1),
+            Key::Char(' ') | Key::Enter | Key::Left | Key::Right => Action::SettingsToggle,
+            _ => Action::Ignore,
+        },
+    }
+}
+
 /// Bytes a stream-focused key sends to the selected device.
 ///
 /// This is ordinary terminal input: arrows are ANSI sequences, Enter is CR and
-/// Backspace is DEL. Human writes have no local echo.
+/// Backspace is DEL. Human writes are echoed locally only when the `local_echo`
+/// setting is on (see [`echo_key`]).
 pub fn encode_key(key: Key) -> Option<Vec<u8>> {
     let bytes: Vec<u8> = match key {
         Key::Char(ch) => {
@@ -130,6 +164,26 @@ pub fn encode_key(key: Key) -> Option<Vec<u8>> {
         }
     };
     Some(bytes)
+}
+
+/// Bytes to echo locally for a key typed in the stream.
+///
+/// Echo is deliberately narrower than [`encode_key`]: only printable text and
+/// the editing keys a person expects to see are echoed. Escape sequences for
+/// arrows and function keys are not, because echoing them would move the local
+/// cursor instead of showing what was typed.
+pub fn echo_key(key: Key) -> Option<Vec<u8>> {
+    match key {
+        Key::Char(ch) => {
+            let mut buffer = [0u8; 4];
+            Some(ch.encode_utf8(&mut buffer).as_bytes().to_vec())
+        }
+        Key::Enter => Some(b"\r\n".to_vec()),
+        Key::Tab => Some(b"\t".to_vec()),
+        // Move back over the character and erase it, like a terminal does.
+        Key::Backspace => Some(b"\x08 \x08".to_vec()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -181,5 +235,54 @@ mod tests {
         assert_eq!(encode_key(Key::Backspace), Some(vec![0x7f]));
         assert_eq!(encode_key(Key::F(1)), Some(b"\x1bOP".to_vec()));
         assert_eq!(encode_key(Key::Ctrl('@')), None);
+    }
+
+    #[test]
+    fn function_keys_open_the_panels_and_printables_stay_device_input() {
+        let mut state = AppState::new(20, 80);
+        state.focus = Focus::Stream;
+        assert_eq!(map_key(&state, Key::F(1)), Action::ToggleHelp);
+        assert_eq!(map_key(&state, Key::F(2)), Action::ToggleSettings);
+        // Serial consoles need these: they must reach the device.
+        assert_eq!(
+            map_key(&state, Key::Char('?')),
+            Action::Write(b"?".to_vec())
+        );
+        assert_eq!(
+            map_key(&state, Key::Char('q')),
+            Action::Write(b"q".to_vec())
+        );
+    }
+
+    #[test]
+    fn an_open_panel_takes_the_keys_and_escape_closes_it() {
+        let mut state = AppState::new(20, 80);
+        state.overlay = Some(Overlay::Settings);
+        assert_eq!(map_key(&state, Key::Down), Action::SettingsMove(1));
+        assert_eq!(map_key(&state, Key::Char('j')), Action::SettingsMove(1));
+        assert_eq!(map_key(&state, Key::Char('k')), Action::SettingsMove(-1));
+        assert_eq!(map_key(&state, Key::Char(' ')), Action::SettingsToggle);
+        assert_eq!(map_key(&state, Key::Enter), Action::SettingsToggle);
+        assert_eq!(map_key(&state, Key::Esc), Action::CloseOverlay);
+        assert_eq!(map_key(&state, Key::F(2)), Action::CloseOverlay);
+        // Typing into the device is off while a panel is open.
+        assert_eq!(map_key(&state, Key::Char('x')), Action::Ignore);
+
+        state.overlay = Some(Overlay::Help);
+        assert_eq!(map_key(&state, Key::Esc), Action::CloseOverlay);
+        assert_eq!(map_key(&state, Key::F(1)), Action::CloseOverlay);
+        assert_eq!(map_key(&state, Key::Char('x')), Action::Ignore);
+        // Quitting still works from a panel.
+        assert_eq!(map_key(&state, Key::Ctrl('q')), Action::Quit);
+    }
+
+    #[test]
+    fn echo_shows_printed_and_editing_keys_only() {
+        assert_eq!(echo_key(Key::Char('A')), Some(b"A".to_vec()));
+        assert_eq!(echo_key(Key::Enter), Some(b"\r\n".to_vec()));
+        assert_eq!(echo_key(Key::Tab), Some(b"\t".to_vec()));
+        assert_eq!(echo_key(Key::Backspace), Some(b"\x08 \x08".to_vec()));
+        assert_eq!(echo_key(Key::Up), None);
+        assert_eq!(echo_key(Key::Ctrl('c')), None);
     }
 }

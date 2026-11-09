@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use serial_nexus_client::{Client, ClientInfo};
 use serial_nexus_terminal::app::App;
 use serial_nexus_terminal::input::Key;
-use serial_nexus_terminal::state::Focus;
+use serial_nexus_terminal::state::{Focus, Overlay};
 use support::{connect, start_core, SimulatedDevice};
 
 fn app(socket: &std::path::PathBuf) -> App {
@@ -418,6 +418,93 @@ fn launch_settings_are_loaded_into_the_app_and_do_not_change_baud_behavior() {
     app.handle_key(Key::Char('b'));
     app.handle_key(Key::Enter);
     assert_eq!(app.state.selected_session().expect("opened").baud, 115_200);
+
+    app.shutdown();
+}
+
+#[test]
+fn local_echo_shows_typed_keys_only_while_it_is_on() {
+    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let mut device = SimulatedDevice::new();
+    let settings = serial_nexus_terminal::settings::TerminalSettings {
+        local_echo: true,
+        scrollback: true,
+    };
+    let client = Client::connect_to_socket(&socket, ClientInfo::human("terminal-echo"))
+        .expect("terminal connects");
+    let mut app = App::with_settings(client, 40, 120, settings);
+    app.open_path(&device.path, Some(115_200)).expect("open");
+    app.state.focus = Focus::Stream;
+
+    for ch in "ab".chars() {
+        app.handle_key(Key::Char(ch));
+    }
+    device.read_until(b"ab", Duration::from_secs(3));
+    assert!(
+        stream_text(&app).contains("ab"),
+        "local echo is on: {:?}",
+        stream_text(&app)
+    );
+
+    // Turning it off in the settings panel stops the local echo at once.
+    app.handle_key(Key::F(2));
+    assert_eq!(app.state.overlay, Some(Overlay::Settings));
+    app.handle_key(Key::Char(' '));
+    assert!(!app.state.settings.local_echo);
+    app.handle_key(Key::Esc);
+    for ch in "cd".chars() {
+        app.handle_key(Key::Char(ch));
+    }
+    device.read_until(b"cd", Duration::from_secs(3));
+    app.pump();
+    assert!(
+        !stream_text(&app).contains("cd"),
+        "local echo is off: {:?}",
+        stream_text(&app)
+    );
+
+    app.shutdown();
+}
+
+#[test]
+fn a_setting_changed_in_the_panel_is_written_back_and_kept_for_the_next_launch() {
+    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("terminal.json");
+    let store = serial_nexus_terminal::settings::SettingsStore::at(&path);
+    let settings = store.load_or_create().expect("settings file");
+
+    let client = Client::connect_to_socket(&socket, ClientInfo::human("terminal-save"))
+        .expect("terminal connects");
+    let mut app = App::with_preferences(client, 40, 120, settings, Some(store.clone()));
+    app.handle_key(Key::F(2));
+    assert_eq!(app.state.overlay, Some(Overlay::Settings));
+    // Local echo is the first row and starts off.
+    app.handle_key(Key::Char(' '));
+    assert!(app.state.settings.local_echo);
+    assert!(
+        store.load().expect("load").expect("file").local_echo,
+        "the change was saved"
+    );
+
+    // A failing save is reported, and the preference still applies here.
+    let blocked = dir.path().join("not-a-directory");
+    std::fs::write(&blocked, "x").unwrap();
+    let mut app = App::with_preferences(
+        Client::connect_to_socket(&socket, ClientInfo::human("terminal-save-fail"))
+            .expect("terminal connects"),
+        40,
+        120,
+        store.load().unwrap().unwrap(),
+        Some(serial_nexus_terminal::settings::SettingsStore::at(
+            blocked.join("terminal.json"),
+        )),
+    );
+    app.handle_key(Key::F(2));
+    app.handle_key(Key::Char(' '));
+    assert!(!app.state.settings.local_echo);
+    let notice = app.state.notice.as_ref().expect("save failure reported");
+    assert!(notice.text.contains("not saved"), "{}", notice.text);
 
     app.shutdown();
 }

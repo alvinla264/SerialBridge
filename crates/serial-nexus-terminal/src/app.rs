@@ -7,9 +7,9 @@ use crossbeam_channel::Receiver;
 use serial_nexus_client::{Client, ClientError};
 use serial_nexus_protocol::{DeviceSummary, Event};
 
-use crate::input::{map_key, Action, Key};
-use crate::settings::TerminalSettings;
-use crate::state::{short_holder, AppState, DeviceEntry, Focus, Notice};
+use crate::input::{echo_key, map_key, Action, Key};
+use crate::settings::{SettingsStore, TerminalSettings};
+use crate::state::{short_holder, AppState, DeviceEntry, Focus, Notice, Overlay};
 
 /// Wire the app to a connected core. The core is started by
 /// [`Client::connect`] (the auto-start seam), not by the TUI.
@@ -19,7 +19,8 @@ pub struct App {
     events: Receiver<Event>,
     /// Closures this terminal asked for; their `DeviceClosed` is not an unplug.
     expected_closes: HashSet<u64>,
-    settings: TerminalSettings,
+    /// Where a changed setting is saved, when this launch has a settings file.
+    settings_store: Option<SettingsStore>,
 }
 
 impl App {
@@ -34,13 +35,28 @@ impl App {
         cols: usize,
         settings: TerminalSettings,
     ) -> Self {
+        Self::with_preferences(client, rows, cols, settings, None)
+    }
+
+    /// Like [`App::with_settings`], and a changed setting is written back
+    /// through `store`. Without a store the change still applies to this launch
+    /// and is not persisted.
+    pub fn with_preferences(
+        client: Client,
+        rows: usize,
+        cols: usize,
+        settings: TerminalSettings,
+        store: Option<SettingsStore>,
+    ) -> Self {
         let events = client.subscribe();
+        let mut state = AppState::new(rows, cols);
+        state.settings = settings;
         let mut app = Self {
-            state: AppState::new(rows, cols),
+            state,
             client,
             events,
             expected_closes: HashSet::new(),
-            settings,
+            settings_store: store,
         };
         app.refresh_devices();
         app
@@ -48,7 +64,7 @@ impl App {
 
     /// The settings this launch loaded.
     pub fn settings(&self) -> &TerminalSettings {
-        &self.settings
+        &self.state.settings
     }
 
     pub fn client(&self) -> &Client {
@@ -80,7 +96,7 @@ impl App {
     }
 
     /// Handle one key. Typing in the stream writes to the selected device and
-    /// is never echoed locally.
+    /// is echoed locally only when the `local_echo` setting is on.
     pub fn handle_key(&mut self, key: Key) {
         let action = map_key(&self.state, key);
         match action {
@@ -94,9 +110,38 @@ impl App {
             Action::PromptBackspace => self.state.prompt_backspace(),
             Action::PromptCancel => self.state.prompt = None,
             Action::PromptSubmit => self.submit_baud_prompt(),
-            Action::Write(bytes) => self.write_selected(&bytes),
+            Action::Write(bytes) => self.write_selected(&bytes, key),
+            Action::ToggleHelp => self.toggle_overlay(Overlay::Help),
+            Action::ToggleSettings => self.toggle_overlay(Overlay::Settings),
+            Action::CloseOverlay => self.state.overlay = None,
+            Action::SettingsMove(delta) => self.state.move_settings_row(delta),
+            Action::SettingsToggle => self.toggle_setting(),
             Action::Ignore => {}
         }
+    }
+
+    /// Open a panel, or close it when the same one is already open.
+    fn toggle_overlay(&mut self, overlay: Overlay) {
+        self.state.overlay = (self.state.overlay != Some(overlay)).then_some(overlay);
+    }
+
+    /// Flip the selected setting and save it. A save failure is reported and
+    /// leaves the preference in effect for this launch only.
+    fn toggle_setting(&mut self) {
+        let Some(row) = AppState::settings_row_name(self.state.settings_row) else {
+            return;
+        };
+        let Some(value) = self.state.toggle_selected_setting() else {
+            return;
+        };
+        let state = if value { "on" } else { "off" };
+        self.state.notice = Some(match &self.settings_store {
+            Some(store) => match store.save(&self.state.settings) {
+                Ok(()) => Notice::info(format!("{row}: {state}")),
+                Err(error) => Notice::error(format!("{row}: {state} (not saved: {error})")),
+            },
+            None => Notice::info(format!("{row}: {state} (this launch only)")),
+        });
     }
 
     /// Open the selected device. A closed device asks for a baud rate first;
@@ -205,9 +250,10 @@ impl App {
         self.refresh_devices();
     }
 
-    /// Write human input to the selected device without taking AI control and
-    /// without adding it to the local stream.
-    pub fn write_selected(&mut self, bytes: &[u8]) {
+    /// Write human input to the selected device without taking AI control.
+    /// With `local_echo` on, the typed text is shown locally too; it is added
+    /// only after the write was accepted, so a refused write leaves no ghost.
+    pub fn write_selected(&mut self, bytes: &[u8], key: Key) {
         let Some(session) = self.state.selected_session() else {
             self.state.notice = Some(Notice::error(
                 "no open device — press Tab and Enter to open one",
@@ -221,6 +267,14 @@ impl App {
                 self.state.remove_session(device_id);
             }
             self.state.notice = Some(Notice::error(format!("write to {path}: {error}")));
+            return;
+        }
+        if self.state.settings.local_echo {
+            if let (Some(echo), Some(session)) =
+                (echo_key(key), self.state.sessions.get_mut(&device_id))
+            {
+                session.screen.echo(&echo);
+            }
         }
     }
 

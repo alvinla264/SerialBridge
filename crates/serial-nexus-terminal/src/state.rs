@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use serial_nexus_protocol::{Event, Holder, Source, DEFAULT_BAUD};
 
 use crate::screen::Screen;
+use crate::settings::TerminalSettings;
 
 /// Which pane receives keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,6 +25,16 @@ impl Focus {
         }
     }
 }
+
+/// A panel drawn over the panes that takes the keys while it is open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Overlay {
+    Help,
+    Settings,
+}
+
+/// The settings rows of the settings panel, in drawing order.
+pub const SETTINGS_ROWS: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
@@ -135,6 +146,12 @@ pub struct AppState {
     pub notice: Option<Notice>,
     pub prompt: Option<BaudPrompt>,
     pub quit: bool,
+    /// Open panel, if any. While one is open the panes do not take keys.
+    pub overlay: Option<Overlay>,
+    /// Selected row of the settings panel.
+    pub settings_row: usize,
+    /// The human's preferences, loaded at launch and saved when changed.
+    pub settings: TerminalSettings,
     rows: usize,
     cols: usize,
 }
@@ -155,8 +172,50 @@ impl AppState {
             notice: None,
             prompt: None,
             quit: false,
+            overlay: None,
+            settings_row: 0,
+            settings: TerminalSettings::default(),
             rows: rows.max(1),
             cols: cols.max(1),
+        }
+    }
+
+    /// The value of one settings panel row: local echo first, then scrollback.
+    pub fn settings_value(&self, row: usize) -> Option<bool> {
+        match row {
+            0 => Some(self.settings.local_echo),
+            1 => Some(self.settings.scrollback),
+            _ => None,
+        }
+    }
+
+    /// Move the settings panel selection, staying on a real row.
+    pub fn move_settings_row(&mut self, delta: i32) {
+        let last = SETTINGS_ROWS - 1;
+        self.settings_row = (self.settings_row as i32 + delta).clamp(0, last as i32) as usize;
+    }
+
+    /// Flip the setting on the selected row, returning its new value.
+    pub fn toggle_selected_setting(&mut self) -> Option<bool> {
+        match self.settings_row {
+            0 => {
+                self.settings.local_echo = !self.settings.local_echo;
+                Some(self.settings.local_echo)
+            }
+            1 => {
+                self.settings.scrollback = !self.settings.scrollback;
+                Some(self.settings.scrollback)
+            }
+            _ => None,
+        }
+    }
+
+    /// The name of one settings panel row.
+    pub fn settings_row_name(row: usize) -> Option<&'static str> {
+        match row {
+            0 => Some("Local echo"),
+            1 => Some("Scrollback"),
+            _ => None,
         }
     }
 

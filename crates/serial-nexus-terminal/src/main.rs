@@ -31,17 +31,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Settings are a convenience: an unreadable or invalid file leaves the
     // defaults in effect, is reported, and is never overwritten.
-    let (settings, settings_error) = match SettingsStore::from_env() {
+    let (settings, store, settings_error) = match SettingsStore::from_env() {
         Some(store) => match store.load_or_create() {
-            Ok(settings) => (settings, None),
+            Ok(settings) => (settings, Some(store), None),
             Err(error) => (
                 TerminalSettings::default(),
+                // Changes are not saved over a file the human hand-edited into
+                // an invalid state: they apply to this launch only.
+                None,
                 Some(format!("settings {}: {error}", store.path().display())),
             ),
         },
-        None => (TerminalSettings::default(), None),
+        None => (TerminalSettings::default(), None, None),
     };
-    let mut app = App::with_settings(client, 24, 80, settings);
+    let mut app = App::with_preferences(client, 24, 80, settings, store);
     if let Some(message) = settings_error {
         app.state.notice = Some(Notice::error(message));
     }

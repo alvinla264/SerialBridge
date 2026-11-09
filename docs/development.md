@@ -64,11 +64,12 @@ path as a real serial port and the test drives the master. Covered end to end:
   writes, pipelined writes keeping arrival order, unplug notification;
 - core grace-period shutdown and client auto-start (including an explicit core
   path, a missing binary, and the started core owning a separate session);
-- the terminal's sidebar/prompt/switch/disconnect flows, no local echo,
-  visible AI writes, unplug and shutdown through the same core. The terminal's
-  stream parsing and key mapping are covered by unit tests, and its settings
-  cover defaults, a missing file, round trips, invalid and unreadable files
-  left untouched, and save failures.
+- the terminal's sidebar/prompt/switch/disconnect flows, local echo off by
+  default and on when the setting says so, a setting changed in the panel saved
+  for the next launch, visible AI writes, unplug and shutdown through the same
+  core. The terminal's stream parsing, key mapping, panels and footer layout are
+  covered by unit tests, and its settings cover defaults, a missing file, round
+  trips, invalid and unreadable files left untouched, and save failures.
 
 `serial-nexus-mcp` additionally has end-to-end tests over real MCP stdio framing:
 handshake and tool listing, protocol errors, default and joined baud, rejected

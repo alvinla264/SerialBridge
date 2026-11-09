@@ -190,6 +190,16 @@ impl Screen {
         }
     }
 
+    /// Echo human keystrokes into the local view. The bytes come from
+    /// [`crate::input::echo_key`]: printable text plus CR, LF, BS and TAB only,
+    /// so nothing here can move the cursor around. The device's current SGR
+    /// style is set aside, so typed text never borrows the device's colours.
+    pub fn echo(&mut self, bytes: &[u8]) {
+        let style = std::mem::take(&mut self.style);
+        self.feed(bytes);
+        self.style = style;
+    }
+
     /// Show an AI write inline in the stream, in a distinct style. Control
     /// bytes are printed literally so they are visible and cannot drive the
     /// screen, and no marker or extra line break is inserted: the stream keeps
@@ -611,6 +621,26 @@ mod tests {
         let lines = text(&screen);
         assert_eq!(lines[0], "boot> AT\\rOK", "{lines:?}");
         assert!(!lines[0].contains("[AI]"), "{lines:?}");
+    }
+
+    #[test]
+    fn local_echo_keeps_typed_text_in_the_default_style() {
+        let mut screen = Screen::new(4, 40);
+        screen.feed(b"\x1b[31m");
+        screen.feed("prompt> ".as_bytes());
+        screen.echo(b"AB");
+        screen.echo(b"\x08C");
+        screen.echo(b"\r\n");
+        let lines = text(&screen);
+        assert_eq!(lines[0], "prompt> AC", "{lines:?}");
+        assert_eq!(lines[1], "", "{lines:?}");
+
+        // The device's red stays on for its own output after the echo.
+        let echoed = screen.cell(0, 8);
+        assert_eq!(echoed.ch, 'A');
+        assert_eq!(echoed.style.fg, None, "typed text is not device-coloured");
+        screen.feed(b"Z");
+        assert_eq!(screen.cell(1, 0).style.fg, Some(Color::Indexed(1)));
     }
 
     #[test]

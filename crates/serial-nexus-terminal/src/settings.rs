@@ -16,7 +16,9 @@ pub const SETTINGS_FILE: &str = "terminal.json";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TerminalSettings {
-    /// Echo keys typed in the stream back into the local view.
+    /// Echo keys typed in the stream back into the local view. Off by default:
+    /// most devices echo what they receive, so echoing here too would show
+    /// every keystroke twice. Turn it on for a device that stays quiet.
     pub local_echo: bool,
     /// Keep device output around for scrolling back.
     pub scrollback: bool,
@@ -25,7 +27,7 @@ pub struct TerminalSettings {
 impl Default for TerminalSettings {
     fn default() -> Self {
         Self {
-            local_echo: true,
+            local_echo: false,
             scrollback: true,
         }
     }
@@ -202,9 +204,9 @@ mod tests {
     }
 
     #[test]
-    fn the_defaults_are_both_on() {
+    fn scrollback_is_kept_by_default_and_local_echo_is_left_to_the_device() {
         let settings = TerminalSettings::default();
-        assert!(settings.local_echo);
+        assert!(!settings.local_echo);
         assert!(settings.scrollback);
     }
 
