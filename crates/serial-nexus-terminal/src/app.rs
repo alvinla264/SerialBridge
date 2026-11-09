@@ -121,8 +121,8 @@ impl App {
             Action::PromptSubmit => self.submit_baud_prompt(),
             Action::Write(bytes) => self.write_selected(&bytes, key),
             Action::Scroll(delta) => self.scroll_stream(delta),
-            Action::ScrollTop => self.scroll_stream_to_top(),
-            Action::ScrollBottom => self.scroll_stream_to_bottom(),
+            Action::EnterScrollback => self.enter_scrollback(),
+            Action::LeaveScrollback => self.leave_scrollback(),
             Action::OpenSettings => self.open_settings(),
             Action::SettingsMove(delta) => self.state.move_settings_row(delta),
             Action::SettingsToggle => {
@@ -134,7 +134,39 @@ impl App {
         }
     }
 
-    /// Scroll the stream view: positive goes back into the kept output,
+    /// Show the selected device's kept rows. The sidebar's `b` gets here; a
+    /// closed device has none and `b` asks for its baud rate instead, and with
+    /// the scrollback setting off there is nothing to show.
+    fn enter_scrollback(&mut self) {
+        if self.state.selected_session().is_none() {
+            self.state.notice = Some(Notice::error("open a device first"));
+            return;
+        }
+        if !self.state.settings.scrollback {
+            self.state.notice = Some(Notice::error("scrollback is off in the settings"));
+            return;
+        }
+        if let Some(session) = self.state.selected_session_mut() {
+            session.screen.scroll_to_bottom();
+        }
+        self.state.view = View::Scrollback;
+        self.state.notice = None;
+    }
+
+    /// Leave the scrollback view for the live stream. The stream starts at the
+    /// live screen, so its keys reach the device from where they land.
+    fn leave_scrollback(&mut self) {
+        if let Some(session) = self.state.selected_session_mut() {
+            session.screen.scroll_to_bottom();
+        }
+        self.state.view = if self.state.selected_session().is_some() {
+            View::Stream
+        } else {
+            View::Devices
+        };
+    }
+
+    /// Scroll the scrollback view: positive goes back into the kept output,
     /// negative returns towards live.
     fn scroll_stream(&mut self, delta: i32) {
         let Some(session) = self.state.selected_session_mut() else {
@@ -147,21 +179,11 @@ impl App {
         }
     }
 
-    fn scroll_stream_to_top(&mut self) {
-        if let Some(session) = self.state.selected_session_mut() {
-            session.screen.scroll_to_top();
-        }
-    }
-
-    fn scroll_stream_to_bottom(&mut self) {
-        if let Some(session) = self.state.selected_session_mut() {
-            session.screen.scroll_to_bottom();
-        }
-    }
-
-    /// One mouse-wheel notch in the stream: three lines back or forward.
+    /// One mouse-wheel notch in the scrollback view: three lines back or
+    /// forward. The live stream has its own keys, so the wheel does nothing
+    /// there.
     pub fn handle_scroll(&mut self, up: bool) {
-        if self.state.view != View::Stream {
+        if self.state.view != View::Scrollback {
             return;
         }
         const NOTCH: i32 = 3;
@@ -183,7 +205,7 @@ impl App {
     /// Handle a click at one cell of the screen. The sidebar's device rows
     /// select and its Settings button opens the settings; in the settings, a
     /// flag row toggles and the Save and Cancel buttons do what they say. The
-    /// stream has no controls.
+    /// stream and its scrollback have no controls.
     pub fn handle_click(&mut self, area: Rect, column: u16, row: u16) {
         match self.state.view {
             View::Devices => match hit_test(&self.state, area, column, row) {
@@ -200,7 +222,7 @@ impl App {
                 Some(SettingsHit::Cancel) => self.state.cancel_settings(),
                 None => {}
             },
-            View::Stream => {}
+            View::Stream | View::Scrollback => {}
         }
     }
 
@@ -230,10 +252,14 @@ impl App {
                     ));
                     return;
                 }
+                // The stream is the live screen, never a scrolled-back view.
+                if let Some(session) = self.state.selected_session_mut() {
+                    session.screen.scroll_to_bottom();
+                }
                 self.state.view = View::Stream;
                 self.state.notice = None;
             }
-            View::Stream => self.state.view = View::Devices,
+            View::Stream | View::Scrollback => self.state.view = View::Devices,
             // Another view owns the keys; Ctrl+] is not a shortcut out of it.
             View::Settings => {}
         }
@@ -387,16 +413,12 @@ impl App {
             self.state.notice = Some(Notice::error(format!("write to {path}: {error}")));
             return;
         }
-        // Typing is a live action: it brings a scrolled-back view to the live
-        // screen, so the person sees the device's answer where it lands.
         let local_echo = self.state.settings.local_echo;
-        let echo = echo_key(key);
-        if let Some(session) = self.state.sessions.get_mut(&device_id) {
-            session.screen.scroll_to_bottom();
-            if local_echo {
-                if let Some(echo) = echo {
-                    session.screen.echo(&echo);
-                }
+        if local_echo {
+            if let (Some(echo), Some(session)) =
+                (echo_key(key), self.state.sessions.get_mut(&device_id))
+            {
+                session.screen.echo(&echo);
             }
         }
     }

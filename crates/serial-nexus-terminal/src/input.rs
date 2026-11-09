@@ -24,14 +24,6 @@ pub enum Key {
     End,
     PageUp,
     PageDown,
-    /// Shift+PageUp: scroll the stream view back a page.
-    ShiftPageUp,
-    /// Shift+PageDown: scroll it forward a page.
-    ShiftPageDown,
-    /// Shift+Home: the oldest kept line.
-    ShiftHome,
-    /// Shift+End: back to the live view.
-    ShiftEnd,
     F(u8),
     Ctrl(char),
 }
@@ -53,12 +45,12 @@ pub enum Action {
     /// Bytes for the selected device. Never drawn locally unless local echo is
     /// on.
     Write(Vec<u8>),
-    /// Scroll the stream view back (`> 0`) or forward by lines.
+    /// Scroll the scrollback view back (`> 0`) or forward by lines.
     Scroll(i32),
-    /// Scroll the stream view to the oldest kept line.
-    ScrollTop,
-    /// Scroll the stream view back to live.
-    ScrollBottom,
+    /// Show the selected device's kept rows.
+    EnterScrollback,
+    /// Leave the scrollback view for the live stream.
+    LeaveScrollback,
     /// Open the settings that the sidebar button offers.
     OpenSettings,
     SettingsMove(i32),
@@ -73,7 +65,9 @@ pub enum Action {
 /// The stream is a transparent terminal: every key it can encode goes to the
 /// device, `Tab` and `Ctrl+Q` included. Only `Ctrl+]` leaves it, which is why
 /// the sidebar's `]` sends a literal `Ctrl+]`. The sidebar is the command
-/// surface: `Ctrl+Q` quits there, and the settings button is a row of it.
+/// surface: `Ctrl+Q` quits there, `b` shows the selected device's scrollback,
+/// and the settings button is a row of it. The scrollback view navigates with
+/// the arrow and page keys; they never reach the device from there.
 pub fn map_key(state: &AppState, key: Key) -> Action {
     if state.prompt.is_some() {
         return match key {
@@ -115,21 +109,25 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
             Key::Home => Action::Select(i32::MIN),
             Key::End => Action::Select(i32::MAX),
             Key::Enter | Key::Char('o') => Action::OpenSelected,
+            // `b` is the scrollback of the attached device; a closed device has
+            // no scrollback, so `b` keeps asking for its baud rate.
+            Key::Char('b') if state.selected_session().is_some() => Action::EnterScrollback,
             Key::Char('b') => Action::StartBaudPrompt,
             Key::Char('d') => Action::DisconnectSelected,
             _ => Action::Ignore,
         },
-        View::Stream => match key {
-            // Shift is the terminal's own scrollback, so the device keeps the
-            // plain page and home/end keys.
-            Key::ShiftPageUp => Action::Scroll(state.rows().max(1) as i32),
-            Key::ShiftPageDown => Action::Scroll(-(state.rows().max(1) as i32)),
-            Key::ShiftHome => Action::ScrollTop,
-            Key::ShiftEnd => Action::ScrollBottom,
-            key => match encode_key(key) {
-                Some(bytes) => Action::Write(bytes),
-                None => Action::Ignore,
-            },
+        View::Stream => match encode_key(key) {
+            Some(bytes) => Action::Write(bytes),
+            None => Action::Ignore,
+        },
+        View::Scrollback => match key {
+            // Navigation, not device input: nothing typed here is forwarded.
+            Key::Up => Action::Scroll(1),
+            Key::Down => Action::Scroll(-1),
+            Key::PageUp => Action::Scroll(state.rows().max(1) as i32),
+            Key::PageDown => Action::Scroll(-(state.rows().max(1) as i32)),
+            Key::Esc => Action::LeaveScrollback,
+            _ => Action::Ignore,
         },
         View::Settings => Action::Ignore,
     }
@@ -143,12 +141,7 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
 /// Both spell the same key here, so the toggle works either way.
 pub fn translate(event: KeyEvent) -> Option<Key> {
     let control = event.modifiers.contains(KeyModifiers::CONTROL);
-    let shift = event.modifiers.contains(KeyModifiers::SHIFT);
     match event.code {
-        KeyCode::PageUp if shift => Some(Key::ShiftPageUp),
-        KeyCode::PageDown if shift => Some(Key::ShiftPageDown),
-        KeyCode::Home if shift => Some(Key::ShiftHome),
-        KeyCode::End if shift => Some(Key::ShiftEnd),
         KeyCode::Char(']') if control => Some(Key::Ctrl(']')),
         KeyCode::Char('5') if control => Some(Key::Ctrl(']')),
         KeyCode::Char(ch) if control => Some(Key::Ctrl(ch.to_ascii_lowercase())),
@@ -222,8 +215,6 @@ pub fn encode_key(key: Key) -> Option<Vec<u8>> {
                 return None;
             }
         }
-        // The terminal's own scrolling never reaches a device.
-        Key::ShiftPageUp | Key::ShiftPageDown | Key::ShiftHome | Key::ShiftEnd => return None,
     };
     Some(bytes)
 }
@@ -385,20 +376,45 @@ mod tests {
     }
 
     #[test]
-    fn shift_page_and_home_end_scroll_the_stream_view() {
+    fn the_sidebar_opens_scrollback_for_an_attached_device_only() {
         let mut state = state_with_device();
         assert_eq!(
-            map_key(&state, Key::ShiftPageUp),
-            Action::Ignore,
-            "the sidebar is not the stream"
+            map_key(&state, Key::Char('b')),
+            Action::StartBaudPrompt,
+            "a closed device has no scrollback: b still asks for its baud"
         );
-        state.view = View::Stream;
-        assert_eq!(map_key(&state, Key::ShiftPageUp), Action::Scroll(20));
-        assert_eq!(map_key(&state, Key::ShiftPageDown), Action::Scroll(-20));
-        assert_eq!(map_key(&state, Key::ShiftHome), Action::ScrollTop);
-        assert_eq!(map_key(&state, Key::ShiftEnd), Action::ScrollBottom);
+        state.add_session(7, "/dev/ttyUSB0", 115_200, None);
+        assert_eq!(map_key(&state, Key::Char('b')), Action::EnterScrollback);
+    }
 
-        // Plain page keys stay the device's.
+    #[test]
+    fn the_scrollback_view_navigates_and_escape_returns_to_live() {
+        let mut state = state_with_device();
+        state.add_session(7, "/dev/ttyUSB0", 115_200, None);
+        state.view = View::Scrollback;
+        assert_eq!(map_key(&state, Key::Up), Action::Scroll(1));
+        assert_eq!(map_key(&state, Key::Down), Action::Scroll(-1));
+        assert_eq!(map_key(&state, Key::PageUp), Action::Scroll(20));
+        assert_eq!(map_key(&state, Key::PageDown), Action::Scroll(-20));
+        assert_eq!(map_key(&state, Key::Esc), Action::LeaveScrollback);
+        // The scroll keys never reach the device from here…
+        assert_eq!(map_key(&state, Key::Char('a')), Action::Ignore);
+        assert_eq!(map_key(&state, Key::Tab), Action::Ignore);
+        assert_eq!(map_key(&state, Key::Ctrl('q')), Action::Ignore);
+        // …but Ctrl+] still leaves for the sidebar.
+        assert_eq!(map_key(&state, Key::Ctrl(']')), Action::ToggleView);
+    }
+
+    #[test]
+    fn the_stream_keeps_every_key_for_the_device_including_shifted_pages() {
+        let mut state = state_with_device();
+        state.add_session(7, "/dev/ttyUSB0", 115_200, None);
+        state.view = View::Stream;
+        // Shift does not turn the page keys into terminal commands: the device
+        // sees the same bytes as before.
+        use crossterm::event::KeyEvent;
+        let shifted = translate(KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT));
+        assert_eq!(shifted, Some(Key::PageUp));
         assert_eq!(
             map_key(&state, Key::PageUp),
             Action::Write(b"\x1b[5~".to_vec())
@@ -407,31 +423,7 @@ mod tests {
             map_key(&state, Key::PageDown),
             Action::Write(b"\x1b[6~".to_vec())
         );
-    }
-
-    #[test]
-    fn the_shifted_scroll_keys_come_through_translate() {
-        use crossterm::event::KeyEvent;
-        assert_eq!(
-            translate(KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT)),
-            Some(Key::ShiftPageUp)
-        );
-        assert_eq!(
-            translate(KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT)),
-            Some(Key::ShiftPageDown)
-        );
-        assert_eq!(
-            translate(KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT)),
-            Some(Key::ShiftHome)
-        );
-        assert_eq!(
-            translate(KeyEvent::new(KeyCode::End, KeyModifiers::SHIFT)),
-            Some(Key::ShiftEnd)
-        );
-        assert_eq!(
-            translate(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
-            Some(Key::PageUp)
-        );
+        assert_eq!(map_key(&state, Key::Esc), Action::Write(b"\x1b".to_vec()));
     }
 
     #[test]

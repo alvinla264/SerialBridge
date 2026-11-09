@@ -13,11 +13,14 @@ use crate::settings::TerminalSettings;
 /// Which view receives keys. The sidebar is shown while choosing a device and
 /// hides itself in the stream, so the device gets the whole screen. Settings is
 /// its own view in the terminal area, opened from the sidebar's button.
+/// Scrollback is the stream's kept rows, entered from the sidebar with `b`, so
+/// its keys navigate instead of reaching the device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
     Devices,
     Stream,
     Settings,
+    Scrollback,
 }
 
 /// The settings rows, in drawing order. Scrollback has a switch before the
@@ -525,6 +528,10 @@ impl AppState {
             } => {
                 self.remove_session(*device_id);
                 self.notice = Some(Notice::error(format!("unplugged: {path} ({reason})")));
+                // Nothing is left to scroll: the sidebar is the way on.
+                if self.view == View::Scrollback && self.selected_session().is_none() {
+                    self.view = View::Devices;
+                }
             }
             Event::ControlGranted { device_id, holder } => {
                 self.set_control(*device_id, Some(holder));

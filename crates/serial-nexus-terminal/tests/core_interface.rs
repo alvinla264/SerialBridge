@@ -969,7 +969,7 @@ fn view_text(app: &App) -> String {
 }
 
 #[test]
-fn the_stream_scrolls_back_through_device_output_and_returns_to_live() {
+fn b_from_the_sidebar_opens_scrollback_and_escape_returns_to_live() {
     let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
     let mut device = SimulatedDevice::new();
     let mut app = app(&socket);
@@ -981,36 +981,53 @@ fn the_stream_scrolls_back_through_device_output_and_returns_to_live() {
     pump_until(&mut app, Duration::from_secs(3), |app| {
         stream_text(app).contains("line11")
     });
+    let history = app.state.selected_session().unwrap().screen.history_len();
+    assert!(history > 0, "the rows above the live view were kept");
     assert!(
-        app.state.selected_session().unwrap().screen.history_len() > 0,
-        "the rows above the live view were kept"
+        device.try_read().is_empty(),
+        "opening and output send nothing to the device"
     );
 
-    // Shift+PageUp is the terminal's own key: a page back, not a device write.
-    app.handle_key(Key::ShiftPageUp);
-    let session = app.state.selected_session().unwrap();
-    assert!(session.screen.scroll() > 0);
-    let scrolled = view_text(&app);
-    assert!(scrolled.contains("line1"), "{scrolled}");
-    assert!(!scrolled.contains("line11"), "{scrolled}");
-
-    // Shift+Home shows the oldest kept line; Shift+End jumps back to live.
-    app.handle_key(Key::ShiftHome);
-    assert!(view_text(&app).contains("line0"), "{}", view_text(&app));
-    app.handle_key(Key::ShiftEnd);
-    assert_eq!(app.state.selected_session().unwrap().screen.scroll(), 0);
+    // Ctrl+] focuses the sidebar; `b` there opens the scrollback of the
+    // attached device, starting at the live screen.
+    app.handle_key(Key::Ctrl(']'));
+    assert_eq!(app.state.view, View::Devices);
+    app.handle_key(Key::Char('b'));
+    assert_eq!(app.state.view, View::Scrollback);
     assert!(view_text(&app).contains("line11"));
 
-    // Typing goes to the device and brings the view back to live.
-    app.handle_key(Key::ShiftPageUp);
-    assert!(app.state.selected_session().unwrap().screen.scroll() > 0);
-    app.handle_key(Key::Char('x'));
-    device.read_until(b"x", Duration::from_secs(3));
-    assert_eq!(
-        app.state.selected_session().unwrap().screen.scroll(),
-        0,
-        "typing shows the live view again"
+    // PageUp shows a page of older output, and Up goes a line further back.
+    app.handle_key(Key::PageUp);
+    let page = app.state.selected_session().unwrap().screen.scroll();
+    assert_eq!(page, 6, "a page is the stream's own height");
+    let older = view_text(&app);
+    assert!(older.contains("line1"), "{older}");
+    assert!(!older.contains("line11"), "{older}");
+    app.handle_key(Key::Up);
+    assert_eq!(app.state.selected_session().unwrap().screen.scroll(), 7);
+    assert!(view_text(&app).contains("line0"), "{}", view_text(&app));
+
+    // Down and PageDown come forward again, to live.
+    app.handle_key(Key::Down);
+    assert_eq!(app.state.selected_session().unwrap().screen.scroll(), 6);
+    app.handle_key(Key::PageDown);
+    assert_eq!(app.state.selected_session().unwrap().screen.scroll(), 0);
+
+    // Escape returns to the live stream, whose keys are the device's again.
+    // Nothing scrolled in the scrollback view reaches the device, so the only
+    // byte the device sees is the key typed after Escape.
+    app.handle_key(Key::PageUp);
+    app.handle_key(Key::Up);
+    assert!(
+        device.try_read().is_empty(),
+        "scrollback keys must not be sent to the device"
     );
+    app.handle_key(Key::Esc);
+    assert_eq!(app.state.view, View::Stream);
+    assert_eq!(app.state.selected_session().unwrap().screen.scroll(), 0);
+    app.handle_key(Key::Char('x'));
+    let got = device.read_until(b"x", Duration::from_secs(3));
+    assert_eq!(got, b"x", "scrollback keys never reach the device: {got:?}");
 
     app.shutdown();
 }
@@ -1039,7 +1056,13 @@ fn without_scrollback_output_is_not_kept_and_the_keys_do_nothing() {
         0,
         "the setting turns keeping output off"
     );
-    app.handle_key(Key::ShiftPageUp);
+
+    // With nothing kept, `b` says why instead of opening an empty view.
+    app.handle_key(Key::Ctrl(']'));
+    app.handle_key(Key::Char('b'));
+    assert_eq!(app.state.view, View::Devices);
+    let notice = app.state.notice.as_ref().expect("the refusal is reported");
+    assert!(notice.text.contains("scrollback is off"), "{}", notice.text);
     assert_eq!(app.state.selected_session().unwrap().screen.scroll(), 0);
 
     app.shutdown();

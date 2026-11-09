@@ -245,7 +245,7 @@ pub fn render(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16,
     let chrome = chrome(area);
     draw_header(state, buffer, chrome.header);
     let cursor = match state.view {
-        View::Stream => draw_stream(state, buffer, chrome.main),
+        View::Stream | View::Scrollback => draw_stream(state, buffer, chrome.main),
         View::Devices => draw_sidebar(state, buffer, area),
         View::Settings => draw_settings(state, buffer, area),
     };
@@ -279,6 +279,7 @@ fn draw_header(state: &AppState, buffer: &mut Buffer, area: Rect) {
         View::Devices => "sidebar",
         View::Stream => "stream",
         View::Settings => "settings",
+        View::Scrollback => "scrollback",
     };
 
     let brand = " SerialNexus ";
@@ -557,8 +558,9 @@ fn draw_stream(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16
             );
         }
     }
-    // Scrolled back, the device's cursor is not in view.
-    if scroll > 0 {
+    // The device's cursor belongs to the live screen: not in a scrolled-back
+    // view, and not in the scrollback view, whose keys do not reach the device.
+    if scroll > 0 || state.view == View::Scrollback {
         return None;
     }
     // The device's own cursor, so typing happens where the device expects it.
@@ -618,27 +620,46 @@ fn draw_status(state: &AppState, buffer: &mut Buffer, area: Rect) -> bool {
         put(buffer, area, 0, &format!(" {} ", notice.text), style);
         return true;
     }
+    if state.view == View::Scrollback {
+        // Say where the view is: the footer's hints stay the same.
+        let lines = state
+            .selected_session()
+            .map(|session| session.screen.scroll())
+            .unwrap_or(0);
+        let text = if lines == 0 {
+            " At the live screen · ↑ or PageUp shows older output ".to_string()
+        } else {
+            format!(" Scrolled back {lines} lines ")
+        };
+        put(
+            buffer,
+            area,
+            0,
+            &text,
+            RStyle::default()
+                .fg(RColor::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+        return true;
+    }
     false
 }
 
 fn draw_hints(state: &AppState, buffer: &mut Buffer, area: Rect) {
     let hints: String = match state.view {
         View::Devices => {
-            " ↑/↓ select · Enter open/join · b baud · d disconnect · Ctrl+] stream · Ctrl+Q quit "
+            " ↑/↓ select · Enter open/join · b scrollback · d disconnect · Ctrl+] stream · Ctrl+Q quit "
                 .to_string()
         }
-        View::Stream => match state.selected_session() {
-            // Say where the view is and how to come back, rather than the keys
-            // of a live stream the human is not looking at.
-            Some(session) if session.screen.is_scrolled_back() => format!(
-                " Scrolled back {} lines · Shift+PageDown forward · Shift+End live ",
-                session.screen.scroll()
-            ),
-            // Both hints have to stay readable in a narrow terminal: the
-            // stream forwards every ordinary key, so Ctrl+] is the way out.
-            _ => " Typing goes to the device · Shift+PageUp scrolls back · Ctrl+] leaves "
-                .to_string(),
-        },
+        View::Stream => {
+            // The stream forwards every ordinary key, so Ctrl+] is the way out.
+            " Typing goes to the device (Tab and Ctrl+Q too) · Ctrl+] back to the sidebar "
+                .to_string()
+        }
+        // The scrollback view's keys navigate; none of them reach the device.
+        View::Scrollback => {
+            " ↑/↓ line · PageUp/PageDown page · Esc back to live · Ctrl+] sidebar ".to_string()
+        }
         View::Settings => " Ctrl+S save · Esc cancel · Tab/↑↓ move · Space toggle ".to_string(),
     };
     put(buffer, area, 0, &hints, dim());
@@ -1036,9 +1057,9 @@ mod tests {
     }
 
     #[test]
-    fn the_stream_draws_the_scrollback_and_says_it_is_scrolled_back() {
+    fn the_scrollback_view_draws_the_kept_rows_and_says_where_it_is() {
         let mut state = demo();
-        state.view = View::Stream;
+        state.view = View::Scrollback;
         state.resize(4, 40);
         for index in 0..8u8 {
             let line = format!("line{index}\r\n");
@@ -1046,7 +1067,8 @@ mod tests {
         }
         let live = screen(&state, 100, 7).join("\n");
         assert!(live.contains("line7"), "{live}");
-        assert!(!live.contains("Scrolled back"), "{live}");
+        assert!(live.contains("At the live screen"), "{live}");
+        assert!(live.contains("scrollback"), "{live}");
 
         let history = state.sessions.get(&7).unwrap().screen.history_len();
         assert!(history > 0, "the rows above the live view were kept");
@@ -1064,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cursor_is_hidden_while_the_stream_is_scrolled_back() {
+    fn the_cursor_is_hidden_in_the_scrollback_view() {
         let mut state = demo();
         state.view = View::Stream;
         state.resize(4, 40);
@@ -1076,39 +1098,40 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         assert!(render(&state, &mut buffer, area).is_some(), "live cursor");
 
-        state.sessions.get_mut(&7).unwrap().screen.scroll_back(2);
+        state.view = View::Scrollback;
         assert_eq!(
             render(&state, &mut buffer, area),
             None,
-            "the device cursor is not in the scrolled-back view"
+            "the scrollback view has no device cursor"
         );
     }
 
     #[test]
-    fn the_stream_hints_name_the_scrollback_keys() {
+    fn the_scrollback_hints_name_its_keys_and_the_stream_keeps_its_own() {
         let mut state = demo();
         state.view = View::Stream;
-        let hints = screen(&state, 100, 16).join("\n");
-        assert!(hints.contains("Shift+PageUp"), "{hints}");
+        let stream = screen(&state, 100, 16).join("\n");
+        assert!(stream.contains("Ctrl+] back to the sidebar"), "{stream}");
+        assert!(!stream.contains("Shift+PageUp"), "{stream}");
+
+        state.view = View::Scrollback;
+        let scrollback = screen(&state, 100, 16).join("\n");
+        assert!(scrollback.contains("PageUp/PageDown"), "{scrollback}");
+        assert!(scrollback.contains("Esc back to live"), "{scrollback}");
     }
 
     #[test]
     fn both_the_scroll_and_the_way_out_stay_readable_in_80_columns() {
         let mut state = demo();
         state.view = View::Stream;
-        state.resize(4, 80);
-        state.apply_event(&Event::device_output(
-            7,
-            b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\n",
-        ));
-        let live = screen(&state, 80, 24).join("\n");
-        assert!(live.contains("Shift+PageUp"), "{live}");
-        assert!(live.contains("Ctrl+]"), "{live}");
+        let stream = screen(&state, 80, 24).join("\n");
+        assert!(stream.contains("Ctrl+] back to the sidebar"), "{stream}");
 
-        state.sessions.get_mut(&7).unwrap().screen.scroll_back(2);
-        let scrolled = screen(&state, 80, 24).join("\n");
-        assert!(scrolled.contains("Scrolled back 2 lines"), "{scrolled}");
-        assert!(scrolled.contains("Shift+End"), "{scrolled}");
+        state.view = View::Scrollback;
+        let scrollback = screen(&state, 80, 24).join("\n");
+        assert!(scrollback.contains("PageUp/PageDown"), "{scrollback}");
+        assert!(scrollback.contains("Esc back to live"), "{scrollback}");
+        assert!(scrollback.contains("Ctrl+] sidebar"), "{scrollback}");
     }
 
     #[test]
@@ -1118,7 +1141,11 @@ mod tests {
         assert!(sidebar_hints.contains("Ctrl+Q quit"), "{sidebar_hints}");
         state.view = View::Stream;
         let stream_hints = screen(&state, 100, 16).join("\n");
-        assert!(stream_hints.contains("Ctrl+] leaves"), "{stream_hints}");
+        assert!(
+            stream_hints.contains("Ctrl+] back to the sidebar"),
+            "{stream_hints}"
+        );
+        assert!(!stream_hints.contains("Shift+PageUp"), "{stream_hints}");
         assert!(!stream_hints.contains("Ctrl+Q quit"), "{stream_hints}");
         state.begin_settings();
         let settings_hints = screen(&state, 100, 16).join("\n");

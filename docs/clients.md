@@ -102,7 +102,8 @@ AI write control.
   whether this terminal is attached and which view is showing.
 - In the sidebar, `↑`/`↓` (or `j`/`k`) select, `Enter` (or `o`) opens a closed
   device (after the baud prompt, default `115200`) or rejoins an open one at its
-  active rate, `b` opens the baud prompt and `d` disconnects. Opened devices
+  active rate, `b` opens the selected device's scrollback (or, for a closed
+  device that has none, the baud prompt) and `d` disconnects. Opened devices
   stay attached while switching. The bottom row is the Settings button: select
   it with the arrow keys and open it with `Enter`, or click it with the mouse.
   `Ctrl+Q` quits from here, even while the baud prompt is open. `]` sends a
@@ -113,13 +114,15 @@ AI write control.
   go to the device. `Ctrl+]` is the only plain key the terminal keeps, to return
   to the sidebar; that is why the sidebar's `]` sends the literal byte.
 - The stream keeps its scrolled-off rows (up to 1000) while the `scrollback`
-  setting is on, so earlier output can be read again. `Shift+PageUp` and
-  `Shift+PageDown` scroll a page at a time, `Shift+Home` shows the oldest kept
-  line, `Shift+End` returns to the live view, and the mouse wheel scrolls three
-  lines a notch. The footer says how far back the view is, and the cursor is
-  hidden while it is scrolled back. Typing a key into the stream brings the
-  view back to live. With the setting off nothing is kept and those keys do
-  nothing; turning it off frees what was kept.
+  setting is on, so earlier output can be read again. `Ctrl+]` focuses the
+  sidebar and `b` there opens the scrollback for the attached device; `↑`/`↓`
+  move a line, `PageUp`/`PageDown` move a page, the mouse wheel moves three
+  lines a notch, and `Esc` returns to the live stream (as does `Ctrl+]` and
+  re-entering the stream from the sidebar). The scrollback view starts at the
+  live screen; its status line says how far back the view is, and its keys are
+  never sent to the device. The device cursor is hidden there. With the setting
+  off nothing is kept, `b` says so in the footer instead of opening an empty
+  view, and turning the setting off frees what was kept.
 - Device output is rendered through a small ANSI screen (cursor movement,
   erase, SGR colours/attributes, OSC titles ignored). AI writes appear inline in
   a distinct colour, without labels; human writes are not added to the stream as
@@ -160,9 +163,11 @@ AI write control.
 Tests drive the real client/core seam through PTY-backed simulated devices:
 opening by prompt and joining, switching without reopening, local echo on by
 default and off after a saved change, the stream owning `Tab` and `Ctrl+Q` while
-the sidebar quits on `Ctrl+Q`, the sidebar sending a literal `Ctrl+]`, scrolling
-back through output kept by the `scrollback` setting (and nothing kept when it
-is off), typing returning the view to live, settings drafts saved on `Ctrl+S`
+the sidebar quits on `Ctrl+Q`, the sidebar sending a literal `Ctrl+]`, `b` from
+the sidebar opening the scrollback and `Esc` returning to the live stream,
+scrolling with the arrow and page keys through output kept by the `scrollback`
+setting (and nothing kept when it is off), scrollback keys not reaching the
+device, settings drafts saved on `Ctrl+S`
 and discarded on `Esc`, device echo, visible AI writes, baud conflicts, unplug
 notices, explicit disconnect and shutdown.
 State/input/render and the terminal cleanup guard are tested without a real

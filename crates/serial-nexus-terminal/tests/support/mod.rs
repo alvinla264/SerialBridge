@@ -59,6 +59,21 @@ impl SimulatedDevice {
         self.master.flush().ok();
     }
 
+    /// Bytes already waiting on the master side, without waiting for more.
+    pub fn try_read(&mut self) -> Vec<u8> {
+        let mut got = Vec::new();
+        let mut buffer = [0u8; 512];
+        loop {
+            match self.master.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => got.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        got
+    }
+
     /// Read exactly `count` bytes from the master side, else panic.
     pub fn read_n(&mut self, count: usize, timeout: Duration) -> Vec<u8> {
         let deadline = Instant::now() + timeout;
