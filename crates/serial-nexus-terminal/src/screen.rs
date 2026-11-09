@@ -1,5 +1,11 @@
 //! A small ANSI terminal screen for the device stream.
 
+use std::collections::VecDeque;
+
+/// Rows of output the screen can keep above the live view before the oldest
+/// are dropped.
+pub const SCROLLBACK_ROWS: usize = 1_000;
+
 /// A colour the device asked for. `Default` means the terminal default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Color {
@@ -76,6 +82,13 @@ pub struct Screen {
     rows: usize,
     cols: usize,
     grid: Vec<Cell>,
+    /// Rows that scrolled off the top, oldest first. Each row keeps the width
+    /// it was written at, so a later resize cannot lose its text.
+    history: VecDeque<Vec<Cell>>,
+    /// How many history rows to keep; zero keeps none.
+    scrollback: usize,
+    /// How many rows the view is scrolled back from the live bottom.
+    scroll: usize,
     x: usize,
     y: usize,
     style: Style,
@@ -89,12 +102,20 @@ pub struct Screen {
 
 impl Screen {
     pub fn new(rows: usize, cols: usize) -> Self {
+        Self::with_scrollback(rows, cols, 0)
+    }
+
+    /// A screen that keeps up to `scrollback` rows of scrolled-off output.
+    pub fn with_scrollback(rows: usize, cols: usize, scrollback: usize) -> Self {
         let rows = rows.max(1);
         let cols = cols.max(1);
-        Self {
+        let mut screen = Self {
             rows,
             cols,
             grid: vec![Cell::default(); rows * cols],
+            history: VecDeque::new(),
+            scrollback: 0,
+            scroll: 0,
             x: 0,
             y: 0,
             style: Style::default(),
@@ -103,7 +124,9 @@ impl Screen {
             state: State::Ground,
             csi: Vec::new(),
             utf8_pending: Vec::new(),
-        }
+        };
+        screen.set_scrollback(scrollback);
+        screen
     }
 
     pub fn rows(&self) -> usize {
@@ -112,6 +135,71 @@ impl Screen {
 
     pub fn cols(&self) -> usize {
         self.cols
+    }
+
+    /// Keep up to `rows` rows of scrolled-off output. Zero keeps none and
+    /// discards whatever was kept, so turning scrollback off frees it at once.
+    pub fn set_scrollback(&mut self, rows: usize) {
+        self.scrollback = rows;
+        while self.history.len() > rows {
+            self.history.pop_front();
+        }
+        if rows == 0 {
+            self.history.clear();
+        }
+        self.scroll = self.scroll.min(self.history.len());
+    }
+
+    /// Rows kept above the live view.
+    pub fn history_len(&self) -> usize {
+        self.history.len()
+    }
+
+    /// How many rows the view is scrolled back from the live bottom.
+    pub fn scroll(&self) -> usize {
+        self.scroll
+    }
+
+    pub fn is_scrolled_back(&self) -> bool {
+        self.scroll > 0
+    }
+
+    /// Scroll the view back by `rows`, stopping at the oldest kept row.
+    pub fn scroll_back(&mut self, rows: usize) {
+        self.scroll = self.scroll.saturating_add(rows).min(self.history.len());
+    }
+
+    /// Scroll the view towards the live bottom.
+    pub fn scroll_forward(&mut self, rows: usize) {
+        self.scroll = self.scroll.saturating_sub(rows);
+    }
+
+    /// Show the oldest kept row.
+    pub fn scroll_to_top(&mut self) {
+        self.scroll = self.history.len();
+    }
+
+    /// Return to the live view.
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll = 0;
+    }
+
+    /// One cell of the view as it is scrolled: the live screen at
+    /// [`Screen::scroll`] `0`, the kept rows further back. Columns past a
+    /// history row's own width are blank, so a narrow resize shows the start of
+    /// an old line instead of dropping it.
+    pub fn view_cell(&self, row: usize, col: usize) -> Cell {
+        let first = (self.history.len() + self.rows).saturating_sub(self.scroll + self.rows);
+        let index = first + row;
+        match index.checked_sub(self.history.len()) {
+            Some(grid_row) => self.cell(grid_row, col),
+            None => self
+                .history
+                .get(index)
+                .and_then(|line| line.get(col))
+                .copied()
+                .unwrap_or_default(),
+        }
     }
 
     /// The visible rows as strings with trailing blanks trimmed.
@@ -166,6 +254,7 @@ impl Screen {
         self.x = self.x.min(cols - 1);
         self.y = self.y.min(rows - 1);
         self.pending_wrap = false;
+        self.scroll = self.scroll.min(self.history.len());
     }
 
     /// Feed raw device bytes through the escape parser.
@@ -348,11 +437,29 @@ impl Screen {
     fn line_feed(&mut self) {
         self.pending_wrap = false;
         if self.y + 1 >= self.rows {
+            self.keep_top_row();
             self.grid.drain(..self.cols);
             self.grid
                 .extend(std::iter::repeat_n(Cell::default(), self.cols));
         } else {
             self.y += 1;
+        }
+    }
+
+    /// Move the top row into the scrollback before it is scrolled off. A full
+    /// history drops its oldest row, so memory stays bounded.
+    fn keep_top_row(&mut self) {
+        if self.scrollback == 0 {
+            return;
+        }
+        while self.history.len() >= self.scrollback {
+            self.history.pop_front();
+        }
+        self.history.push_back(self.grid[..self.cols].to_vec());
+        // A view that is scrolled back stays on the same text as new rows
+        // arrive, and stops at the oldest row still kept.
+        if self.scroll > 0 {
+            self.scroll = (self.scroll + 1).min(self.history.len());
         }
     }
 
@@ -460,7 +567,14 @@ impl Screen {
                     *cell = Cell::default();
                 }
             }
-            2 | 3 => self.grid.fill(Cell::default()),
+            2 => self.grid.fill(Cell::default()),
+            // 3 erases the saved lines too, as a real terminal does. The view
+            // comes back to live: there is nothing left behind it.
+            3 => {
+                self.grid.fill(Cell::default());
+                self.history.clear();
+                self.scroll = 0;
+            }
             _ => {}
         }
     }
@@ -544,6 +658,121 @@ mod tests {
 
     fn text(screen: &Screen) -> Vec<String> {
         screen.lines()
+    }
+
+    /// One row of the view as it is scrolled, trailing blanks trimmed.
+    fn view_line(screen: &Screen, row: usize) -> String {
+        let mut line: String = (0..screen.cols())
+            .map(|col| screen.view_cell(row, col).ch)
+            .collect();
+        while line.ends_with(' ') {
+            line.pop();
+        }
+        line
+    }
+
+    fn view(screen: &Screen) -> Vec<String> {
+        (0..screen.rows())
+            .map(|row| view_line(screen, row))
+            .collect()
+    }
+
+    #[test]
+    fn scrollback_keeps_the_rows_that_scroll_off_the_top() {
+        let mut screen = Screen::new(2, 4);
+        screen.set_scrollback(10);
+        screen.feed(b"abcdefgh");
+        assert_eq!(text(&screen), ["abcd", "efgh"]);
+        assert_eq!(screen.history_len(), 0, "nothing has scrolled off yet");
+
+        screen.feed(b"ij");
+        assert_eq!(text(&screen), ["efgh", "ij"]);
+        assert_eq!(screen.history_len(), 1);
+        assert_eq!(view(&screen), ["efgh", "ij"], "live view");
+        screen.scroll_back(1);
+        assert_eq!(view(&screen), ["abcd", "efgh"], "one line back");
+        screen.scroll_back(99);
+        assert_eq!(
+            view(&screen),
+            ["abcd", "efgh"],
+            "scrolling past the oldest line stops there"
+        );
+    }
+
+    #[test]
+    fn scrollback_spans_more_than_the_screen() {
+        let mut screen = Screen::new(2, 4);
+        screen.set_scrollback(10);
+        screen.feed(b"aaaa\r\nbbbb\r\ncccc\r\ndddd\r\neeee");
+        assert_eq!(screen.history_len(), 3);
+        assert_eq!(view(&screen), ["dddd", "eeee"]);
+        screen.scroll_back(1);
+        assert_eq!(view(&screen), ["cccc", "dddd"]);
+        screen.scroll_back(1);
+        assert_eq!(view(&screen), ["bbbb", "cccc"]);
+        screen.scroll_back(1);
+        assert_eq!(view(&screen), ["aaaa", "bbbb"]);
+    }
+
+    #[test]
+    fn scrollback_is_bounded_and_drops_the_oldest_rows() {
+        let mut screen = Screen::new(1, 4);
+        screen.set_scrollback(2);
+        for word in [b"aaaa", b"bbbb", b"cccc"] {
+            screen.feed(word);
+            screen.feed(b"\r\n");
+        }
+        screen.feed(b"dddd");
+        assert_eq!(screen.history_len(), 2, "the oldest row was dropped");
+        screen.scroll_back(1);
+        assert_eq!(view(&screen)[0], "cccc");
+        screen.scroll_back(1);
+        assert_eq!(view(&screen)[0], "bbbb");
+    }
+
+    #[test]
+    fn scrollback_off_keeps_nothing_and_turning_it_off_frees_what_was_kept() {
+        let mut screen = Screen::new(2, 4);
+        screen.feed(b"abcdefghij");
+        assert_eq!(screen.history_len(), 0, "off by default");
+        assert_eq!(screen.view_cell(0, 0).ch, 'e', "the live view is all");
+
+        screen.set_scrollback(10);
+        screen.feed(b"klmnop");
+        assert!(screen.history_len() > 0);
+        screen.set_scrollback(0);
+        assert_eq!(screen.history_len(), 0, "turning it off frees the rows");
+        screen.scroll_back(3);
+        assert_eq!(
+            view(&screen),
+            ["ijkl", "mnop"],
+            "with no history there is nothing to scroll to"
+        );
+    }
+
+    #[test]
+    fn erasing_the_saved_lines_clears_the_scrollback_but_a_plain_clear_keeps_it() {
+        let mut screen = Screen::new(1, 4);
+        screen.set_scrollback(10);
+        screen.feed(b"aaaa\n");
+        assert_eq!(screen.history_len(), 1);
+        screen.feed(b"\x1b[2J");
+        assert_eq!(screen.history_len(), 1, "CSI 2J keeps the saved lines");
+        screen.scroll_to_top();
+        screen.feed(b"\x1b[3J");
+        assert_eq!(screen.history_len(), 0, "CSI 3J erases them");
+        assert_eq!(screen.scroll(), 0, "and the view goes back to live");
+    }
+
+    #[test]
+    fn a_narrower_resize_shows_the_start_of_a_history_row() {
+        let mut screen = Screen::new(2, 6);
+        screen.set_scrollback(10);
+        screen.feed(b"abcdefghijklm");
+        assert_eq!(screen.history_len(), 1);
+        screen.resize(2, 3);
+        screen.scroll_back(1);
+        assert_eq!(view_line(&screen, 0), "abc");
     }
 
     #[test]

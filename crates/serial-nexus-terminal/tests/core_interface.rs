@@ -948,3 +948,139 @@ fn a_mouse_save_that_fails_changes_nothing_and_stays_on_the_page() {
 
     app.shutdown();
 }
+
+/// The view as the stream draws it: the live screen, or the rows the view is
+/// scrolled back to.
+fn view_text(app: &App) -> String {
+    let Some(session) = app.state.selected_session() else {
+        return String::new();
+    };
+    let screen = &session.screen;
+    (0..screen.rows())
+        .map(|row| {
+            (0..screen.cols())
+                .map(|col| screen.view_cell(row, col).ch)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn b_from_the_sidebar_opens_scrollback_and_escape_returns_to_live() {
+    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let mut device = SimulatedDevice::new();
+    let mut app = app(&socket);
+    app.open_path(&device.path, Some(115_200)).expect("open");
+    app.resize_stream(6, 40);
+
+    let lines: String = (0..12).map(|index| format!("line{index}\r\n")).collect();
+    device.write(lines.as_bytes());
+    pump_until(&mut app, Duration::from_secs(3), |app| {
+        stream_text(app).contains("line11")
+    });
+    let history = app.state.selected_session().unwrap().screen.history_len();
+    assert!(history > 0, "the rows above the live view were kept");
+    assert!(
+        device.try_read().is_empty(),
+        "opening and output send nothing to the device"
+    );
+
+    // Ctrl+] focuses the sidebar; `b` there opens the scrollback of the
+    // attached device, starting at the live screen.
+    app.handle_key(Key::Ctrl(']'));
+    assert_eq!(app.state.view, View::Devices);
+    app.handle_key(Key::Char('b'));
+    assert_eq!(app.state.view, View::Scrollback);
+    assert!(view_text(&app).contains("line11"));
+
+    // PageUp shows a page of older output, and Up goes a line further back.
+    app.handle_key(Key::PageUp);
+    let page = app.state.selected_session().unwrap().screen.scroll();
+    assert_eq!(page, 6, "a page is the stream's own height");
+    let older = view_text(&app);
+    assert!(older.contains("line1"), "{older}");
+    assert!(!older.contains("line11"), "{older}");
+    app.handle_key(Key::Up);
+    assert_eq!(app.state.selected_session().unwrap().screen.scroll(), 7);
+    assert!(view_text(&app).contains("line0"), "{}", view_text(&app));
+
+    // Down and PageDown come forward again, to live.
+    app.handle_key(Key::Down);
+    assert_eq!(app.state.selected_session().unwrap().screen.scroll(), 6);
+    app.handle_key(Key::PageDown);
+    assert_eq!(app.state.selected_session().unwrap().screen.scroll(), 0);
+
+    // Escape returns to the live stream, whose keys are the device's again.
+    // Nothing scrolled in the scrollback view reaches the device, so the only
+    // byte the device sees is the key typed after Escape.
+    app.handle_key(Key::PageUp);
+    app.handle_key(Key::Up);
+    assert!(
+        device.try_read().is_empty(),
+        "scrollback keys must not be sent to the device"
+    );
+    app.handle_key(Key::Esc);
+    assert_eq!(app.state.view, View::Stream);
+    assert_eq!(app.state.selected_session().unwrap().screen.scroll(), 0);
+    app.handle_key(Key::Char('x'));
+    let got = device.read_until(b"x", Duration::from_secs(3));
+    assert_eq!(got, b"x", "scrollback keys never reach the device: {got:?}");
+
+    // Every way back to the stream shows the live screen: opening the
+    // attached device from the sidebar must not leave a scrolled-back view
+    // forwarding keys to the device.
+    app.handle_key(Key::Ctrl(']'));
+    app.handle_key(Key::Char('b'));
+    app.handle_key(Key::PageUp);
+    assert!(app.state.selected_session().unwrap().screen.scroll() > 0);
+    app.handle_key(Key::Ctrl(']'));
+    app.handle_key(Key::Enter);
+    assert_eq!(app.state.view, View::Stream);
+    assert_eq!(
+        app.state.selected_session().unwrap().screen.scroll(),
+        0,
+        "re-entering the stream returns to live"
+    );
+    assert!(view_text(&app).contains("line11"), "{}", view_text(&app));
+
+    app.shutdown();
+}
+
+#[test]
+fn without_scrollback_output_is_not_kept_and_the_keys_do_nothing() {
+    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let mut device = SimulatedDevice::new();
+    let client = Client::connect_to_socket(&socket, ClientInfo::human("terminal-no-scrollback"))
+        .expect("terminal connects");
+    let settings = serial_nexus_terminal::settings::TerminalSettings {
+        local_echo: true,
+        scrollback: false,
+    };
+    let mut app = App::with_settings(client, 40, 120, settings);
+    app.open_path(&device.path, Some(115_200)).expect("open");
+    app.resize_stream(6, 40);
+
+    let lines: String = (0..12).map(|index| format!("line{index}\r\n")).collect();
+    device.write(lines.as_bytes());
+    pump_until(&mut app, Duration::from_secs(3), |app| {
+        stream_text(app).contains("line11")
+    });
+    assert_eq!(
+        app.state.selected_session().unwrap().screen.history_len(),
+        0,
+        "the setting turns keeping output off"
+    );
+
+    // With nothing kept, `b` says why instead of opening an empty view.
+    app.handle_key(Key::Ctrl(']'));
+    app.handle_key(Key::Char('b'));
+    assert_eq!(app.state.view, View::Devices);
+    let notice = app.state.notice.as_ref().expect("the refusal is reported");
+    assert!(notice.text.contains("scrollback is off"), "{}", notice.text);
+    assert_eq!(app.state.selected_session().unwrap().screen.scroll(), 0);
+
+    app.shutdown();
+}

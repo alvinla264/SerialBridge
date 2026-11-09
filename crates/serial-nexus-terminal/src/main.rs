@@ -104,9 +104,15 @@ fn event_loop(
 }
 
 /// A click on a device row selects it; a click on the sidebar's Settings
-/// button opens the settings, just as Enter does.
+/// button opens the settings, just as Enter does. In the stream, the wheel
+/// scrolls the kept output.
 fn handle_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
-    if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-        app.handle_click(area, mouse.column, mouse.row);
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.handle_click(area, mouse.column, mouse.row);
+        }
+        MouseEventKind::ScrollUp => app.handle_scroll(true),
+        MouseEventKind::ScrollDown => app.handle_scroll(false),
+        _ => {}
     }
 }

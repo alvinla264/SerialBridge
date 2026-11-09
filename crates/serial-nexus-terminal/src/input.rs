@@ -45,6 +45,12 @@ pub enum Action {
     /// Bytes for the selected device. Never drawn locally unless local echo is
     /// on.
     Write(Vec<u8>),
+    /// Scroll the scrollback view back (`> 0`) or forward by lines.
+    Scroll(i32),
+    /// Show the selected device's kept rows.
+    EnterScrollback,
+    /// Leave the scrollback view for the live stream.
+    LeaveScrollback,
     /// Open the settings that the sidebar button offers.
     OpenSettings,
     SettingsMove(i32),
@@ -59,7 +65,9 @@ pub enum Action {
 /// The stream is a transparent terminal: every key it can encode goes to the
 /// device, `Tab` and `Ctrl+Q` included. Only `Ctrl+]` leaves it, which is why
 /// the sidebar's `]` sends a literal `Ctrl+]`. The sidebar is the command
-/// surface: `Ctrl+Q` quits there, and the settings button is a row of it.
+/// surface: `Ctrl+Q` quits there, `b` shows the selected device's scrollback,
+/// and the settings button is a row of it. The scrollback view navigates with
+/// the arrow and page keys; they never reach the device from there.
 pub fn map_key(state: &AppState, key: Key) -> Action {
     if state.prompt.is_some() {
         return match key {
@@ -101,6 +109,9 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
             Key::Home => Action::Select(i32::MIN),
             Key::End => Action::Select(i32::MAX),
             Key::Enter | Key::Char('o') => Action::OpenSelected,
+            // `b` is the scrollback of the attached device; a closed device has
+            // no scrollback, so `b` keeps asking for its baud rate.
+            Key::Char('b') if state.selected_session().is_some() => Action::EnterScrollback,
             Key::Char('b') => Action::StartBaudPrompt,
             Key::Char('d') => Action::DisconnectSelected,
             _ => Action::Ignore,
@@ -108,6 +119,15 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
         View::Stream => match encode_key(key) {
             Some(bytes) => Action::Write(bytes),
             None => Action::Ignore,
+        },
+        View::Scrollback => match key {
+            // Navigation, not device input: nothing typed here is forwarded.
+            Key::Up => Action::Scroll(1),
+            Key::Down => Action::Scroll(-1),
+            Key::PageUp => Action::Scroll(state.rows().max(1) as i32),
+            Key::PageDown => Action::Scroll(-(state.rows().max(1) as i32)),
+            Key::Esc => Action::LeaveScrollback,
+            _ => Action::Ignore,
         },
         View::Settings => Action::Ignore,
     }
@@ -353,6 +373,57 @@ mod tests {
         // Nothing typed here reaches a device.
         assert_eq!(map_key(&state, Key::Char('x')), Action::Ignore);
         assert_eq!(map_key(&state, Key::Ctrl(']')), Action::Ignore);
+    }
+
+    #[test]
+    fn the_sidebar_opens_scrollback_for_an_attached_device_only() {
+        let mut state = state_with_device();
+        assert_eq!(
+            map_key(&state, Key::Char('b')),
+            Action::StartBaudPrompt,
+            "a closed device has no scrollback: b still asks for its baud"
+        );
+        state.add_session(7, "/dev/ttyUSB0", 115_200, None);
+        assert_eq!(map_key(&state, Key::Char('b')), Action::EnterScrollback);
+    }
+
+    #[test]
+    fn the_scrollback_view_navigates_and_escape_returns_to_live() {
+        let mut state = state_with_device();
+        state.add_session(7, "/dev/ttyUSB0", 115_200, None);
+        state.view = View::Scrollback;
+        assert_eq!(map_key(&state, Key::Up), Action::Scroll(1));
+        assert_eq!(map_key(&state, Key::Down), Action::Scroll(-1));
+        assert_eq!(map_key(&state, Key::PageUp), Action::Scroll(20));
+        assert_eq!(map_key(&state, Key::PageDown), Action::Scroll(-20));
+        assert_eq!(map_key(&state, Key::Esc), Action::LeaveScrollback);
+        // The scroll keys never reach the device from here…
+        assert_eq!(map_key(&state, Key::Char('a')), Action::Ignore);
+        assert_eq!(map_key(&state, Key::Tab), Action::Ignore);
+        assert_eq!(map_key(&state, Key::Ctrl('q')), Action::Ignore);
+        // …but Ctrl+] still leaves for the sidebar.
+        assert_eq!(map_key(&state, Key::Ctrl(']')), Action::ToggleView);
+    }
+
+    #[test]
+    fn the_stream_keeps_every_key_for_the_device_including_shifted_pages() {
+        let mut state = state_with_device();
+        state.add_session(7, "/dev/ttyUSB0", 115_200, None);
+        state.view = View::Stream;
+        // Shift does not turn the page keys into terminal commands: the device
+        // sees the same bytes as before.
+        use crossterm::event::KeyEvent;
+        let shifted = translate(KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT));
+        assert_eq!(shifted, Some(Key::PageUp));
+        assert_eq!(
+            map_key(&state, Key::PageUp),
+            Action::Write(b"\x1b[5~".to_vec())
+        );
+        assert_eq!(
+            map_key(&state, Key::PageDown),
+            Action::Write(b"\x1b[6~".to_vec())
+        );
+        assert_eq!(map_key(&state, Key::Esc), Action::Write(b"\x1b".to_vec()));
     }
 
     #[test]

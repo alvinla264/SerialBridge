@@ -7,17 +7,20 @@ use std::collections::BTreeMap;
 
 use serial_nexus_protocol::{Event, Holder, Source, DEFAULT_BAUD};
 
-use crate::screen::Screen;
+use crate::screen::{Screen, SCROLLBACK_ROWS};
 use crate::settings::TerminalSettings;
 
 /// Which view receives keys. The sidebar is shown while choosing a device and
 /// hides itself in the stream, so the device gets the whole screen. Settings is
 /// its own view in the terminal area, opened from the sidebar's button.
+/// Scrollback is the stream's kept rows, entered from the sidebar with `b`, so
+/// its keys navigate instead of reaching the device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
     Devices,
     Stream,
     Settings,
+    Scrollback,
 }
 
 /// The settings rows, in drawing order. Scrollback has a switch before the
@@ -251,7 +254,17 @@ impl AppState {
     /// Keep the draft as the settings in effect and leave the view.
     pub fn commit_settings(&mut self) {
         self.settings = self.draft.clone();
+        self.apply_scrollback();
         self.leave_settings();
+    }
+
+    /// Keep every open screen's scrollback in line with the settings in effect.
+    /// Turning it off frees the kept rows and brings the view back to live.
+    fn apply_scrollback(&mut self) {
+        let capacity = scrollback_capacity(&self.settings);
+        for session in self.sessions.values_mut() {
+            session.screen.set_scrollback(capacity);
+        }
     }
 
     fn leave_settings(&mut self) {
@@ -435,7 +448,11 @@ impl AppState {
             baud,
             control: control.as_ref().map(short_holder),
             control_id: control.as_ref().map(|holder| holder.client_id),
-            screen: Screen::new(self.rows, self.cols),
+            screen: Screen::with_scrollback(
+                self.rows,
+                self.cols,
+                scrollback_capacity(&self.settings),
+            ),
             rows: self.rows,
             cols: self.cols,
         };
@@ -511,6 +528,10 @@ impl AppState {
             } => {
                 self.remove_session(*device_id);
                 self.notice = Some(Notice::error(format!("unplugged: {path} ({reason})")));
+                // Nothing is left to scroll: the sidebar is the way on.
+                if self.view == View::Scrollback && self.selected_session().is_none() {
+                    self.view = View::Devices;
+                }
             }
             Event::ControlGranted { device_id, holder } => {
                 self.set_control(*device_id, Some(holder));
@@ -596,6 +617,15 @@ impl AppState {
     }
 }
 
+/// How many rows a screen keeps for scrolling, from the settings in effect.
+fn scrollback_capacity(settings: &TerminalSettings) -> usize {
+    if settings.scrollback {
+        SCROLLBACK_ROWS
+    } else {
+        0
+    }
+}
+
 pub fn short_holder(holder: &Holder) -> String {
     match &holder.name {
         Some(name) => name.clone(),
@@ -669,6 +699,108 @@ mod tests {
             Some("/dev/a"),
             "the remembered device is still A"
         );
+    }
+
+    fn session_state(rows: usize, scrollback: bool) -> AppState {
+        let mut state = AppState::new(rows, 20);
+        state.settings.scrollback = scrollback;
+        state.draft = state.settings.clone();
+        state.add_session(7, "/dev/ttyUSB0", 115_200, None);
+        state
+    }
+
+    fn write_lines(state: &mut AppState, first: usize, count: usize) {
+        for index in first..first + count {
+            let line = format!("line{index}\r\n");
+            state.apply_event(&Event::device_output(7, line.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn a_session_keeps_scrolled_off_output_and_scrolls_back_through_it() {
+        let mut state = session_state(4, true);
+        write_lines(&mut state, 0, 8);
+        let session = state.sessions.get(&7).expect("session");
+        assert_eq!(session.screen.history_len(), 5, "five lines scrolled off");
+        assert_eq!(session.screen.scroll(), 0, "the live view is the start");
+
+        let session = state.sessions.get_mut(&7).unwrap();
+        session.screen.scroll_back(4);
+        assert_eq!(session.screen.scroll(), 4);
+        // Scrolled four lines back, the view starts four rows above the live
+        // bottom: at the second kept line.
+        let row: String = (0..20)
+            .map(|col| session.screen.view_cell(0, col).ch)
+            .collect();
+        assert_eq!(row.trim_end(), "line1");
+
+        // The oldest line is as far back as it goes.
+        session.screen.scroll_to_top();
+        assert_eq!(session.screen.scroll(), session.screen.history_len());
+        let row: String = (0..20)
+            .map(|col| session.screen.view_cell(0, col).ch)
+            .collect();
+        assert_eq!(row.trim_end(), "line0");
+
+        session.screen.scroll_to_bottom();
+        assert_eq!(session.screen.scroll(), 0);
+        assert!(!session.screen.is_scrolled_back());
+    }
+
+    #[test]
+    fn scrolling_back_while_output_arrives_keeps_the_same_text_in_view() {
+        let mut state = session_state(4, true);
+        write_lines(&mut state, 0, 8);
+        let session = state.sessions.get_mut(&7).unwrap();
+        session.screen.scroll_back(3);
+        let before: String = (0..20)
+            .map(|col| session.screen.view_cell(0, col).ch)
+            .collect();
+
+        // More output that scrolls rows off the top must not slide the view.
+        write_lines(&mut state, 8, 2);
+        let session = state.sessions.get(&7).unwrap();
+        assert!(session.screen.scroll() > 3, "the view stayed on its text");
+        let after: String = (0..20)
+            .map(|col| session.screen.view_cell(0, col).ch)
+            .collect();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn without_the_scrollback_setting_nothing_is_kept_or_scrolled() {
+        let mut state = session_state(4, false);
+        write_lines(&mut state, 0, 12);
+        let session = state.sessions.get_mut(&7).unwrap();
+        assert_eq!(session.screen.history_len(), 0);
+        session.screen.scroll_back(5);
+        assert_eq!(session.screen.scroll(), 0, "nothing to scroll to");
+    }
+
+    #[test]
+    fn saving_scrollback_off_clears_every_sessions_history() {
+        let mut state = session_state(4, true);
+        write_lines(&mut state, 0, 12);
+        assert!(state.sessions.get(&7).unwrap().screen.history_len() > 0);
+
+        state.begin_settings();
+        state.draft.scrollback = false;
+        state.commit_settings();
+        assert!(!state.settings.scrollback);
+        let session = state.sessions.get(&7).unwrap();
+        assert_eq!(session.screen.history_len(), 0, "the rows are freed");
+        assert_eq!(session.screen.scroll(), 0, "the view is back on live");
+    }
+
+    #[test]
+    fn turning_scrollback_on_keeps_new_rows_from_then_on() {
+        let mut state = session_state(4, false);
+        write_lines(&mut state, 0, 8);
+        state.begin_settings();
+        state.draft.scrollback = true;
+        state.commit_settings();
+        write_lines(&mut state, 8, 8);
+        assert!(state.sessions.get(&7).unwrap().screen.history_len() > 0);
     }
 
     #[test]
