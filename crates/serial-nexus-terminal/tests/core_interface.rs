@@ -707,3 +707,40 @@ fn opening_settings_does_not_move_typing_to_another_attached_device() {
 
     app.shutdown();
 }
+
+#[test]
+fn the_settings_button_keeps_its_focus_when_discovery_grows_the_list() {
+    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let first = SimulatedDevice::new();
+    let mut app = app(&socket);
+    app.open_path(&first.path, Some(115_200)).expect("open");
+    app.state.set_devices(Vec::new());
+    app.handle_key(Key::Ctrl(']'));
+    app.state.select_settings_button();
+    let device = app.state.selected_device().map(|device| device.device_id);
+    assert_eq!(device, None, "the button has the focus");
+
+    // Discovery finds a device that sorts before the attached one, as another
+    // AI opening one would make it do. The attached session keeps its entry.
+    let mut path = first.path.clone();
+    path.push_str("-aaa");
+    app.state
+        .set_devices(vec![serial_nexus_terminal::state::DeviceEntry::new(&path)]);
+    assert!(
+        app.state.settings_button_selected(),
+        "the button still has the focus after discovery"
+    );
+
+    // Enter still opens the settings, not a device.
+    app.handle_key(Key::Enter);
+    assert_eq!(app.state.view, View::Settings);
+    app.handle_key(Key::Esc);
+
+    // Ctrl+] without moving the focus shows the attached device's stream.
+    app.state.select_settings_button();
+    app.handle_key(Key::Ctrl(']'));
+    assert_eq!(app.state.view, View::Stream);
+    assert!(app.state.selected_device().is_some());
+
+    app.shutdown();
+}

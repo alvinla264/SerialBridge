@@ -129,9 +129,11 @@ impl BaudPrompt {
 /// Everything the renderer needs.
 pub struct AppState {
     pub devices: Vec<DeviceEntry>,
-    /// The selected sidebar row: a device, or the Settings button when it is
-    /// one past the last device.
+    /// The selected device row. It stays on a device while the Settings button
+    /// has the focus, so discovery cannot turn the button into a device.
     pub selected: usize,
+    /// Whether the sidebar's Settings button has the focus.
+    settings_button_selected: bool,
     pub view: View,
     pub sessions: BTreeMap<u64, Session>,
     pub notice: Option<Notice>,
@@ -166,6 +168,7 @@ impl AppState {
         Self {
             devices: Vec::new(),
             selected: 0,
+            settings_button_selected: false,
             view: View::Devices,
             sessions: BTreeMap::new(),
             notice: None,
@@ -263,9 +266,9 @@ impl AppState {
         self.view = View::Devices;
     }
 
-    /// Whether the sidebar's Settings button is the selected row.
+    /// Whether the sidebar's Settings button has the focus.
     pub fn settings_button_selected(&self) -> bool {
-        self.selected >= self.devices.len()
+        self.settings_button_selected
     }
 
     /// The name of one settings panel row.
@@ -297,6 +300,9 @@ impl AppState {
     }
 
     pub fn selected_device(&self) -> Option<&DeviceEntry> {
+        if self.settings_button_selected {
+            return None;
+        }
         self.devices.get(self.selected)
     }
 
@@ -325,7 +331,12 @@ impl AppState {
     /// Select one sidebar row, keeping the last device row for when the
     /// Settings button is left. Every selection change goes through here.
     pub fn select_index(&mut self, index: usize) {
-        self.selected = index.min(self.devices.len());
+        if index >= self.devices.len() {
+            self.settings_button_selected = true;
+            return;
+        }
+        self.settings_button_selected = false;
+        self.selected = index;
         if let Some(device) = self.devices.get(self.selected) {
             self.last_device_path = Some(device.path.clone());
         }
@@ -347,9 +358,11 @@ impl AppState {
             .unwrap_or_else(|| self.selected.min(self.devices.len().saturating_sub(1)))
     }
 
-    /// Point the sidebar selection at the Settings button.
+    /// Point the sidebar selection at the Settings button. The device row
+    /// stays where it was, so the button is not a row that discovery can
+    /// renumber into a device.
     pub fn select_settings_button(&mut self) {
-        self.select_index(self.devices.len());
+        self.settings_button_selected = true;
     }
 
     pub fn select_path(&mut self, path: &str) -> bool {
@@ -393,15 +406,16 @@ impl AppState {
         }
         devices.sort_by(|left, right| left.path.cmp(&right.path));
         self.devices = devices;
-        if let Some(path) = selected_path {
-            if let Some(index) = self.devices.iter().position(|device| device.path == path) {
-                self.select_index(index);
-                return;
-            }
+        // The Settings button keeps the focus; a device row keeps its device by
+        // path when the list was re-sorted or grew.
+        if self.settings_button_selected {
+            return;
         }
-        // The Settings button stays selected when it was; otherwise a row that
-        // disappeared falls back to the last device.
-        self.select_index(self.selected);
+        let row = selected_path
+            .as_deref()
+            .and_then(|path| self.devices.iter().position(|device| device.path == path))
+            .unwrap_or(0);
+        self.select_index(row);
     }
 
     /// Add a freshly opened session and point the sidebar at it. The screen
@@ -629,6 +643,31 @@ mod tests {
         assert_eq!(
             state.selected_device().map(|device| device.path.as_str()),
             Some("/dev/a")
+        );
+    }
+
+    #[test]
+    fn button_focus_survives_the_device_list_growing() {
+        let mut state = AppState::new(10, 80);
+        state.set_devices(devices(&["/dev/a", "/dev/b"]));
+        state.select_index(0);
+        state.select_settings_button();
+        assert!(state.settings_button_selected());
+
+        // A device that sorts first arrives while the button has the focus.
+        state.set_devices(devices(&["/dev/0", "/dev/a", "/dev/b"]));
+        assert!(
+            state.settings_button_selected(),
+            "the button keeps the focus"
+        );
+        assert_eq!(state.selected_device(), None);
+        assert_eq!(
+            state
+                .devices
+                .get(state.last_device_index())
+                .map(|d| d.path.as_str()),
+            Some("/dev/a"),
+            "the remembered device is still A"
         );
     }
 

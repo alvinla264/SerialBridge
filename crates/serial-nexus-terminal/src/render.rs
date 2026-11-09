@@ -246,14 +246,23 @@ fn draw_header(state: &AppState, buffer: &mut Buffer, area: Rect) {
 /// devices than fit.
 fn draw_sidebar(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16, u16)> {
     let sidebar = sidebar(area)?;
-    let title = format!(" Devices ({}) ", state.devices.len());
+    let list = sidebar.list;
+    // With no room for a device row, the title row carries the selected device
+    // instead, so the cursor never points at the Settings button while a
+    // device owns the keys.
+    let title = if list.height == 0 && !state.settings_button_selected() {
+        match state.selected_device() {
+            Some(device) => format!("› {} ", device.path),
+            None => " Devices ".to_string(),
+        }
+    } else {
+        format!(" Devices ({}) ", state.devices.len())
+    };
     let title_style = RStyle::default()
         .fg(RColor::Black)
         .bg(RColor::Cyan)
         .add_modifier(Modifier::BOLD);
     put(buffer, sidebar.title, 0, &title, title_style);
-
-    let list = sidebar.list;
     if state.devices.is_empty() && list.height > 0 {
         put(
             buffer,
@@ -317,8 +326,11 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u1
         style,
     );
 
-    if selected {
+    if state.settings_button_selected() {
         Some((button.x + 1, button.y))
+    } else if list.height == 0 {
+        // The device is shown on the title row when no device row fits.
+        Some((sidebar.title.x + 1, sidebar.title.y))
     } else {
         // The selected device row, which the list has kept in view.
         let offset = state.selected.saturating_sub(first) as u16;
@@ -805,6 +817,22 @@ mod tests {
             "the cursor row is the selected flag: {:?}",
             lines[cursor.1 as usize]
         );
+    }
+
+    #[test]
+    fn a_four_row_sidebar_shows_the_selected_device_under_the_cursor() {
+        let state = demo();
+        let area = Rect::new(0, 0, 80, 4);
+        let mut buffer = Buffer::empty(area);
+        let cursor = render(&state, &mut buffer, area).expect("cursor");
+        let row: String = (0..area.width)
+            .map(|x| buffer[(x, cursor.1)].symbol())
+            .collect();
+        assert!(
+            row.contains(&state.devices[state.selected].path),
+            "the cursor row names the selected device: {row:?}"
+        );
+        assert!(!row.contains("[ Settings ]"), "{row:?}");
     }
 
     #[test]
