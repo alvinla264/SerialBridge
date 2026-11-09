@@ -192,16 +192,27 @@ impl App {
         }
     }
 
-    /// Keep the draft settings, save them, and go back to the sidebar.
+    /// Save the draft settings, then keep them and go back to the sidebar.
+    ///
+    /// The draft becomes the settings in effect only after the file was
+    /// written: a failed save, or no settings file to write, leaves the
+    /// options as they were and stays in the settings so the draft is not
+    /// lost. The terminal never claims a save it did not make.
     fn save_settings(&mut self) {
-        self.state.commit_settings();
-        self.state.notice = Some(match &self.settings_store {
-            Some(store) => match store.save(&self.state.settings) {
-                Ok(()) => Notice::info("settings saved"),
-                Err(error) => Notice::error(format!("settings not saved: {error}")),
-            },
-            None => Notice::info("settings applied for this launch"),
-        });
+        let draft = self.state.draft.clone();
+        let Some(store) = &self.settings_store else {
+            self.state.notice = Some(Notice::error("settings not saved: no settings file"));
+            return;
+        };
+        match store.save(&draft) {
+            Ok(()) => {
+                self.state.commit_settings();
+                self.state.notice = Some(Notice::info("settings saved"));
+            }
+            Err(error) => {
+                self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
+            }
+        }
     }
 
     /// Open the selected device. A closed device asks for a baud rate first;

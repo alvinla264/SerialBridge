@@ -432,7 +432,18 @@ fn launch_settings_are_loaded_into_the_app_and_do_not_change_baud_behavior() {
 fn local_echo_is_on_by_default_and_stops_when_it_is_turned_off() {
     let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
     let mut device = SimulatedDevice::new();
-    let mut app = app(&socket);
+    let config = tempfile::tempdir().unwrap();
+    let store =
+        serial_nexus_terminal::settings::SettingsStore::at(config.path().join("terminal.json"));
+    let settings = store.load_or_create().expect("settings file");
+    let mut app = App::with_preferences(
+        Client::connect_to_socket(&socket, ClientInfo::human("terminal-echo-default"))
+            .expect("terminal connects"),
+        40,
+        120,
+        settings,
+        Some(store),
+    );
     assert!(app.settings().local_echo, "local echo is on by default");
     app.open_path(&device.path, Some(115_200)).expect("open");
     assert_eq!(app.state.view, View::Stream);
@@ -566,26 +577,87 @@ fn a_setting_changed_in_the_settings_view_is_saved_on_ctrl_s() {
         "Ctrl+S wrote the change"
     );
 
-    // A failing save is reported, and the setting still applies for this run.
-    let blocked = dir.path().join("not-a-directory");
-    std::fs::write(&blocked, "x").unwrap();
+    app.shutdown();
+}
+
+#[test]
+fn a_failed_settings_save_neither_applies_nor_claims_the_change() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("terminal.json");
+    let store = serial_nexus_terminal::settings::SettingsStore::at(&path);
+    store
+        .save(&serial_nexus_terminal::settings::TerminalSettings {
+            local_echo: true,
+            scrollback: true,
+        })
+        .expect("a settings file to keep");
+    let before = std::fs::read_to_string(&path).expect("the file");
+
     let mut app = App::with_preferences(
         Client::connect_to_socket(&socket, ClientInfo::human("terminal-save-fail"))
             .expect("terminal connects"),
         40,
         120,
-        store.load().unwrap().unwrap(),
-        Some(serial_nexus_terminal::settings::SettingsStore::at(
-            blocked.join("terminal.json"),
-        )),
+        store.load().expect("load").expect("file"),
+        Some(store.clone()),
     );
+
+    // Make the save fail: the directory cannot take the staging file.
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
     app.state.select_settings_button();
     app.handle_key(Key::Enter);
     app.handle_key(Key::Char(' '));
+    assert!(!app.state.draft.local_echo, "the draft was flipped");
     app.handle_key(Key::Ctrl('s'));
-    assert!(app.state.settings.local_echo, "the change still applies");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(
+        app.state.settings.local_echo,
+        "the active options are unchanged by a failed save"
+    );
+    assert_eq!(
+        app.state.view,
+        View::Settings,
+        "the settings stay open with the draft, not reported as saved"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("the file is untouched"),
+        before,
+        "the persisted file is unchanged"
+    );
     let notice = app.state.notice.as_ref().expect("save failure reported");
-    assert!(notice.text.contains("not saved"), "{}", notice.text);
+    assert!(
+        notice.text.contains("not saved"),
+        "the failure is reported: {}",
+        notice.text
+    );
+
+    // Without a settings file there is nothing to save either, and no claim.
+    let mut app = App::with_settings(
+        Client::connect_to_socket(&socket, ClientInfo::human("terminal-no-store"))
+            .expect("terminal connects"),
+        40,
+        120,
+        store.load().expect("load").expect("file"),
+    );
+    app.open_settings();
+    app.handle_key(Key::Char(' '));
+    app.handle_key(Key::Ctrl('s'));
+    assert!(app.state.settings.local_echo, "no store, no change applied");
+    assert_eq!(app.state.view, View::Settings);
+    let notice = app.state.notice.as_ref().expect("no store reported");
+    assert!(
+        notice.text.contains("not saved"),
+        "the missing file is reported as a failed save: {}",
+        notice.text
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("the file is untouched"),
+        before
+    );
 
     app.shutdown();
 }
@@ -626,7 +698,18 @@ fn settings_clicked_during_a_baud_prompt_takes_the_keys_and_cancels_the_prompt()
 
     let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
     let device = SimulatedDevice::new();
-    let mut app = app(&socket);
+    let config = tempfile::tempdir().unwrap();
+    let store =
+        serial_nexus_terminal::settings::SettingsStore::at(config.path().join("terminal.json"));
+    let settings = store.load_or_create().expect("settings file");
+    let mut app = App::with_preferences(
+        Client::connect_to_socket(&socket, ClientInfo::human("terminal-prompt-settings"))
+            .expect("terminal connects"),
+        40,
+        120,
+        settings,
+        Some(store),
+    );
     app.state
         .set_devices(vec![serial_nexus_terminal::state::DeviceEntry::new(
             &device.path,

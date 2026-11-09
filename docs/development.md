@@ -67,7 +67,9 @@ path as a real serial port and the test drives the master. Covered end to end:
 - the terminal's sidebar/prompt/switch/disconnect flows, local echo on by
   default and off after a saved change, the stream owning `Tab` and `Ctrl+Q`
   while the sidebar quits on `Ctrl+Q`, the sidebar sending a literal `Ctrl+]`,
-  settings drafts saved on `Ctrl+S` and discarded on `Esc`, visible AI writes,
+  settings drafts saved on `Ctrl+S` only when the file was written (a forced
+  save failure and a missing settings file leave the options unchanged and say
+  so) and discarded on `Esc`, visible AI writes,
   unplug and shutdown through the same core. The terminal's stream parsing, key
   mapping, layout, cursor positions, mouse hit testing, local echo next to a
   half-read device escape or UTF-8 sequence, and footer layout are covered by

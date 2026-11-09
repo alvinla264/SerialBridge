@@ -122,9 +122,13 @@ AI write control.
   the device echoes what it receives.
 - The settings view lists both flags, `local_echo` and `scrollback`. `Tab`,
   `Shift+Tab` and `↑`/`↓` move between them, `Space` (or `Enter`) toggles the
-  selection, `Ctrl+S` keeps the changes and saves the file, and `Esc` throws
-  every change away. Scrollback is stored before the stream can scroll: it is
-  part of the settings, and the scrolling interface reads the same flag.
+  selection, `Ctrl+S` saves the file and only then puts the changes into
+  effect, and `Esc` throws every change away. A save that fails — including a
+  launch with no settings file to write — leaves the options as they were, says
+  so in the footer, and stays in the settings so the draft is not lost; the
+  terminal never reports a save it did not make. Scrollback is stored before
+  the stream can scroll: it is part of the settings, and the scrolling
+  interface reads the same flag.
 - The footer has a status line (errors, unplug notices, setting changes, the
   baud prompt) and a line of key hints for the current view. A short terminal
   keeps the status line and hides the hints.
@@ -135,7 +139,7 @@ AI write control.
   first launch. An invalid or unreadable file is reported in the footer and
   left untouched, never silently replaced, and settings changed in that launch
   are not saved; saves go to a temporary file and are renamed into place, and a
-  failed save is reported.
+  failed save is reported and changes nothing.
 - `Ctrl+Q` in the sidebar (or `F10`) quits. Normal exit, I/O errors and panics
   restore raw mode, the alternate screen and mouse capture, and explicitly
   disconnect every device. Catchable termination signals (SIGTERM, SIGHUP) are
