@@ -42,6 +42,8 @@ these words in their tool names and user-facing text.
 - **Tool call**: one MCP request from the host to `serial-nexus-mcp`
   (`list_devices`, `connect`, `disconnect`, `read`, `send`). It returns one
   bounded result; there is no continuous stream.
+- **Settings**: the human terminal's own preferences, saved per user in
+  `terminal.json` (today the default baud rate). Not core configuration.
 - **Event**: an unsolicited notification from the core (device output, write
   echo, client joined/left, control granted/released/denied, device closed,
   core shutdown). Clients receive all events from their subscription onward.

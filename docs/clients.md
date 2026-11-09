@@ -96,10 +96,17 @@ AI write control.
 - The sidebar lists every device the core can see, with open/closed state, its
   active baud and the AI control holder. `Tab` switches between the sidebar
   and the stream.
-- In the sidebar, `Enter` opens a closed device (after the baud prompt, default
-  `115200`) or joins an open one at its active rate, `b` opens the baud prompt,
-  `d` disconnects explicitly, and the arrow keys select. Opened devices stay
-  attached while switching.
+- In the sidebar, `Enter` opens a closed device (after the baud prompt, whose
+  default is the saved rate) or joins an open one at its active rate, `b` opens
+  the baud prompt, `d` disconnects explicitly, and the arrow keys select.
+  Opened devices stay attached while switching.
+- Settings are saved per user in `$XDG_CONFIG_HOME/serial-nexus/terminal.json`
+  (`~/.config/serial-nexus/terminal.json` when `XDG_CONFIG_HOME` is unset;
+  `SERIAL_NEXUS_TERMINAL_SETTINGS` names another file). The file holds
+  `default_baud`: the rate the baud prompt offers when left empty, updated to
+  the rate typed at the prompt. A missing, unreadable or invalid file falls
+  back to `115200`, and a failed save is reported in the footer without
+  stopping the open.
 - In the stream, keys are written to the selected device as-is: arrows are ANSI
   sequences, Enter is CR and Backspace is DEL. Nothing typed is echoed locally;
   the device's own echo is still shown.
