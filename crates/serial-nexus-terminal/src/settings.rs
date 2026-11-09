@@ -4,7 +4,7 @@
 //! to the terminal, not the core: each human's preferences are their own.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -87,8 +87,9 @@ impl SettingsStore {
     }
 
     /// Write the settings, creating their directory. The write goes to a
-    /// sibling temporary file first, so an interrupted save cannot truncate
-    /// the file the terminal loaded.
+    /// sibling staging file first, so an interrupted save cannot truncate the
+    /// file the terminal loaded. The staging file is created exclusively, so
+    /// an existing entry (even a symlink) cannot redirect the write.
     pub fn save(&self, settings: &TerminalSettings) -> Result<(), SettingsError> {
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -96,24 +97,46 @@ impl SettingsStore {
             }
         }
         let text = serde_json::to_string_pretty(settings)? + "\n";
-        let name = self
-            .path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| SETTINGS_FILE.to_string());
-        let temporary = self
-            .path
-            .with_file_name(format!(".{name}.{}.tmp", std::process::id()));
-        if let Err(error) = fs::write(&temporary, text) {
-            let _ = fs::remove_file(&temporary);
-            return Err(error.into());
-        }
-        if let Err(error) = fs::rename(&temporary, &self.path) {
-            let _ = fs::remove_file(&temporary);
-            return Err(error.into());
-        }
-        Ok(())
+        write_atomic(&self.path, &staging_path(&self.path), &text)
     }
+}
+
+/// Write `text` to `temporary`, then rename it onto `path`. The staging file
+/// is created exclusively, so an existing entry (even a symlink) cannot
+/// redirect the write or make it destroy another file.
+fn write_atomic(path: &Path, temporary: &Path, text: &str) -> Result<(), SettingsError> {
+    let mut staging = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temporary)?;
+    if let Err(error) = staging
+        .write_all(text.as_bytes())
+        .and_then(|()| staging.sync_all())
+    {
+        drop(staging);
+        let _ = fs::remove_file(temporary);
+        return Err(error.into());
+    }
+    drop(staging);
+    if let Err(error) = fs::rename(temporary, path) {
+        let _ = fs::remove_file(temporary);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+/// The staging file next to `path`. The name is unique to this process and
+/// moment, so a leftover staging file from a killed run does not block saves.
+fn staging_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| SETTINGS_FILE.to_string());
+    let moment = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos())
+        .unwrap_or_default();
+    path.with_file_name(format!(".{name}.{}.{moment}.tmp", std::process::id()))
 }
 
 /// The settings file for this user, if the environment names a place for it.
@@ -258,6 +281,25 @@ mod tests {
             std::fs::read_to_string(&blocker).unwrap(),
             "not a directory"
         );
+    }
+
+    #[test]
+    fn a_preexisting_staging_entry_cannot_redirect_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal.json");
+        let target = dir.path().join("elsewhere.txt");
+        std::fs::write(&target, "sentinel").unwrap();
+        let temporary = dir.path().join("staging.tmp");
+        std::os::unix::fs::symlink(&target, &temporary).unwrap();
+
+        let result = write_atomic(&path, &temporary, "{}\n");
+
+        assert!(
+            result.is_err(),
+            "an occupied staging path is a safe failure"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "sentinel");
+        assert!(!path.exists(), "nothing was renamed into place");
     }
 
     #[test]
