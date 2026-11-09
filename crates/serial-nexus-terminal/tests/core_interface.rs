@@ -469,7 +469,7 @@ fn an_unwritable_settings_file_does_not_stop_the_terminal_opening_a_device() {
         40,
         120,
         serial_nexus_terminal::settings::TerminalSettings::default(),
-        Some(path),
+        Some(path.clone()),
     );
     app.state
         .set_devices(vec![serial_nexus_terminal::state::DeviceEntry::new(
@@ -486,6 +486,29 @@ fn an_unwritable_settings_file_does_not_stop_the_terminal_opening_a_device() {
     assert!(
         notice.text.contains("settings"),
         "notice should name the settings file: {notice:?}"
+    );
+
+    // Once storage works again, submitting the same rate retries the save
+    // instead of treating the in-memory value as already persisted.
+    std::fs::remove_file(&blocker).unwrap();
+    let second = SimulatedDevice::new();
+    app.state
+        .set_devices(vec![serial_nexus_terminal::state::DeviceEntry::new(
+            &second.path,
+        )]);
+    assert!(app.state.select_path(&second.path));
+    app.state.focus = Focus::Devices;
+    app.handle_key(Key::Char('b'));
+    for ch in "9600".chars() {
+        app.handle_key(Key::Char(ch));
+    }
+    app.handle_key(Key::Enter);
+    assert_eq!(app.state.selected_session().expect("opened").baud, 9_600);
+    assert_eq!(
+        serial_nexus_terminal::settings::load(&path)
+            .expect("settings saved after recovery")
+            .default_baud,
+        9_600
     );
 
     app.shutdown();

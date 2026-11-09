@@ -23,6 +23,9 @@ pub struct App {
     settings: TerminalSettings,
     /// Where settings are saved; `None` keeps them in memory only.
     settings_path: Option<PathBuf>,
+    /// A save failed, so the next prompt submission tries again even for the
+    /// same rate.
+    settings_dirty: bool,
 }
 
 impl App {
@@ -49,6 +52,7 @@ impl App {
             expected_closes: HashSet::new(),
             settings,
             settings_path,
+            settings_dirty: false,
         };
         app.refresh_devices();
         app
@@ -177,17 +181,27 @@ impl App {
 
     /// Keep the rate the human just chose as the next prompt's default.
     /// Returns the problem when it could not be written to disk; the terminal
-    /// still opens the device.
+    /// still opens the device, and a later submission retries the save.
     fn remember_baud(&mut self, baud: u32) -> Option<String> {
-        if baud == self.settings.default_baud {
+        if baud == self.settings.default_baud && !self.settings_dirty {
             return None;
         }
         self.settings.default_baud = baud;
         self.state.default_baud = baud;
         let path = self.settings_path.as_ref()?;
-        settings::save(path, &self.settings)
-            .err()
-            .map(|error| format!("could not save settings {}: {error}", path.display()))
+        match settings::save(path, &self.settings) {
+            Ok(()) => {
+                self.settings_dirty = false;
+                None
+            }
+            Err(error) => {
+                self.settings_dirty = true;
+                Some(format!(
+                    "could not save settings {}: {error}",
+                    path.display()
+                ))
+            }
+        }
     }
 
     fn start_baud_prompt(&mut self) {

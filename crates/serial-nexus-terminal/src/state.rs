@@ -127,7 +127,10 @@ impl BaudPrompt {
         }
         match text.parse::<u32>() {
             Ok(baud) if (1..=crate::settings::MAX_BAUD).contains(&baud) => Ok(baud),
-            Ok(_) => Err(format!("{text} is outside 1..{}", crate::settings::MAX_BAUD)),
+            Ok(_) => Err(format!(
+                "{text} is outside 1..{}",
+                crate::settings::MAX_BAUD
+            )),
             Err(_) => Err(format!("{text} is not a baud rate")),
         }
     }
