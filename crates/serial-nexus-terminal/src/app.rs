@@ -7,9 +7,12 @@ use crossbeam_channel::Receiver;
 use serial_nexus_client::{Client, ClientError};
 use serial_nexus_protocol::{DeviceSummary, Event};
 
-use crate::input::{map_key, Action, Key};
-use crate::settings::TerminalSettings;
-use crate::state::{short_holder, AppState, DeviceEntry, Focus, Notice};
+use ratatui::layout::Rect;
+
+use crate::input::{echo_key, map_key, Action, Key};
+use crate::render::{hit_test, settings_hit_test, Hit, SettingsHit};
+use crate::settings::{SettingsStore, TerminalSettings};
+use crate::state::{short_holder, AppState, DeviceEntry, Notice, View, SETTINGS_ROWS};
 
 /// Wire the app to a connected core. The core is started by
 /// [`Client::connect`] (the auto-start seam), not by the TUI.
@@ -19,7 +22,8 @@ pub struct App {
     events: Receiver<Event>,
     /// Closures this terminal asked for; their `DeviceClosed` is not an unplug.
     expected_closes: HashSet<u64>,
-    settings: TerminalSettings,
+    /// Where a changed setting is saved, when this launch has a settings file.
+    settings_store: Option<SettingsStore>,
 }
 
 impl App {
@@ -34,13 +38,28 @@ impl App {
         cols: usize,
         settings: TerminalSettings,
     ) -> Self {
+        Self::with_preferences(client, rows, cols, settings, None)
+    }
+
+    /// Like [`App::with_settings`], and a changed setting is written back
+    /// through `store`. Without a store the change still applies to this launch
+    /// and is not persisted.
+    pub fn with_preferences(
+        client: Client,
+        rows: usize,
+        cols: usize,
+        settings: TerminalSettings,
+        store: Option<SettingsStore>,
+    ) -> Self {
         let events = client.subscribe();
+        let mut state = AppState::new(rows, cols);
+        state.settings = settings;
         let mut app = Self {
-            state: AppState::new(rows, cols),
+            state,
             client,
             events,
             expected_closes: HashSet::new(),
-            settings,
+            settings_store: store,
         };
         app.refresh_devices();
         app
@@ -48,7 +67,7 @@ impl App {
 
     /// The settings this launch loaded.
     pub fn settings(&self) -> &TerminalSettings {
-        &self.settings
+        &self.state.settings
     }
 
     pub fn client(&self) -> &Client {
@@ -79,23 +98,130 @@ impl App {
         }
     }
 
-    /// Handle one key. Typing in the stream writes to the selected device and
-    /// is never echoed locally.
+    /// Handle one key. In the stream, keys go to the device and only Ctrl+]
+    /// leaves; in the sidebar, the command keys act and Ctrl+Q quits.
     pub fn handle_key(&mut self, key: Key) {
         let action = map_key(&self.state, key);
         match action {
             Action::Quit => self.state.quit = true,
-            Action::Select(delta) => self.state.select_delta(delta),
-            Action::ToggleFocus => self.state.focus = self.state.focus.toggled(),
-            Action::OpenSelected => self.open_selected(),
+            Action::Select(delta) => self.select_row(delta),
+            Action::OpenSelected => {
+                if self.state.settings_button_selected() {
+                    self.open_settings();
+                } else {
+                    self.open_selected();
+                }
+            }
             Action::DisconnectSelected => self.disconnect_selected(),
             Action::StartBaudPrompt => self.start_baud_prompt(),
+            Action::ToggleView => self.toggle_view(),
             Action::PromptChar(ch) => self.state.prompt_push(ch),
             Action::PromptBackspace => self.state.prompt_backspace(),
             Action::PromptCancel => self.state.prompt = None,
             Action::PromptSubmit => self.submit_baud_prompt(),
-            Action::Write(bytes) => self.write_selected(&bytes),
+            Action::Write(bytes) => self.write_selected(&bytes, key),
+            Action::OpenSettings => self.open_settings(),
+            Action::SettingsMove(delta) => self.state.move_settings_row(delta),
+            Action::SettingsToggle => {
+                self.state.toggle_draft();
+            }
+            Action::SettingsSave => self.save_settings(),
+            Action::SettingsCancel => self.state.cancel_settings(),
             Action::Ignore => {}
+        }
+    }
+
+    /// Move the sidebar selection over the devices and the Settings button.
+    /// A huge delta (Home/End) lands on the first or last row.
+    fn select_row(&mut self, delta: i32) {
+        if delta == i32::MIN {
+            self.state.select_index(0);
+        } else if delta == i32::MAX {
+            self.state.select_settings_button();
+        } else {
+            self.state.select_delta(delta);
+        }
+    }
+
+    /// Handle a click at one cell of the screen. The sidebar's device rows
+    /// select and its Settings button opens the settings; in the settings, a
+    /// flag row toggles and the Save and Cancel buttons do what they say. The
+    /// stream has no controls.
+    pub fn handle_click(&mut self, area: Rect, column: u16, row: u16) {
+        match self.state.view {
+            View::Devices => match hit_test(&self.state, area, column, row) {
+                Some(Hit::Device(index)) => self.select_row_index(index),
+                Some(Hit::Settings) => self.open_settings(),
+                None => {}
+            },
+            View::Settings => match settings_hit_test(&self.state, area, column, row) {
+                Some(SettingsHit::Flag(index)) => {
+                    self.state.settings_row = index.min(SETTINGS_ROWS - 1);
+                    self.state.toggle_draft();
+                }
+                Some(SettingsHit::Save) => self.save_settings(),
+                Some(SettingsHit::Cancel) => self.state.cancel_settings(),
+                None => {}
+            },
+            View::Stream => {}
+        }
+    }
+
+    /// Point the sidebar at one of its rows (a mouse click or a test).
+    pub fn select_row_index(&mut self, index: usize) {
+        self.state.select_index(index);
+    }
+
+    /// Open the settings view. The current settings are copied into a draft,
+    /// so Escape can throw every change away.
+    pub fn open_settings(&mut self) {
+        self.state.begin_settings();
+    }
+
+    /// Show the stream for the attached device, or go back to the sidebar.
+    fn toggle_view(&mut self) {
+        match self.state.view {
+            View::Devices => {
+                // With the Settings button selected, fall back to the last
+                // device row: an attached device still opens its stream.
+                if self.state.selected_session().is_none() {
+                    self.state.select_index(self.state.last_device_index());
+                }
+                if self.state.selected_session().is_none() {
+                    self.state.notice = Some(Notice::error(
+                        "open a device first: select it and press Enter",
+                    ));
+                    return;
+                }
+                self.state.view = View::Stream;
+                self.state.notice = None;
+            }
+            View::Stream => self.state.view = View::Devices,
+            // Another view owns the keys; Ctrl+] is not a shortcut out of it.
+            View::Settings => {}
+        }
+    }
+
+    /// Save the draft settings, then keep them and go back to the sidebar.
+    ///
+    /// The draft becomes the settings in effect only after the file was
+    /// written: a failed save, or no settings file to write, leaves the
+    /// options as they were and stays in the settings so the draft is not
+    /// lost. The terminal never claims a save it did not make.
+    fn save_settings(&mut self) {
+        let draft = self.state.draft.clone();
+        let Some(store) = &self.settings_store else {
+            self.state.notice = Some(Notice::error("settings not saved: no settings file"));
+            return;
+        };
+        match store.save(&draft) {
+            Ok(()) => {
+                self.state.commit_settings();
+                self.state.notice = Some(Notice::info("settings saved"));
+            }
+            Err(error) => {
+                self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
+            }
         }
     }
 
@@ -107,7 +233,7 @@ impl App {
             return;
         };
         if self.state.selected_session().is_some() {
-            self.state.focus = Focus::Stream;
+            self.state.view = View::Stream;
             self.state.notice = Some(Notice::info("already attached"));
             return;
         }
@@ -135,7 +261,7 @@ impl App {
             opened.baud,
             opened.control.holder.clone(),
         );
-        self.state.focus = Focus::Stream;
+        self.state.view = View::Stream;
         self.state.notice = Some(Notice::info(format!(
             "opened {} at {} baud",
             opened.port, opened.baud
@@ -205,9 +331,10 @@ impl App {
         self.refresh_devices();
     }
 
-    /// Write human input to the selected device without taking AI control and
-    /// without adding it to the local stream.
-    pub fn write_selected(&mut self, bytes: &[u8]) {
+    /// Write human input to the selected device without taking AI control.
+    /// With `local_echo` on, the typed text is shown locally too; it is added
+    /// only after the write was accepted, so a refused write leaves no ghost.
+    pub fn write_selected(&mut self, bytes: &[u8], key: Key) {
         let Some(session) = self.state.selected_session() else {
             self.state.notice = Some(Notice::error(
                 "no open device — press Tab and Enter to open one",
@@ -221,6 +348,14 @@ impl App {
                 self.state.remove_session(device_id);
             }
             self.state.notice = Some(Notice::error(format!("write to {path}: {error}")));
+            return;
+        }
+        if self.state.settings.local_echo {
+            if let (Some(echo), Some(session)) =
+                (echo_key(key), self.state.sessions.get_mut(&device_id))
+            {
+                session.screen.echo(&echo);
+            }
         }
     }
 

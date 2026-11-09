@@ -204,8 +204,8 @@ mod tests {
     #[test]
     fn the_defaults_are_both_on() {
         let settings = TerminalSettings::default();
-        assert!(settings.local_echo);
-        assert!(settings.scrollback);
+        assert!(settings.local_echo, "local echo is on by default");
+        assert!(settings.scrollback, "scrollback is on by default");
     }
 
     #[test]

@@ -3,12 +3,13 @@
 use std::io;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 use serial_nexus_client::{Client, ClientConfig, ClientInfo};
 use serial_nexus_terminal::app::App;
-use serial_nexus_terminal::input::Key;
+use serial_nexus_terminal::input::translate;
 use serial_nexus_terminal::render::{render, stream_body_area};
 use serial_nexus_terminal::settings::{SettingsStore, TerminalSettings};
 use serial_nexus_terminal::state::Notice;
@@ -31,17 +32,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Settings are a convenience: an unreadable or invalid file leaves the
     // defaults in effect, is reported, and is never overwritten.
-    let (settings, settings_error) = match SettingsStore::from_env() {
+    let (settings, store, settings_error) = match SettingsStore::from_env() {
         Some(store) => match store.load_or_create() {
-            Ok(settings) => (settings, None),
+            Ok(settings) => (settings, Some(store), None),
             Err(error) => (
                 TerminalSettings::default(),
+                // Changes are not saved over a file the human hand-edited into
+                // an invalid state: they apply to this launch only.
+                None,
                 Some(format!("settings {}: {error}", store.path().display())),
             ),
         },
-        None => (TerminalSettings::default(), None),
+        None => (TerminalSettings::default(), None, None),
     };
-    let mut app = App::with_settings(client, 24, 80, settings);
+    let mut app = App::with_preferences(client, 24, 80, settings, store);
     if let Some(message) = settings_error {
         app.state.notice = Some(Notice::error(message));
     }
@@ -64,14 +68,18 @@ fn event_loop(
     app: &mut App,
 ) -> io::Result<()> {
     let mut last_refresh = Instant::now();
+    let mut last_area = Rect::default();
     loop {
         app.pump();
         terminal.draw(|frame| {
             let area = frame.area();
+            last_area = area;
             if let Some(body) = stream_body_area(area) {
                 app.resize_stream(body.height as usize, body.width as usize);
             }
-            render(&app.state, frame.buffer_mut(), area);
+            if let Some((x, y)) = render(&app.state, frame.buffer_mut(), area) {
+                frame.set_cursor_position((x, y));
+            }
         })?;
         if app.state.quit {
             return Ok(());
@@ -83,6 +91,7 @@ fn event_loop(
                         app.handle_key(key);
                     }
                 }
+                event::Event::Mouse(mouse) => handle_mouse(app, last_area, mouse),
                 event::Event::Resize(_, _) => terminal.autoresize()?,
                 _ => {}
             }
@@ -94,27 +103,10 @@ fn event_loop(
     }
 }
 
-fn translate(event: KeyEvent) -> Option<Key> {
-    let control = event.modifiers.contains(KeyModifiers::CONTROL);
-    match event.code {
-        KeyCode::Char(ch) if control => Some(Key::Ctrl(ch.to_ascii_lowercase())),
-        KeyCode::Char(ch) => Some(Key::Char(ch)),
-        KeyCode::Enter => Some(Key::Enter),
-        KeyCode::Esc => Some(Key::Esc),
-        KeyCode::Tab => Some(Key::Tab),
-        KeyCode::BackTab => Some(Key::BackTab),
-        KeyCode::Backspace => Some(Key::Backspace),
-        KeyCode::Delete => Some(Key::Delete),
-        KeyCode::Insert => Some(Key::Insert),
-        KeyCode::Up => Some(Key::Up),
-        KeyCode::Down => Some(Key::Down),
-        KeyCode::Left => Some(Key::Left),
-        KeyCode::Right => Some(Key::Right),
-        KeyCode::Home => Some(Key::Home),
-        KeyCode::End => Some(Key::End),
-        KeyCode::PageUp => Some(Key::PageUp),
-        KeyCode::PageDown => Some(Key::PageDown),
-        KeyCode::F(number) => Some(Key::F(number)),
-        _ => None,
+/// A click on a device row selects it; a click on the sidebar's Settings
+/// button opens the settings, just as Enter does.
+fn handle_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
+    if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+        app.handle_click(area, mouse.column, mouse.row);
     }
 }

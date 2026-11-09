@@ -45,6 +45,16 @@ these words in their tool names and user-facing text.
 - **Settings**: the human terminal's own preferences, stored per user in
   `terminal.json` (`local_echo` and `scrollback`, both on by default). Not core
   configuration.
+- **Local echo**: showing the keys a human types in the **stream** in the
+  terminal's own view. On by default; the `local_echo` **setting** turns it off
+  for a device that echoes what it receives.
+- **Sidebar**: the terminal's list of **devices** and its Settings button,
+  shown while a device is chosen. It hides in the **stream**.
+- **Stream**: the terminal view that shows a device's output and sends the
+  keys typed in it to that device.
+- **Settings view**: the terminal view opened from the sidebar's Settings
+  button, where `local_echo` and `scrollback` are edited and saved with
+  `Ctrl+S`.
 - **Event**: an unsolicited notification from the core (device output, write
   echo, client joined/left, control granted/released/denied, device closed,
   core shutdown). Clients receive all events from their subscription onward.

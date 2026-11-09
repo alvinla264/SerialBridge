@@ -8,22 +8,22 @@ use std::collections::BTreeMap;
 use serial_nexus_protocol::{Event, Holder, Source, DEFAULT_BAUD};
 
 use crate::screen::Screen;
+use crate::settings::TerminalSettings;
 
-/// Which pane receives keys.
+/// Which view receives keys. The sidebar is shown while choosing a device and
+/// hides itself in the stream, so the device gets the whole screen. Settings is
+/// its own view in the terminal area, opened from the sidebar's button.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Focus {
+pub enum View {
     Devices,
     Stream,
+    Settings,
 }
 
-impl Focus {
-    pub fn toggled(self) -> Self {
-        match self {
-            Self::Devices => Self::Stream,
-            Self::Stream => Self::Devices,
-        }
-    }
-}
+/// The settings rows, in drawing order. Scrollback has a switch before the
+/// stream can scroll: the flag is part of the settings, and the terminal keeps
+/// it for the scrolling interface that follows.
+pub const SETTINGS_ROWS: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
@@ -129,12 +129,30 @@ impl BaudPrompt {
 /// Everything the renderer needs.
 pub struct AppState {
     pub devices: Vec<DeviceEntry>,
+    /// The selected device row. It stays on a device while the Settings button
+    /// has the focus, so discovery cannot turn the button into a device.
     pub selected: usize,
-    pub focus: Focus,
+    /// Whether the sidebar's Settings button has the focus.
+    settings_button_selected: bool,
+    pub view: View,
     pub sessions: BTreeMap<u64, Session>,
     pub notice: Option<Notice>,
     pub prompt: Option<BaudPrompt>,
     pub quit: bool,
+    /// Selected row of the settings view.
+    pub settings_row: usize,
+    /// The human's preferences in effect for this launch.
+    pub settings: TerminalSettings,
+    /// The settings being edited; only Ctrl+S copies them into `settings` and
+    /// saves them. Escape throws them away.
+    pub draft: TerminalSettings,
+    /// The device path the settings were opened from, put back on the way out.
+    /// A path survives the device list being re-sorted or changing while the
+    /// settings are open; a row number would not.
+    selection_before_settings: Option<String>,
+    /// The last device that was selected, so leaving the Settings button lands
+    /// on a device even after discovery changed the list.
+    last_device_path: Option<String>,
     rows: usize,
     cols: usize,
 }
@@ -150,13 +168,115 @@ impl AppState {
         Self {
             devices: Vec::new(),
             selected: 0,
-            focus: Focus::Devices,
+            settings_button_selected: false,
+            view: View::Devices,
             sessions: BTreeMap::new(),
             notice: None,
             prompt: None,
             quit: false,
+            settings_row: 0,
+            settings: TerminalSettings::default(),
+            draft: TerminalSettings::default(),
+            selection_before_settings: None,
+            last_device_path: None,
             rows: rows.max(1),
             cols: cols.max(1),
+        }
+    }
+
+    /// The value of one settings row: local echo first, then scrollback.
+    pub fn settings_value(&self, row: usize) -> Option<bool> {
+        match row {
+            0 => Some(self.settings.local_echo),
+            1 => Some(self.settings.scrollback),
+            _ => None,
+        }
+    }
+
+    /// The value of one settings row as the settings view shows it.
+    pub fn draft_value(&self, row: usize) -> Option<bool> {
+        match row {
+            0 => Some(self.draft.local_echo),
+            1 => Some(self.draft.scrollback),
+            _ => None,
+        }
+    }
+
+    /// Move the settings selection, staying on a real row.
+    pub fn move_settings_row(&mut self, delta: i32) {
+        let last = SETTINGS_ROWS - 1;
+        self.settings_row = (self.settings_row as i32 + delta).clamp(0, last as i32) as usize;
+    }
+
+    /// Flip the selected setting in the draft, returning its new value.
+    pub fn toggle_draft(&mut self) -> Option<bool> {
+        match self.settings_row {
+            0 => {
+                self.draft.local_echo = !self.draft.local_echo;
+                Some(self.draft.local_echo)
+            }
+            1 => {
+                self.draft.scrollback = !self.draft.scrollback;
+                Some(self.draft.scrollback)
+            }
+            _ => None,
+        }
+    }
+
+    /// Start editing the settings: the draft begins as a copy of what is in
+    /// effect, so Escape can throw every change away.
+    pub fn begin_settings(&mut self) {
+        self.draft = self.settings.clone();
+        self.settings_row = 0;
+        // Coming from the Settings button itself, fall back to the last device
+        // row, so leaving the settings lands on a device.
+        // Opening the settings abandons a baud prompt: the settings keys would
+        // otherwise reach the hidden prompt.
+        self.prompt = None;
+        self.selection_before_settings = self
+            .devices
+            .get(self.selected)
+            .map(|device| device.path.clone())
+            .or_else(|| self.last_device_path.clone());
+        self.view = View::Settings;
+        self.notice = None;
+    }
+
+    /// Leave the settings without keeping the draft.
+    pub fn cancel_settings(&mut self) {
+        self.draft = self.settings.clone();
+        self.leave_settings();
+    }
+
+    /// Keep the draft as the settings in effect and leave the view.
+    pub fn commit_settings(&mut self) {
+        self.settings = self.draft.clone();
+        self.leave_settings();
+    }
+
+    fn leave_settings(&mut self) {
+        // The Settings button is not a device: go back to the device the
+        // settings were opened from, found by path in the list as it is now.
+        let row = self
+            .selection_before_settings
+            .as_deref()
+            .and_then(|path| self.devices.iter().position(|device| device.path == path))
+            .unwrap_or_else(|| self.last_device_index());
+        self.select_index(row);
+        self.view = View::Devices;
+    }
+
+    /// Whether the sidebar's Settings button has the focus.
+    pub fn settings_button_selected(&self) -> bool {
+        self.settings_button_selected
+    }
+
+    /// The name of one settings panel row.
+    pub fn settings_row_name(row: usize) -> Option<&'static str> {
+        match row {
+            0 => Some("Local echo"),
+            1 => Some("Scrollback"),
+            _ => None,
         }
     }
 
@@ -180,6 +300,9 @@ impl AppState {
     }
 
     pub fn selected_device(&self) -> Option<&DeviceEntry> {
+        if self.settings_button_selected {
+            return None;
+        }
         self.devices.get(self.selected)
     }
 
@@ -192,28 +315,61 @@ impl AppState {
             .and_then(|id| self.sessions.get(&id))
     }
 
+    /// The device the header names: the selected one, or the last device row
+    /// when the Settings button is selected.
+    pub fn shown_device(&self) -> Option<&DeviceEntry> {
+        self.devices
+            .get(self.selected)
+            .or_else(|| self.devices.get(self.last_device_index()))
+    }
+
     pub fn selected_session_mut(&mut self) -> Option<&mut Session> {
         let id = self.selected_device_id()?;
         self.sessions.get_mut(&id)
     }
 
-    pub fn select_delta(&mut self, delta: i32) {
-        if self.devices.is_empty() {
-            self.selected = 0;
+    /// Select one sidebar row, keeping the last device row for when the
+    /// Settings button is left. Every selection change goes through here.
+    pub fn select_index(&mut self, index: usize) {
+        if index >= self.devices.len() {
+            self.settings_button_selected = true;
             return;
         }
-        let last = self.devices.len() - 1;
+        self.settings_button_selected = false;
+        self.selected = index;
+        if let Some(device) = self.devices.get(self.selected) {
+            self.last_device_path = Some(device.path.clone());
+        }
+    }
+
+    /// Move the sidebar selection over the devices and the Settings button,
+    /// which is the row just past the last device.
+    pub fn select_delta(&mut self, delta: i32) {
+        let last = self.devices.len();
         let next = self.selected as i32 + delta;
-        self.selected = next.clamp(0, last as i32) as usize;
+        self.select_index(next.clamp(0, last as i32) as usize);
+    }
+
+    /// The row of the last device that was selected, in the list as it is now.
+    pub fn last_device_index(&self) -> usize {
+        self.last_device_path
+            .as_deref()
+            .and_then(|path| self.devices.iter().position(|device| device.path == path))
+            .unwrap_or_else(|| self.selected.min(self.devices.len().saturating_sub(1)))
+    }
+
+    /// Point the sidebar selection at the Settings button. The device row
+    /// stays where it was, so the button is not a row that discovery can
+    /// renumber into a device.
+    pub fn select_settings_button(&mut self) {
+        self.settings_button_selected = true;
     }
 
     pub fn select_path(&mut self, path: &str) -> bool {
         self.devices
             .iter()
             .position(|device| device.path == path)
-            .map(|index| {
-                self.selected = index;
-            })
+            .map(|index| self.select_index(index))
             .is_some()
     }
 
@@ -250,13 +406,16 @@ impl AppState {
         }
         devices.sort_by(|left, right| left.path.cmp(&right.path));
         self.devices = devices;
-        if let Some(path) = selected_path {
-            if let Some(index) = self.devices.iter().position(|device| device.path == path) {
-                self.selected = index;
-                return;
-            }
+        // The Settings button keeps the focus; a device row keeps its device by
+        // path when the list was re-sorted or grew.
+        if self.settings_button_selected {
+            return;
         }
-        self.selected = self.selected.min(self.devices.len().saturating_sub(1));
+        let row = selected_path
+            .as_deref()
+            .and_then(|path| self.devices.iter().position(|device| device.path == path))
+            .unwrap_or(0);
+        self.select_index(row);
     }
 
     /// Add a freshly opened session and point the sidebar at it. The screen
@@ -301,7 +460,7 @@ impl AppState {
                 .sort_by(|left, right| left.path.cmp(&right.path));
         }
         if let Some(index) = self.devices.iter().position(|device| device.path == path) {
-            self.selected = index;
+            self.select_index(index);
         }
     }
 
@@ -441,5 +600,83 @@ pub fn short_holder(holder: &Holder) -> String {
     match &holder.name {
         Some(name) => name.clone(),
         None => format!("client {}", holder.client_id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn devices(paths: &[&str]) -> Vec<DeviceEntry> {
+        paths.iter().map(|path| DeviceEntry::new(*path)).collect()
+    }
+
+    #[test]
+    fn settings_restore_the_device_by_path_when_discovery_changes() {
+        let mut state = AppState::new(10, 80);
+        state.set_devices(devices(&["/dev/a", "/dev/b"]));
+        state.select_index(1);
+        state.begin_settings();
+
+        // A device that sorts first appears while the settings are open, as an
+        // AI opening it would make it do.
+        state.set_devices(devices(&["/dev/0", "/dev/a", "/dev/b"]));
+        state.cancel_settings();
+
+        assert_eq!(
+            state.selected_device().map(|device| device.path.as_str()),
+            Some("/dev/b"),
+            "the selected device is restored by path, not by row"
+        );
+    }
+
+    #[test]
+    fn settings_opened_from_the_button_return_to_the_last_device_by_path() {
+        let mut state = AppState::new(10, 80);
+        state.set_devices(devices(&["/dev/a", "/dev/b"]));
+        state.select_index(0);
+        state.select_settings_button();
+        state.begin_settings();
+        state.set_devices(devices(&["/dev/0", "/dev/a", "/dev/b"]));
+        state.commit_settings();
+
+        assert_eq!(
+            state.selected_device().map(|device| device.path.as_str()),
+            Some("/dev/a")
+        );
+    }
+
+    #[test]
+    fn button_focus_survives_the_device_list_growing() {
+        let mut state = AppState::new(10, 80);
+        state.set_devices(devices(&["/dev/a", "/dev/b"]));
+        state.select_index(0);
+        state.select_settings_button();
+        assert!(state.settings_button_selected());
+
+        // A device that sorts first arrives while the button has the focus.
+        state.set_devices(devices(&["/dev/0", "/dev/a", "/dev/b"]));
+        assert!(
+            state.settings_button_selected(),
+            "the button keeps the focus"
+        );
+        assert_eq!(state.selected_device(), None);
+        assert_eq!(
+            state
+                .devices
+                .get(state.last_device_index())
+                .map(|d| d.path.as_str()),
+            Some("/dev/a"),
+            "the remembered device is still A"
+        );
+    }
+
+    #[test]
+    fn the_last_device_index_follows_the_path_after_the_list_changes() {
+        let mut state = AppState::new(10, 80);
+        state.set_devices(devices(&["/dev/a", "/dev/b"]));
+        state.select_index(1);
+        state.set_devices(devices(&["/dev/0", "/dev/a", "/dev/b"]));
+        assert_eq!(state.last_device_index(), 2);
     }
 }
