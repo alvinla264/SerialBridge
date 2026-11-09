@@ -379,9 +379,10 @@ fn draw_settings(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u
         Some(true) => "on",
         _ => "off",
     };
-    // The cursor sits where the value is drawn, right-aligned at the edge.
+    // The cursor sits where the value is drawn, right-aligned at the edge, on
+    // the row the list actually scrolled to.
     let value_column = rows.width.saturating_sub(display_width(value));
-    Some((rows.x + value_column, rows.y + row as u16))
+    Some((rows.x + value_column, rows.y + (row - first) as u16))
 }
 
 fn draw_stream(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16, u16)> {
@@ -804,6 +805,25 @@ mod tests {
             "the cursor row is the selected flag: {:?}",
             lines[cursor.1 as usize]
         );
+    }
+
+    #[test]
+    fn a_four_row_settings_view_keeps_the_cursor_on_the_selected_flag() {
+        let mut state = demo();
+        state.begin_settings();
+        state.settings_row = 1;
+        let area = Rect::new(0, 0, 80, 4);
+        let mut buffer = Buffer::empty(area);
+        let cursor = render(&state, &mut buffer, area).expect("cursor");
+        let (_, rows, _) = settings_rows(area).unwrap();
+        assert!(
+            cursor.1 >= rows.y && cursor.1 < rows.y + rows.height,
+            "the cursor is on a flag row, not the footer: {cursor:?}"
+        );
+        let row_text: String = (0..area.width)
+            .map(|x| buffer[(x, cursor.1)].symbol())
+            .collect();
+        assert!(row_text.contains("Scrollback"), "{row_text:?}");
     }
 
     #[test]

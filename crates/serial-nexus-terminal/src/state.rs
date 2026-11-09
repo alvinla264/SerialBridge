@@ -144,11 +144,13 @@ pub struct AppState {
     /// The settings being edited; only Ctrl+S copies them into `settings` and
     /// saves them. Escape throws them away.
     pub draft: TerminalSettings,
-    /// The sidebar row the settings were opened from, put back on the way out.
-    selection_before_settings: usize,
-    /// The last device row that was selected, so leaving the Settings button
-    /// lands on a device.
-    last_device_selection: usize,
+    /// The device path the settings were opened from, put back on the way out.
+    /// A path survives the device list being re-sorted or changing while the
+    /// settings are open; a row number would not.
+    selection_before_settings: Option<String>,
+    /// The last device that was selected, so leaving the Settings button lands
+    /// on a device even after discovery changed the list.
+    last_device_path: Option<String>,
     rows: usize,
     cols: usize,
 }
@@ -172,8 +174,8 @@ impl AppState {
             settings_row: 0,
             settings: TerminalSettings::default(),
             draft: TerminalSettings::default(),
-            selection_before_settings: 0,
-            last_device_selection: 0,
+            selection_before_settings: None,
+            last_device_path: None,
             rows: rows.max(1),
             cols: cols.max(1),
         }
@@ -228,7 +230,11 @@ impl AppState {
         // Opening the settings abandons a baud prompt: the settings keys would
         // otherwise reach the hidden prompt.
         self.prompt = None;
-        self.selection_before_settings = self.last_device_index();
+        self.selection_before_settings = self
+            .devices
+            .get(self.selected)
+            .map(|device| device.path.clone())
+            .or_else(|| self.last_device_path.clone());
         self.view = View::Settings;
         self.notice = None;
     }
@@ -246,9 +252,14 @@ impl AppState {
     }
 
     fn leave_settings(&mut self) {
-        // The Settings button is not a device: go back to the row the settings
-        // were opened from, so Ctrl+] still has a device to show.
-        self.select_index(self.selection_before_settings);
+        // The Settings button is not a device: go back to the device the
+        // settings were opened from, found by path in the list as it is now.
+        let row = self
+            .selection_before_settings
+            .as_deref()
+            .and_then(|path| self.devices.iter().position(|device| device.path == path))
+            .unwrap_or_else(|| self.last_device_index());
+        self.select_index(row);
         self.view = View::Devices;
     }
 
@@ -303,7 +314,7 @@ impl AppState {
     pub fn shown_device(&self) -> Option<&DeviceEntry> {
         self.devices
             .get(self.selected)
-            .or_else(|| self.devices.get(self.last_device_selection))
+            .or_else(|| self.devices.get(self.last_device_index()))
     }
 
     pub fn selected_session_mut(&mut self) -> Option<&mut Session> {
@@ -315,8 +326,8 @@ impl AppState {
     /// Settings button is left. Every selection change goes through here.
     pub fn select_index(&mut self, index: usize) {
         self.selected = index.min(self.devices.len());
-        if self.selected < self.devices.len() {
-            self.last_device_selection = self.selected;
+        if let Some(device) = self.devices.get(self.selected) {
+            self.last_device_path = Some(device.path.clone());
         }
     }
 
@@ -328,10 +339,12 @@ impl AppState {
         self.select_index(next.clamp(0, last as i32) as usize);
     }
 
-    /// The last device row that was selected.
+    /// The row of the last device that was selected, in the list as it is now.
     pub fn last_device_index(&self) -> usize {
-        self.last_device_selection
-            .min(self.devices.len().saturating_sub(1))
+        self.last_device_path
+            .as_deref()
+            .and_then(|path| self.devices.iter().position(|device| device.path == path))
+            .unwrap_or_else(|| self.selected.min(self.devices.len().saturating_sub(1)))
     }
 
     /// Point the sidebar selection at the Settings button.
@@ -388,9 +401,6 @@ impl AppState {
         }
         // The Settings button stays selected when it was; otherwise a row that
         // disappeared falls back to the last device.
-        self.last_device_selection = self
-            .last_device_selection
-            .min(self.devices.len().saturating_sub(1));
         self.select_index(self.selected);
     }
 
@@ -576,5 +586,58 @@ pub fn short_holder(holder: &Holder) -> String {
     match &holder.name {
         Some(name) => name.clone(),
         None => format!("client {}", holder.client_id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn devices(paths: &[&str]) -> Vec<DeviceEntry> {
+        paths.iter().map(|path| DeviceEntry::new(*path)).collect()
+    }
+
+    #[test]
+    fn settings_restore_the_device_by_path_when_discovery_changes() {
+        let mut state = AppState::new(10, 80);
+        state.set_devices(devices(&["/dev/a", "/dev/b"]));
+        state.select_index(1);
+        state.begin_settings();
+
+        // A device that sorts first appears while the settings are open, as an
+        // AI opening it would make it do.
+        state.set_devices(devices(&["/dev/0", "/dev/a", "/dev/b"]));
+        state.cancel_settings();
+
+        assert_eq!(
+            state.selected_device().map(|device| device.path.as_str()),
+            Some("/dev/b"),
+            "the selected device is restored by path, not by row"
+        );
+    }
+
+    #[test]
+    fn settings_opened_from_the_button_return_to_the_last_device_by_path() {
+        let mut state = AppState::new(10, 80);
+        state.set_devices(devices(&["/dev/a", "/dev/b"]));
+        state.select_index(0);
+        state.select_settings_button();
+        state.begin_settings();
+        state.set_devices(devices(&["/dev/0", "/dev/a", "/dev/b"]));
+        state.commit_settings();
+
+        assert_eq!(
+            state.selected_device().map(|device| device.path.as_str()),
+            Some("/dev/a")
+        );
+    }
+
+    #[test]
+    fn the_last_device_index_follows_the_path_after_the_list_changes() {
+        let mut state = AppState::new(10, 80);
+        state.set_devices(devices(&["/dev/a", "/dev/b"]));
+        state.select_index(1);
+        state.set_devices(devices(&["/dev/0", "/dev/a", "/dev/b"]));
+        assert_eq!(state.last_device_index(), 2);
     }
 }
