@@ -12,6 +12,9 @@ crossterm = "0.28"
 ratatui = "0.29"
 serial-nexus-client = { path = "../serial-nexus-client" }
 serial-nexus-protocol = { path = "../serial-nexus-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 nix.workspace = true

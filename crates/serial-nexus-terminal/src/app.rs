@@ -8,6 +8,7 @@ use serial_nexus_client::{Client, ClientError};
 use serial_nexus_protocol::{DeviceSummary, Event};
 
 use crate::input::{map_key, Action, Key};
+use crate::settings::TerminalSettings;
 use crate::state::{short_holder, AppState, DeviceEntry, Focus, Notice};
 
 /// Wire the app to a connected core. The core is started by
@@ -18,19 +19,36 @@ pub struct App {
     events: Receiver<Event>,
     /// Closures this terminal asked for; their `DeviceClosed` is not an unplug.
     expected_closes: HashSet<u64>,
+    settings: TerminalSettings,
 }
 
 impl App {
     pub fn new(client: Client, rows: usize, cols: usize) -> Self {
+        Self::with_settings(client, rows, cols, TerminalSettings::default())
+    }
+
+    /// Like [`App::new`], with settings loaded for this launch.
+    pub fn with_settings(
+        client: Client,
+        rows: usize,
+        cols: usize,
+        settings: TerminalSettings,
+    ) -> Self {
         let events = client.subscribe();
         let mut app = Self {
             state: AppState::new(rows, cols),
             client,
             events,
             expected_closes: HashSet::new(),
+            settings,
         };
         app.refresh_devices();
         app
+    }
+
+    /// The settings this launch loaded.
+    pub fn settings(&self) -> &TerminalSettings {
+        &self.settings
     }
 
     pub fn client(&self) -> &Client {

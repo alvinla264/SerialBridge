@@ -108,6 +108,13 @@ AI write control.
   a distinct colour, without labels; human writes are never added to the stream.
 - The header shows the selected path, active baud, AI control holder and
   attachment; the footer shows errors, unplug notices and the baud prompt.
+- Settings are stored per user in `$XDG_CONFIG_HOME/serial-nexus/terminal.json`
+  (`~/.config/serial-nexus/terminal.json` when `XDG_CONFIG_HOME` is unset and
+  `HOME` is set). The file holds `local_echo` and `scrollback`, both on by
+  default; the terminal loads them at launch and writes the defaults on the
+  first launch. An invalid or unreadable file is reported in the footer and
+  left untouched, never silently replaced; saves go to a temporary file and
+  are renamed into place, and a failed save is reported.
 - `Ctrl+Q` (or `F10`) quits. Normal exit, I/O errors and panics restore raw
   mode and the alternate screen, and explicitly disconnect every device.
   Catchable termination signals (SIGTERM, SIGHUP) are not handled and may

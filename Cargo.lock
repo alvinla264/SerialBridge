@@ -576,10 +576,13 @@ dependencies = [
  "crossterm",
  "nix 0.29.0",
  "ratatui",
+ "serde",
+ "serde_json",
  "serial-nexus-client",
  "serial-nexus-core",
  "serial-nexus-protocol",
  "tempfile",
+ "thiserror",
 ]
 
 [[package]]

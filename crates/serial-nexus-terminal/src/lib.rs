@@ -9,5 +9,6 @@ pub mod app;
 pub mod input;
 pub mod render;
 pub mod screen;
+pub mod settings;
 pub mod state;
 pub mod terminal;

@@ -395,3 +395,29 @@ fn explicit_disconnect_leaves_the_other_device_connected() {
 
     app.shutdown();
 }
+
+#[test]
+fn launch_settings_are_loaded_into_the_app_and_do_not_change_baud_behavior() {
+    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let device = SimulatedDevice::new();
+    let settings = serial_nexus_terminal::settings::TerminalSettings {
+        local_echo: false,
+        scrollback: false,
+    };
+    let client = Client::connect_to_socket(&socket, ClientInfo::human("terminal-settings"))
+        .expect("terminal connects");
+    let mut app = App::with_settings(client, 40, 120, settings.clone());
+    assert_eq!(app.settings(), &settings);
+
+    // Settings do not touch device opening: an empty baud prompt still asks
+    // the core for the documented default rate.
+    app.state
+        .set_devices(vec![serial_nexus_terminal::state::DeviceEntry::new(
+            &device.path,
+        )]);
+    app.handle_key(Key::Char('b'));
+    app.handle_key(Key::Enter);
+    assert_eq!(app.state.selected_session().expect("opened").baud, 115_200);
+
+    app.shutdown();
+}
