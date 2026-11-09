@@ -469,6 +469,29 @@ fn local_echo_shows_typed_keys_only_while_it_is_on() {
 }
 
 #[test]
+fn the_help_list_stops_scrolling_at_its_last_row() {
+    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let mut app = app(&socket);
+    app.handle_key(Key::F(1));
+    assert_eq!(app.state.overlay, Some(Overlay::Help));
+    for _ in 0..20 {
+        app.handle_key(Key::Down);
+    }
+    assert_eq!(
+        app.state.help_offset,
+        serial_nexus_terminal::render::help_rows() - 1,
+        "scrolling stops at the last row"
+    );
+    // One press back moves at once: there is no invisible overscroll.
+    app.handle_key(Key::Up);
+    assert_eq!(
+        app.state.help_offset,
+        serial_nexus_terminal::render::help_rows() - 2
+    );
+    app.shutdown();
+}
+
+#[test]
 fn a_setting_changed_in_the_panel_is_written_back_and_kept_for_the_next_launch() {
     let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
     let dir = tempfile::tempdir().unwrap();

@@ -8,6 +8,7 @@ use serial_nexus_client::{Client, ClientError};
 use serial_nexus_protocol::{DeviceSummary, Event};
 
 use crate::input::{echo_key, map_key, Action, Key};
+use crate::render::help_rows;
 use crate::settings::{SettingsStore, TerminalSettings};
 use crate::state::{short_holder, AppState, DeviceEntry, Focus, Notice, Overlay};
 
@@ -117,7 +118,11 @@ impl App {
             Action::SettingsMove(delta) => self.state.move_settings_row(delta),
             Action::SettingsToggle => self.toggle_setting(),
             Action::HelpScroll(delta) => {
-                self.state.help_offset = (self.state.help_offset as i32 + delta).max(0) as usize;
+                // Clamp to the rows that exist: scrolling past the end would
+                // make scrolling back look broken.
+                let last = help_rows().saturating_sub(1);
+                self.state.help_offset =
+                    (self.state.help_offset as i32 + delta).clamp(0, last as i32) as usize;
             }
             Action::Ignore => {}
         }

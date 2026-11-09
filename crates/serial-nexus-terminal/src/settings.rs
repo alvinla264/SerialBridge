@@ -111,8 +111,8 @@ impl SettingsStore {
     }
 
     /// Bring a file from an older version up to date, saving the result. A
-    /// save failure is not fatal: the upgraded settings still apply to this
-    /// launch, and the next launch upgrades again.
+    /// save failure is an error, so the terminal says so instead of silently
+    /// upgrading again on every launch.
     fn upgrade(&self, mut settings: TerminalSettings) -> Result<TerminalSettings, SettingsError> {
         if settings.version >= SETTINGS_VERSION {
             return Ok(settings);
@@ -123,7 +123,7 @@ impl SettingsStore {
         // gets every keystroke doubled on a device that echoes.
         settings.local_echo = false;
         settings.version = SETTINGS_VERSION;
-        let _ = self.save(&settings);
+        self.save(&settings)?;
         Ok(settings)
     }
 
@@ -435,6 +435,25 @@ mod tests {
             "unexpected error: {error}"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), concurrent);
+    }
+
+    #[test]
+    fn a_migration_that_cannot_be_saved_is_an_error_not_a_silent_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal.json");
+        std::fs::write(&path, "{\"local_echo\":true,\"scrollback\":true}").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = SettingsStore::at(&path).load_or_create();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(result.is_err(), "a failed upgrade save is reported");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"local_echo\":true,\"scrollback\":true}",
+            "the file is left as it was"
+        );
     }
 
     #[test]

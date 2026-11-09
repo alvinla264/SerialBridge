@@ -425,48 +425,92 @@ fn draw_hints(state: &AppState, buffer: &mut Buffer, area: Rect) {
     put(buffer, area, 0, hints, dim());
 }
 
+/// One line of a panel: a label on the left, an optional value kept at the
+/// right edge, and whether it is the selected row.
+struct PanelRow {
+    label: String,
+    value: String,
+    style: RStyle,
+    selected: bool,
+}
+
+/// How the visible rows are chosen when the list is taller than the box.
+enum PanelScroll {
+    /// Show the list from this row (the help list).
+    First(usize),
+    /// Scroll so this row stays visible (the selected setting).
+    KeepInView(usize),
+}
+
 /// One centred panel over everything else.
 fn draw_overlay(state: &AppState, buffer: &mut Buffer, area: Rect) {
     match state.overlay {
         Some(Overlay::Help) => {
-            let lines: Vec<(String, RStyle, bool)> = HELP
+            let mut rows: Vec<PanelRow> = HELP
                 .iter()
-                .map(|(key, what)| (format!("{key:<12} {what}"), RStyle::default(), false))
-                .collect();
-            draw_panel(buffer, area, "Keys", &lines, state.help_offset);
-        }
-        Some(Overlay::Settings) => {
-            let mut rows: Vec<(String, RStyle, bool)> = (0..SETTINGS_ROWS)
-                .map(|row| {
-                    let name = AppState::settings_row_name(row).unwrap_or_default();
-                    let value = match state.settings_value(row) {
-                        Some(true) => "on",
-                        _ => "off",
-                    };
-                    let marker = if row == state.settings_row {
-                        "▸"
-                    } else {
-                        " "
-                    };
-                    let text = format!("{marker} {name:<12} {value}");
-                    let selected = row == state.settings_row;
-                    let style = if selected {
-                        RStyle::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
-                    } else {
-                        RStyle::default()
-                    };
-                    (text, style, selected)
+                .map(|(key, what)| PanelRow {
+                    label: format!("{key:<12} {what}"),
+                    value: String::new(),
+                    style: RStyle::default(),
+                    selected: false,
                 })
                 .collect();
-            rows.push(("Esc closes · Space toggles".to_string(), dim(), false));
-            let selected = rows
-                .iter()
-                .position(|(_, _, selected)| *selected)
-                .unwrap_or(0);
-            draw_panel(buffer, area, "Settings", &rows, selected);
+            rows.push(PanelRow {
+                label: "↑/↓ scrolls this list".to_string(),
+                value: String::new(),
+                style: dim(),
+                selected: false,
+            });
+            draw_panel(
+                buffer,
+                area,
+                "Keys",
+                &rows,
+                PanelScroll::First(state.help_offset),
+            );
+        }
+        Some(Overlay::Settings) => {
+            let mut rows: Vec<PanelRow> = (0..SETTINGS_ROWS)
+                .map(|row| {
+                    let name = AppState::settings_row_name(row).unwrap_or_default();
+                    let selected = row == state.settings_row;
+                    PanelRow {
+                        label: format!("{} {name}", if selected { "▸" } else { " " }),
+                        value: match state.settings_value(row) {
+                            Some(true) => "on".to_string(),
+                            _ => "off".to_string(),
+                        },
+                        style: if selected {
+                            RStyle::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                        } else {
+                            RStyle::default()
+                        },
+                        selected,
+                    }
+                })
+                .collect();
+            rows.push(PanelRow {
+                label: "Esc closes · Space toggles".to_string(),
+                value: String::new(),
+                style: dim(),
+                selected: false,
+            });
+            let selected = rows.iter().position(|row| row.selected).unwrap_or(0);
+            draw_panel(
+                buffer,
+                area,
+                "Settings",
+                &rows,
+                PanelScroll::KeepInView(selected),
+            );
         }
         None => {}
     }
+}
+
+/// How many key rows the help panel has, for bounding its scroll position.
+pub fn help_rows() -> usize {
+    HELP.len()
 }
 
 /// The keys the help panel lists: what each one does.
@@ -487,8 +531,8 @@ fn draw_panel(
     buffer: &mut Buffer,
     area: Rect,
     title: &str,
-    lines: &[(String, RStyle, bool)],
-    keep_in_view: usize,
+    rows: &[PanelRow],
+    scroll: PanelScroll,
 ) {
     // Too small for a box: one line still says the panel is open, so its keys
     // are never swallowed silently.
@@ -507,16 +551,20 @@ fn draw_panel(
         );
         return;
     }
-    let content_width = lines
+    let content_width = rows
         .iter()
-        .map(|(line, _, _)| display_width(line) as usize)
+        .map(|row| {
+            let mut width = display_width(&row.label) as usize;
+            if !row.value.is_empty() {
+                width += 1 + display_width(&row.value) as usize;
+            }
+            width
+        })
         .max()
         .unwrap_or(0)
         .max(display_width(title) as usize);
     let width = ((content_width + 4) as u16).min(area.width);
-    // Room for both borders and at least two content rows, or the one-line
-    // fallback above says the panel is open.
-    let height = ((lines.len() + 2) as u16).max(4).min(area.height);
+    let height = ((rows.len() + 2) as u16).min(area.height);
     if width < 8 || height < 4 {
         return;
     }
@@ -547,26 +595,26 @@ fn draw_panel(
     );
     put(buffer, Rect::new(x, y, width, 1), 0, &top, border);
 
-    // When the box is shorter than the list, scroll it: the selected row (or
-    // the help list's own scroll position) stays in view.
+    // When the box is shorter than the list it scrolls, and the stored
+    // position is clamped to the rows that exist.
     let visible = (height - 2) as usize;
-    let last_first = lines.len().saturating_sub(visible);
-    let first = keep_in_view
-        .saturating_sub(visible.saturating_sub(1))
-        .min(last_first);
-    for (offset, (line, style, _)) in lines.iter().skip(first).enumerate() {
-        if offset >= visible {
-            break;
-        }
-        let mut row = String::from("│");
-        row.push_str(&fit(&format!(" {line}"), inner));
-        row.push('│');
+    let last_first = rows.len().saturating_sub(visible);
+    let first = match scroll {
+        PanelScroll::First(first) => first.min(last_first),
+        PanelScroll::KeepInView(row) => row
+            .saturating_sub(visible.saturating_sub(1))
+            .min(last_first),
+    };
+    for (offset, row) in rows.iter().skip(first).take(visible).enumerate() {
+        let mut line = String::from("│");
+        line.push_str(&fit_row(row, inner));
+        line.push('│');
         put(
             buffer,
             Rect::new(x, y + 1 + offset as u16, width, 1),
             0,
-            &row,
-            *style,
+            &line,
+            row.style,
         );
     }
     let bottom = format!("└{}┘", "─".repeat(inner));
@@ -577,6 +625,29 @@ fn draw_panel(
         &bottom,
         border,
     );
+}
+
+/// A row as exactly `inner` columns. The label gives way before the value, so
+/// the state being changed is not the part that gets clipped.
+fn fit_row(row: &PanelRow, inner: usize) -> String {
+    let label = format!(" {}", row.label);
+    if row.value.is_empty() {
+        return fit(&label, inner);
+    }
+    let value_width = display_width(&row.value) as usize;
+    let label_width = display_width(&label) as usize;
+    if label_width + value_width < inner {
+        let mut line = label;
+        line.push_str(&" ".repeat(inner - label_width - value_width));
+        line.push_str(&row.value);
+        return fit(&line, inner);
+    }
+    // Too narrow for both: keep the value, clip the label.
+    let keep = inner.saturating_sub(value_width + 1);
+    let mut line = fit(&clip(&label, keep), keep);
+    line.push(' ');
+    line.push_str(&row.value);
+    fit(&line, inner)
 }
 
 /// One line as exactly `width` display columns: clipped if longer, padded if
@@ -932,6 +1003,24 @@ mod tests {
             render(&state, &mut buffer, area);
             let screen = lines(&state, width, height).join("\n");
             assert!(screen.contains("Esc"), "{width}x{height}: {screen}");
+        }
+    }
+
+    #[test]
+    fn a_narrow_settings_panel_still_shows_the_value() {
+        let mut state = demo_state();
+        state.overlay = Some(Overlay::Settings);
+        for width in [18, 20, 24] {
+            for echo in [false, true] {
+                state.settings.local_echo = echo;
+                let screen = lines(&state, width, 6).join("\n");
+                let row = screen
+                    .lines()
+                    .find(|line| line.contains("▸"))
+                    .unwrap_or_else(|| panic!("{width}: {screen}"));
+                let value = if echo { "on" } else { "off" };
+                assert!(row.contains(value), "{width}: {row:?}");
+            }
         }
     }
 
