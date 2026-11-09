@@ -96,16 +96,45 @@ pub fn settings_button(area: Rect) -> Option<Rect> {
     sidebar(area).map(|sidebar| sidebar.button)
 }
 
-/// The settings rows: a title, the rows, and (when there is room) the key
-/// hints. A short terminal drops the hints rather than a flag: both flags stay
-/// visible down to a three-row area.
-pub fn settings_rows(area: Rect) -> Option<(Rect, Rect, Rect)> {
+/// The settings view's parts: a title, the flag rows, a bar with the Save and
+/// Cancel buttons, and (when there is room) the key hints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SettingsLayout {
+    pub title: Rect,
+    pub rows: Rect,
+    pub bar: Rect,
+    pub save: Rect,
+    pub cancel: Rect,
+    pub hints: Rect,
+}
+
+/// What a click in the settings view landed on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsHit {
+    Flag(usize),
+    Save,
+    Cancel,
+}
+
+/// Where the settings view puts its parts, or `None` when there is no room.
+/// The Save and Cancel buttons get their own row: the settings are only kept
+/// by an explicit action, so it is always visible when the view is drawn.
+pub fn settings_layout(area: Rect) -> Option<SettingsLayout> {
     let main = chrome(area).main;
-    if main.height < 2 || main.width < 8 {
+    if main.height < 2 || main.width < 12 {
         return None;
     }
-    let hint_height = if main.height >= 4 { 1 } else { 0 };
-    let title = Rect::new(main.x, main.y, main.width, 1);
+    let hint_height = if main.height >= 5 { 1 } else { 0 };
+    // A title and a bar of buttons do not both fit in a very short area: the
+    // flags and the Save button win, the title gives way first.
+    let title_height = if main.height >= 4 { 1 } else { 0 };
+    let title = Rect::new(main.x, main.y, main.width, title_height);
+    let bar = Rect::new(
+        main.x,
+        main.y + main.height - 1 - hint_height,
+        main.width,
+        1,
+    );
     let hints = Rect::new(
         main.x,
         main.y + main.height - hint_height,
@@ -114,11 +143,61 @@ pub fn settings_rows(area: Rect) -> Option<(Rect, Rect, Rect)> {
     );
     let rows = Rect::new(
         main.x,
-        main.y + 1,
+        main.y + title_height,
         main.width,
-        main.height - 1 - hint_height,
+        main.height - title_height - 1 - hint_height,
     );
-    Some((title, rows, hints))
+    // `[ Save ]` first, then `[ Cancel ]`, both wide enough to read.
+    let save_width = 8;
+    let cancel_width = 10;
+    let save = Rect::new(bar.x + 1, bar.y, save_width.min(bar.width), 1);
+    let cancel_x = save.x + save.width + 2;
+    let cancel = Rect::new(
+        cancel_x,
+        bar.y,
+        cancel_width.min(bar.x + bar.width - cancel_x),
+        1,
+    );
+    Some(SettingsLayout {
+        title,
+        rows,
+        bar,
+        save,
+        cancel,
+        hints,
+    })
+}
+
+/// Hit test one click in the settings view.
+pub fn settings_hit_test(
+    state: &AppState,
+    area: Rect,
+    column: u16,
+    row: u16,
+) -> Option<SettingsHit> {
+    let layout = settings_layout(area)?;
+    if in_rect(layout.save, column, row) {
+        return Some(SettingsHit::Save);
+    }
+    if in_rect(layout.cancel, column, row) {
+        return Some(SettingsHit::Cancel);
+    }
+    if in_rect(layout.rows, column, row) {
+        let index = (row - layout.rows.y) as usize + settings_first_row(state, layout);
+        return (index < SETTINGS_ROWS).then_some(SettingsHit::Flag(index));
+    }
+    None
+}
+
+/// The first flag the rows show, so the selected one stays in view.
+fn settings_first_row(state: &AppState, layout: SettingsLayout) -> usize {
+    let visible = layout.rows.height.max(1) as usize;
+    let last_first = SETTINGS_ROWS.saturating_sub(visible);
+    state
+        .settings_row
+        .min(SETTINGS_ROWS - 1)
+        .saturating_sub(visible.saturating_sub(1))
+        .min(last_first)
 }
 
 /// What a click in the sidebar landed on.
@@ -340,25 +419,31 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u1
 
 /// The settings view in the terminal area: the two flags, edited as a draft.
 fn draw_settings(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16, u16)> {
-    let (title, rows, hints) = settings_rows(area)?;
-    put(
-        buffer,
-        title,
-        0,
-        " Settings ",
-        RStyle::default()
-            .fg(RColor::Black)
-            .bg(RColor::Cyan)
-            .add_modifier(Modifier::BOLD),
-    );
-    // Scroll only if the flags cannot all fit; the selected one stays visible.
-    let visible = rows.height.max(1) as usize;
-    let last_first = SETTINGS_ROWS.saturating_sub(visible);
-    let first = state
-        .settings_row
-        .min(SETTINGS_ROWS - 1)
-        .saturating_sub(visible.saturating_sub(1))
-        .min(last_first);
+    let Some(layout) = settings_layout(area) else {
+        // No room for buttons: still say how to save and leave by keyboard.
+        put(
+            buffer,
+            chrome(area).main,
+            0,
+            " Esc closes · Ctrl+S saves ",
+            dim(),
+        );
+        return None;
+    };
+    if layout.title.height > 0 {
+        put(
+            buffer,
+            layout.title,
+            0,
+            " Settings ",
+            RStyle::default()
+                .fg(RColor::Black)
+                .bg(RColor::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    let first = settings_first_row(state, layout);
+    let visible = layout.rows.height.max(1) as usize;
     for row in first..SETTINGS_ROWS {
         if row - first >= visible {
             break;
@@ -369,7 +454,12 @@ fn draw_settings(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u
             _ => "off",
         };
         let selected = row == state.settings_row;
-        let line = Rect::new(rows.x, rows.y + (row - first) as u16, rows.width, 1);
+        let line = Rect::new(
+            layout.rows.x,
+            layout.rows.y + (row - first) as u16,
+            layout.rows.width,
+            1,
+        );
         draw_row(
             buffer,
             line,
@@ -378,13 +468,51 @@ fn draw_settings(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u
             highlighted(selected),
         );
     }
+
+    // The obvious way to keep a change: a real button row, clickable and
+    // reachable from the keyboard with Ctrl+S.
+    let button = RStyle::default()
+        .fg(RColor::Black)
+        .bg(RColor::Cyan)
+        .add_modifier(Modifier::BOLD);
     put(
         buffer,
-        hints,
+        layout.save,
         0,
-        " Local echo and scrollback · Ctrl+S save · Esc cancel ",
-        dim(),
+        &fit("[ Save ]", layout.save.width as usize),
+        button,
     );
+    let quiet = RStyle::default().fg(RColor::Cyan);
+    put(
+        buffer,
+        layout.cancel,
+        0,
+        &fit("[ Cancel ]", layout.cancel.width as usize),
+        quiet,
+    );
+    if layout.cancel.right() + 2 < layout.bar.right() {
+        put(
+            buffer,
+            Rect::new(
+                layout.cancel.right() + 2,
+                layout.bar.y,
+                layout.bar.right() - (layout.cancel.right() + 2),
+                1,
+            ),
+            0,
+            "Click a flag to toggle it · Ctrl+S saves · Esc cancels",
+            dim(),
+        );
+    }
+    if layout.hints.height > 0 {
+        put(
+            buffer,
+            layout.hints,
+            0,
+            " Local echo and scrollback · saved only when the file is written ",
+            dim(),
+        );
+    }
 
     let row = state.settings_row.min(SETTINGS_ROWS - 1);
     let value = match state.draft_value(row) {
@@ -393,8 +521,11 @@ fn draw_settings(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u
     };
     // The cursor sits where the value is drawn, right-aligned at the edge, on
     // the row the list actually scrolled to.
-    let value_column = rows.width.saturating_sub(display_width(value));
-    Some((rows.x + value_column, rows.y + (row - first) as u16))
+    let value_column = layout.rows.width.saturating_sub(display_width(value));
+    Some((
+        layout.rows.x + value_column,
+        layout.rows.y + (row - first) as u16,
+    ))
 }
 
 fn draw_stream(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16, u16)> {
@@ -782,17 +913,52 @@ mod tests {
             .find(|line| line.contains("Scrollback"))
             .expect("scrollback row");
         assert!(scrollback.contains("on"), "{scrollback}");
-        assert!(text.contains("Ctrl+S save"), "{text}");
+        assert!(text.contains("Ctrl+S saves"), "{text}");
+        assert!(
+            text.contains("[ Save ]"),
+            "a clickable save is drawn: {text}"
+        );
+        assert!(text.contains("[ Cancel ]"), "{text}");
 
         let area = Rect::new(0, 0, 100, 16);
         let mut buffer = Buffer::empty(area);
         let cursor = render(&state, &mut buffer, area).expect("cursor");
-        let (_, rows, _) = settings_rows(area).unwrap();
+        let rows = settings_layout(area).unwrap().rows;
         assert_eq!(cursor.1, rows.y);
 
         state.settings_row = 1;
         let cursor = render(&state, &mut buffer, area).expect("cursor");
         assert_eq!(cursor.1, rows.y + 1);
+    }
+
+    #[test]
+    fn clcks_find_the_flags_and_the_save_and_cancel_buttons() {
+        let mut state = demo();
+        state.begin_settings();
+        let area = Rect::new(0, 0, 100, 16);
+        let layout = settings_layout(area).unwrap();
+        assert_eq!(
+            settings_hit_test(&state, area, layout.save.x, layout.save.y),
+            Some(SettingsHit::Save)
+        );
+        assert_eq!(
+            settings_hit_test(&state, area, layout.cancel.x, layout.cancel.y),
+            Some(SettingsHit::Cancel)
+        );
+        assert_eq!(
+            settings_hit_test(&state, area, layout.rows.x, layout.rows.y),
+            Some(SettingsHit::Flag(0))
+        );
+        assert_eq!(
+            settings_hit_test(&state, area, layout.rows.x, layout.rows.y + 1),
+            Some(SettingsHit::Flag(1))
+        );
+        assert_eq!(settings_hit_test(&state, area, 0, 0), None);
+
+        // A very short terminal still draws the buttons when the area allows.
+        let small = Rect::new(0, 0, 40, 7);
+        let layout = settings_layout(small).unwrap();
+        assert!(settings_hit_test(&state, small, layout.save.x, layout.save.y).is_some());
     }
 
     #[test]
@@ -807,7 +973,7 @@ mod tests {
         let area = Rect::new(0, 0, 80, 6);
         let mut buffer = Buffer::empty(area);
         let cursor = render(&state, &mut buffer, area).expect("cursor");
-        let (_, rows, _) = settings_rows(area).unwrap();
+        let rows = settings_layout(area).unwrap().rows;
         assert!(
             cursor.1 >= rows.y && cursor.1 < rows.y + rows.height,
             "the cursor stays on a flag row, not the hints: {cursor:?}"
@@ -843,7 +1009,7 @@ mod tests {
         let area = Rect::new(0, 0, 80, 4);
         let mut buffer = Buffer::empty(area);
         let cursor = render(&state, &mut buffer, area).expect("cursor");
-        let (_, rows, _) = settings_rows(area).unwrap();
+        let rows = settings_layout(area).unwrap().rows;
         assert!(
             cursor.1 >= rows.y && cursor.1 < rows.y + rows.height,
             "the cursor is on a flag row, not the footer: {cursor:?}"

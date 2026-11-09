@@ -827,3 +827,124 @@ fn the_settings_button_keeps_its_focus_when_discovery_grows_the_list() {
 
     app.shutdown();
 }
+
+#[test]
+fn the_settings_page_has_mouse_toggles_and_a_mouse_save_and_cancel() {
+    use ratatui::layout::Rect;
+    use serial_nexus_terminal::render::settings_layout;
+
+    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let device = SimulatedDevice::new();
+    let config = tempfile::tempdir().unwrap();
+    let store =
+        serial_nexus_terminal::settings::SettingsStore::at(config.path().join("terminal.json"));
+    let settings = store.load_or_create().expect("settings file");
+    let mut app = App::with_preferences(
+        Client::connect_to_socket(&socket, ClientInfo::human("terminal-mouse-settings"))
+            .expect("terminal connects"),
+        40,
+        120,
+        settings,
+        Some(store.clone()),
+    );
+    app.open_path(&device.path, Some(115_200)).expect("open");
+    let area = Rect::new(0, 0, 100, 16);
+
+    // The sidebar's Settings button, clicked with the mouse.
+    app.handle_key(Key::Ctrl(']'));
+    let button = serial_nexus_terminal::render::settings_button(area).expect("button");
+    app.handle_click(area, button.x + 2, button.y);
+    assert_eq!(app.state.view, View::Settings);
+
+    let layout = settings_layout(area).expect("settings layout");
+    assert!(layout.save.width > 0 && layout.cancel.width > 0);
+
+    // A click on the first flag toggles the draft, not the active options.
+    app.handle_click(area, layout.rows.x, layout.rows.y);
+    assert!(!app.state.draft.local_echo, "the click flipped the flag");
+    assert!(
+        app.state.settings.local_echo,
+        "the active option is unchanged"
+    );
+    assert!(
+        store.load().expect("load").expect("file").local_echo,
+        "nothing was written before Save"
+    );
+
+    // Cancel throws the draft away and writes nothing.
+    app.handle_click(area, layout.cancel.x + 1, layout.cancel.y);
+    assert_eq!(app.state.view, View::Devices);
+    assert!(app.state.settings.local_echo);
+    assert!(app.state.draft.local_echo);
+    assert!(store.load().expect("load").expect("file").local_echo);
+
+    // Save writes the file and only then applies the change.
+    app.handle_click(area, button.x + 2, button.y);
+    let layout = settings_layout(area).expect("settings layout");
+    app.handle_click(area, layout.rows.x, layout.rows.y);
+    assert!(!app.state.draft.local_echo);
+    app.handle_click(area, layout.save.x + 1, layout.save.y);
+    assert_eq!(app.state.view, View::Devices, "Save leaves the settings");
+    assert!(!app.state.settings.local_echo, "Save applied the change");
+    assert!(!store.load().expect("load").expect("file").local_echo);
+
+    app.shutdown();
+}
+
+#[test]
+fn a_mouse_save_that_fails_changes_nothing_and_stays_on_the_page() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use ratatui::layout::Rect;
+    use serial_nexus_terminal::render::settings_layout;
+
+    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let device = SimulatedDevice::new();
+    let config = tempfile::tempdir().unwrap();
+    let path = config.path().join("terminal.json");
+    let store = serial_nexus_terminal::settings::SettingsStore::at(&path);
+    store
+        .save(&serial_nexus_terminal::settings::TerminalSettings {
+            local_echo: true,
+            scrollback: true,
+        })
+        .expect("a settings file to keep");
+    let before = std::fs::read_to_string(&path).expect("the file");
+
+    let mut app = App::with_preferences(
+        Client::connect_to_socket(&socket, ClientInfo::human("terminal-mouse-save-fail"))
+            .expect("terminal connects"),
+        40,
+        120,
+        store.load().expect("load").expect("file"),
+        Some(store.clone()),
+    );
+    app.open_path(&device.path, Some(115_200)).expect("open");
+    let area = Rect::new(0, 0, 100, 16);
+    app.open_settings();
+    let layout = settings_layout(area).expect("settings layout");
+    app.handle_click(area, layout.rows.x, layout.rows.y);
+    assert!(!app.state.draft.local_echo);
+
+    std::fs::set_permissions(config.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    app.handle_click(area, layout.save.x + 1, layout.save.y);
+    std::fs::set_permissions(config.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_eq!(
+        app.state.view,
+        View::Settings,
+        "a failed save keeps the page and the draft"
+    );
+    assert!(
+        app.state.settings.local_echo,
+        "the active option is unchanged"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("the file is untouched"),
+        before
+    );
+    let notice = app.state.notice.as_ref().expect("the failure is reported");
+    assert!(notice.text.contains("not saved"), "{}", notice.text);
+
+    app.shutdown();
+}

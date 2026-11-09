@@ -123,7 +123,10 @@ AI write control.
 - The settings view lists both flags, `local_echo` and `scrollback`. `Tab`,
   `Shift+Tab` and `↑`/`↓` move between them, `Space` (or `Enter`) toggles the
   selection, `Ctrl+S` saves the file and only then puts the changes into
-  effect, and `Esc` throws every change away. A save that fails — including a
+  effect, and `Esc` throws every change away. With the mouse, a flag row
+  toggles on click, and the `[ Save ]` and `[ Cancel ]` buttons on the page do
+  what they say — a mouse save uses the same save-then-apply path as
+  `Ctrl+S`. A save that fails — including a
   launch with no settings file to write — leaves the options as they were, says
   so in the footer, and stays in the settings so the draft is not lost; the
   terminal never reports a save it did not make. Scrollback is stored before

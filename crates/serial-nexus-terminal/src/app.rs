@@ -10,9 +10,9 @@ use serial_nexus_protocol::{DeviceSummary, Event};
 use ratatui::layout::Rect;
 
 use crate::input::{echo_key, map_key, Action, Key};
-use crate::render::{hit_test, Hit};
+use crate::render::{hit_test, settings_hit_test, Hit, SettingsHit};
 use crate::settings::{SettingsStore, TerminalSettings};
-use crate::state::{short_holder, AppState, DeviceEntry, Notice, View};
+use crate::state::{short_holder, AppState, DeviceEntry, Notice, View, SETTINGS_ROWS};
 
 /// Wire the app to a connected core. The core is started by
 /// [`Client::connect`] (the auto-start seam), not by the TUI.
@@ -143,17 +143,27 @@ impl App {
         }
     }
 
-    /// Handle a click at one cell of the screen. Only the sidebar has
-    /// clickable controls: a device row selects it, the Settings button opens
-    /// the settings.
+    /// Handle a click at one cell of the screen. The sidebar's device rows
+    /// select and its Settings button opens the settings; in the settings, a
+    /// flag row toggles and the Save and Cancel buttons do what they say. The
+    /// stream has no controls.
     pub fn handle_click(&mut self, area: Rect, column: u16, row: u16) {
-        if self.state.view != View::Devices {
-            return;
-        }
-        match hit_test(&self.state, area, column, row) {
-            Some(Hit::Device(index)) => self.select_row_index(index),
-            Some(Hit::Settings) => self.open_settings(),
-            None => {}
+        match self.state.view {
+            View::Devices => match hit_test(&self.state, area, column, row) {
+                Some(Hit::Device(index)) => self.select_row_index(index),
+                Some(Hit::Settings) => self.open_settings(),
+                None => {}
+            },
+            View::Settings => match settings_hit_test(&self.state, area, column, row) {
+                Some(SettingsHit::Flag(index)) => {
+                    self.state.settings_row = index.min(SETTINGS_ROWS - 1);
+                    self.state.toggle_draft();
+                }
+                Some(SettingsHit::Save) => self.save_settings(),
+                Some(SettingsHit::Cancel) => self.state.cancel_settings(),
+                None => {}
+            },
+            View::Stream => {}
         }
     }
 
