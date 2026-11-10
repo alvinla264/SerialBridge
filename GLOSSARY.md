@@ -80,3 +80,34 @@ these words in their tool names and user-facing text.
 - **Event**: an unsolicited notification from the core (device output, write
   echo, client joined/left, control granted/released/denied, device closed,
   core shutdown). Clients receive all events from their subscription onward.
+- **Sharing session**: opt-in LAN access to a set of **checked devices**,
+  started by a **local owner** and alive only while that owner's local terminal
+  connection is. It has its own TLS certificate authority, host certificate and
+  pairing credentials; stopping it, or losing the owner connection, closes the
+  listener, disconnects every **remote client** and revokes the credentials.
+  Off by default; there is no listener until one is started.
+- **Local owner**: the local human terminal connection that started a sharing
+  session. Only it may check, uncheck, inspect or stop sharing.
+- **Checked device**: a detected device the owner added to the session's
+  in-memory allowlist. The checked list is the whole of what remote clients may
+  see or use; a checked device need not be open locally.
+- **Device identity**: the concrete device node behind a path, captured as
+  `(st_dev, st_ino, st_rdev)` when the device is checked. It is revalidated at
+  authorization and open time; a replaced or unplugged device loses its
+  authorization instead of inheriting it.
+- **Unchecked**: a device removed from the allowlist. Remote access to it is
+  revoked immediately, remote work pending on it fails, and local clients and
+  other checked devices keep working. Checking it again is explicit.
+- **Pairing credential**: a random, high-entropy secret generated fresh for each
+  sharing session, one for human clients and a distinct one for AI clients. Its
+  role is decided by the core from which credential matched, never by the
+  client. Returned once, only to the local owner.
+- **Paired host**: the host information a remote client needs to authenticate
+  the core: the session certificate authority, the host certificate's SHA-256
+  fingerprint and the exact address to dial. A different certificate is never
+  accepted silently.
+- **Remote client**: a client connected over TLS to a sharing session, using a
+  pairing credential. It sees only checked devices and cannot control sharing.
+- **Remote frame**: one length-prefixed JSON message on a remote connection
+  (4-byte big-endian length, then that many bytes), bounded to keep one peer
+  from exhausting memory.

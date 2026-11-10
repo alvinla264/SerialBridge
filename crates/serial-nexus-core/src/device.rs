@@ -1,4 +1,5 @@
 use std::io;
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -7,6 +8,67 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, Sender};
 use serial_nexus_protocol::Source;
 use serialport::{DataBits, FlowControl, Parity, StopBits};
+
+/// One concrete device node, captured as the inode the kernel opened.
+///
+/// A path alone is not an identity: a device can be unplugged and another one
+/// can reappear at the same path. Sharing stores this fingerprint when the
+/// owner checks a device and compares it again at authorization and open time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceIdentity {
+    /// Canonical path used for every later lookup.
+    pub canonical: String,
+    dev: u64,
+    ino: u64,
+    rdev: u64,
+}
+
+impl DeviceIdentity {
+    /// Capture the current device node behind `path` (following symlinks).
+    pub fn capture(path: &str) -> io::Result<Self> {
+        let canonical = std::fs::canonicalize(path)?;
+        let stat = nix::sys::stat::stat(&canonical)
+            .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+        Ok(Self::from_stat(
+            canonical.to_string_lossy().into_owned(),
+            &stat,
+        ))
+    }
+
+    fn from_stat(canonical: String, stat: &nix::sys::stat::FileStat) -> Self {
+        Self {
+            canonical,
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+            rdev: stat.st_rdev,
+        }
+    }
+
+    fn same_node(&self, other: &Self) -> bool {
+        self.dev == other.dev && self.ino == other.ino && self.rdev == other.rdev
+    }
+
+    /// True when the node behind the canonical path is still the same one.
+    pub fn still_valid(&self) -> bool {
+        match Self::capture(&self.canonical) {
+            Ok(current) => self.same_node(&current),
+            Err(_) => false,
+        }
+    }
+
+    /// An opaque label for the wire; never contains a path from outside the
+    /// session's own allowlist.
+    pub fn describe(&self) -> String {
+        format!("dev={}:{} ino={}", self.dev, self.rdev, self.ino)
+    }
+
+    /// Compare the identity of an already-open descriptor with this one.
+    fn same_open_file(&self, fd: std::os::unix::io::RawFd) -> io::Result<bool> {
+        let stat = nix::sys::stat::fstat(fd)
+            .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+        Ok(self.same_node(&Self::from_stat(self.canonical.clone(), &stat)))
+    }
+}
 
 /// Events a device's I/O threads send to the engine.
 #[derive(Debug)]
@@ -23,14 +85,38 @@ pub enum DeviceEvent {
 /// Open a serial port with the first version's fixed framing: 8N1, no flow
 /// control, configurable baud, short read timeout so threads can stop.
 pub fn open_serial(path: &str, baud: u32) -> io::Result<Box<dyn serialport::SerialPort>> {
-    let port = serialport::new(path, baud)
+    open_serial_checked(path, baud, None)
+}
+
+/// Open a serial port and, when `expected` is given, refuse the open unless the
+/// descriptor is that exact device node. The identity is checked on the open
+/// file descriptor, so swapping the path between the check and the open cannot
+/// hand a different device the authorization.
+pub fn open_serial_checked(
+    path: &str,
+    baud: u32,
+    expected: Option<&DeviceIdentity>,
+) -> io::Result<Box<dyn serialport::SerialPort>> {
+    let builder = serialport::new(path, baud)
         .data_bits(DataBits::Eight)
         .parity(Parity::None)
         .stop_bits(StopBits::One)
         .flow_control(FlowControl::None)
-        .timeout(Duration::from_millis(50))
-        .open()?;
-    Ok(port)
+        .timeout(Duration::from_millis(50));
+    let port = serialport::TTYPort::open(&builder)?;
+    if let Some(expected) = expected {
+        let same = expected.same_open_file(port.as_raw_fd())?;
+        // Also require the canonical path to still name this node, so a
+        // retargeted symlink cannot keep an authorization alive.
+        let path_still_same = expected.still_valid();
+        if !same || !path_still_same {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{path} changed since it was checked; check it again"),
+            ));
+        }
+    }
+    Ok(Box::new(port))
 }
 
 /// Handles for a device's I/O threads, joined when the device closes so the

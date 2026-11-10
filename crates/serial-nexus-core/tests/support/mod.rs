@@ -84,6 +84,25 @@ impl SimulatedDevice {
         }
     }
 
+    /// Everything currently readable, waiting briefly for more.
+    pub fn read_available(&mut self, wait: Duration) -> Vec<u8> {
+        let deadline = Instant::now() + wait;
+        let mut got = Vec::new();
+        loop {
+            let mut buffer = [0u8; 512];
+            match self.master.read(&mut buffer) {
+                Ok(0) => {}
+                Ok(read) => got.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return got,
+            }
+            if Instant::now() >= deadline {
+                return got;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// Read the master side until `needle` appears, else panic after timeout.
     pub fn read_until(&mut self, needle: &[u8], timeout: Duration) -> Vec<u8> {
         let deadline = Instant::now() + timeout;

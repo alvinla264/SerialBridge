@@ -35,6 +35,17 @@ pub enum ClientError {
 
     #[error("unexpected response from core: {0}")]
     UnexpectedResponse(String),
+
+    #[error("TLS error: {0}")]
+    Tls(String),
+
+    /// The host's certificate did not match the pairing information.
+    #[error("host authentication failed: {0}")]
+    HostRejected(String),
+
+    /// The pairing credential was refused or never answered.
+    #[error("authentication failed: {0}")]
+    Authentication(String),
 }
 
 impl ClientError {

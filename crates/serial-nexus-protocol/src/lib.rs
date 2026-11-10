@@ -11,6 +11,9 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
+pub mod share;
+pub use share::*;
+
 /// Version of the client/core protocol.
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -117,6 +120,19 @@ pub enum Request {
     Write(WriteParams),
     /// One device's state.
     Status(DeviceRef),
+    /// Start sharing checked devices to remote clients on one concrete
+    /// address. Local owner only; the answer carries the pairing secrets.
+    ShareStart(ShareStartParams),
+    /// Stop sharing, disconnect every remote client and revoke credentials.
+    /// Local owner only.
+    ShareStop,
+    /// Add detected devices to the owner's session allowlist. Local owner only.
+    ShareCheck(ShareDevicesParams),
+    /// Remove devices from the allowlist and revoke remote access at once.
+    /// Local owner only.
+    ShareUncheck(ShareDevicesParams),
+    /// The session's state, without secrets. Local owner only.
+    ShareStatus,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +212,9 @@ pub enum ResponseData {
     Read(ReadResult),
     Written(WriteResult),
     Status(DeviceStatus),
+    ShareStarted(ShareSessionInfo),
+    Sharing(SharingSnapshot),
+    ShareStopped(ShareStopped),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -391,6 +410,8 @@ pub enum ErrorCode {
     Internal,
     /// The core is going away.
     ShuttingDown,
+    /// The peer reached a bounded resource or pending-work limit.
+    LimitExceeded,
 }
 
 /// Why a holder lost control.
@@ -453,6 +474,22 @@ pub enum Event {
 }
 
 impl Event {
+    /// The device this event is about, if any. The core uses it to keep remote
+    /// clients from seeing unchecked devices.
+    pub fn device_id(&self) -> Option<u64> {
+        match self {
+            Self::DeviceOutput { device_id, .. }
+            | Self::Write { device_id, .. }
+            | Self::DeviceClosed { device_id, .. }
+            | Self::ClientJoined { device_id, .. }
+            | Self::ClientLeft { device_id, .. }
+            | Self::ControlGranted { device_id, .. }
+            | Self::ControlReleased { device_id, .. }
+            | Self::ControlDenied { device_id, .. } => Some(*device_id),
+            Self::CoreShutdown { .. } | Self::TransportClosed { .. } => None,
+        }
+    }
+
     pub fn device_output(device_id: u64, data: &[u8]) -> Self {
         Self::DeviceOutput {
             device_id,

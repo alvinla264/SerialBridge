@@ -8,14 +8,16 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use serial_nexus_protocol::{
     decode_bytes, ClientKind, ControlReleaseReason, ControlState, DeviceStatus, DeviceSummary,
     ErrorBody, ErrorCode, Event, HelloParams, HelloResult, HistoryLine, Holder, OpenParams,
-    OpenResult, ReadParams, ReadResult, Request, ResponseData, Role, ServerMessage, Source,
-    WriteParams, WriteResult, PROTOCOL_VERSION,
+    OpenResult, ReadParams, ReadResult, Request, ResponseData, Role, ServerMessage,
+    ShareDevicesParams, ShareStartParams, Source, WriteParams, WriteResult, MAX_SHARED_DEVICES,
+    PROTOCOL_VERSION,
 };
 
 use crate::config::CoreConfig;
-use crate::device::{self, DeviceEvent};
+use crate::device::{self, DeviceEvent, DeviceIdentity};
 use crate::enumerate;
 use crate::history::History;
+use crate::share::{self, ShareLimits, SharingSession};
 
 /// Result of preparing a write: either complete, or waiting off-thread.
 pub enum WriteStart {
@@ -45,6 +47,8 @@ struct ClientRecord {
     kind: ClientKind,
     name: Option<String>,
     hello_done: bool,
+    /// Set for remote sharing clients; never for local Unix-socket clients.
+    remote: Option<Arc<SharingSession>>,
 }
 
 struct Attached {
@@ -145,6 +149,7 @@ pub struct Engine {
     events_rx: Receiver<DeviceEvent>,
     shutdown_tx: Sender<String>,
     shutting_down: AtomicBool,
+    sharing: Mutex<Option<Arc<SharingSession>>>,
 }
 
 impl Engine {
@@ -167,6 +172,7 @@ impl Engine {
             events_rx,
             shutdown_tx,
             shutting_down: AtomicBool::new(false),
+            sharing: Mutex::new(None),
         })
     }
 
@@ -225,6 +231,7 @@ impl Engine {
                 kind: ClientKind::Other,
                 name: None,
                 hello_done: false,
+                remote: None,
             },
         );
         self.client_count.fetch_add(1, Ordering::SeqCst);
@@ -237,6 +244,18 @@ impl Engine {
     /// Remove a connection: detach it from every device, release control it
     /// held, and close devices it was the last client of.
     pub fn unregister_client(&self, client_id: u64) {
+        // The owning local terminal is the only reason sharing exists: when
+        // its connection goes away, close the listener and every remote
+        // session before anything else is torn down.
+        if self
+            .sharing
+            .lock()
+            .expect("sharing lock")
+            .as_ref()
+            .is_some_and(|session| session.owner_client_id() == client_id)
+        {
+            self.stop_sharing();
+        }
         self.clients
             .lock()
             .expect("clients lock")
@@ -320,7 +339,11 @@ impl Engine {
 
     // ---- requests ---------------------------------------------------------
 
-    pub fn handle(&self, client_id: u64, request: Request) -> Result<ResponseData, ErrorBody> {
+    pub fn handle(
+        self: &Arc<Self>,
+        client_id: u64,
+        request: Request,
+    ) -> Result<ResponseData, ErrorBody> {
         if self.is_shutting_down() && !matches!(request, Request::Ping) {
             return Err(ErrorBody::new(
                 ErrorCode::ShuttingDown,
@@ -349,6 +372,11 @@ impl Engine {
             Request::Read(params) => self.read(client_id, params),
             Request::Write(params) => self.write(client_id, params),
             Request::Status(device) => self.status(client_id, device.device_id),
+            Request::ShareStart(params) => self.start_sharing(client_id, params),
+            Request::ShareStop => self.stop_sharing_from_owner(client_id),
+            Request::ShareCheck(params) => self.check_shared_devices(client_id, params),
+            Request::ShareUncheck(params) => self.uncheck_shared_devices(client_id, params),
+            Request::ShareStatus => self.sharing_status(client_id),
         }
     }
 
@@ -418,6 +446,15 @@ impl Engine {
     }
 
     fn open(&self, client_id: u64, params: OpenParams) -> Result<ResponseData, ErrorBody> {
+        self.open_with_identity(client_id, params, None)
+    }
+
+    fn open_with_identity(
+        &self,
+        client_id: u64,
+        params: OpenParams,
+        expected: Option<&DeviceIdentity>,
+    ) -> Result<ResponseData, ErrorBody> {
         let (kind, name) = self.identity(client_id);
         // Resolve aliases (symlinks, `..`) so two paths to one device join the
         // same open device instead of colliding at the OS level.
@@ -464,14 +501,15 @@ impl Engine {
                         format!("baud rate {baud} is out of range"),
                     ));
                 }
-                let read_port = device::open_serial(&port, baud).map_err(|error| {
-                    let code = match error.kind() {
-                        std::io::ErrorKind::NotFound => ErrorCode::NotFound,
-                        std::io::ErrorKind::PermissionDenied => ErrorCode::PermissionDenied,
-                        _ => ErrorCode::DeviceFailed,
-                    };
-                    ErrorBody::new(code, format!("could not open {port}: {error}"))
-                })?;
+                let read_port =
+                    device::open_serial_checked(&port, baud, expected).map_err(|error| {
+                        let code = match error.kind() {
+                            std::io::ErrorKind::NotFound => ErrorCode::NotFound,
+                            std::io::ErrorKind::PermissionDenied => ErrorCode::PermissionDenied,
+                            _ => ErrorCode::DeviceFailed,
+                        };
+                        ErrorBody::new(code, format!("could not open {port}: {error}"))
+                    })?;
                 let write_port = read_port.try_clone().map_err(|error| {
                     ErrorBody::new(
                         ErrorCode::Internal,
@@ -811,10 +849,11 @@ impl Engine {
             Ok(outcome) => Err(ErrorBody::new(
                 ErrorCode::DeviceFailed,
                 format!(
-                    "device {device_id} failed during the write: {}",
+                    "device {device_id} failed during the write: {}; the bytes may already have reached the device and are not replayed",
                     outcome.failed.unwrap_or_default()
                 ),
-            )),
+            )
+            .with_details(serde_json::json!({ "may_have_reached_device": true }))),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 // A waiter may have completed in the gap before the timeout;
                 // keep its lines rather than losing them.
@@ -971,19 +1010,26 @@ impl Engine {
 
     fn on_device_failed(&self, device_id: u64, reason: String) {
         let mut events = Vec::new();
+        let reason_text = format!("device failed: {reason}");
         let removed = {
             let mut state = self.state.lock().expect("state lock");
-            take_device_locked(
-                &mut state,
-                device_id,
-                &format!("device failed: {reason}"),
-                &mut events,
-            )
+            take_device_locked(&mut state, device_id, &reason_text, &mut events)
         };
+        let path = removed.as_ref().map(|device| device.path.clone());
         if let Some(device) = removed {
             join_devices(vec![device]);
         }
+        // Tell clients (including remote ones) first: the allowlist still
+        // names the path, so a shared device's failure is reported rather than
+        // silently disappearing.
         self.emit(events);
+        if let Some(path) = path {
+            // An unplugged or replaced device loses its authorization: sharing
+            // it again needs an explicit check.
+            if let Some(session) = self.sharing.lock().expect("sharing lock").as_ref() {
+                session.revoke_path(&path);
+            }
+        }
     }
 
     fn remove_waiter(&self, device_id: u64, waiter_id: u64) -> Vec<HistoryLine> {
@@ -1073,6 +1119,9 @@ impl Engine {
     /// Close every device and tell clients the core is going away.
     pub fn shutdown_all(&self, reason: &str) {
         self.shutting_down.store(true, Ordering::SeqCst);
+        // Close the sharing listener first: no new remote work can start, and
+        // every remote session is disconnected before devices close.
+        self.stop_sharing();
         let mut events = Vec::new();
         let mut removed = Vec::new();
         {
@@ -1089,6 +1138,424 @@ impl Engine {
         events.push(Event::CoreShutdown {
             reason: reason.to_string(),
         });
+        self.emit(events);
+    }
+
+    // ---- LAN sharing ------------------------------------------------------
+
+    fn share_limits(&self) -> ShareLimits {
+        ShareLimits {
+            handshake_timeout: self.cfg.share_handshake_timeout,
+            auth_timeout: self.cfg.share_auth_timeout,
+            max_connections: self.cfg.share_max_connections,
+            max_pending_writes: self.cfg.share_max_pending_writes,
+        }
+    }
+
+    pub fn sharing_session(&self) -> Option<Arc<SharingSession>> {
+        self.sharing.lock().expect("sharing lock").clone()
+    }
+
+    /// The local owner of the active session, or an error that never reveals
+    /// session details.
+    fn owner_session(&self, client_id: u64) -> Result<Arc<SharingSession>, ErrorBody> {
+        let session = self
+            .sharing_session()
+            .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "sharing is not active"))?;
+        if session.owner_client_id() != client_id {
+            return Err(ErrorBody::new(
+                ErrorCode::PermissionDenied,
+                "only the local terminal that started sharing may control it",
+            ));
+        }
+        Ok(session)
+    }
+
+    /// Capture a detected device's identity. Checking never opens the device.
+    fn detected_device(&self, path: &str) -> Result<DeviceIdentity, ErrorBody> {
+        let identity = DeviceIdentity::capture(path).map_err(|error| {
+            ErrorBody::new(
+                ErrorCode::NotFound,
+                format!("{path} is not a usable device: {error}"),
+            )
+        })?;
+        let detected = enumerate::list_ports()
+            .iter()
+            .any(|port| port.path == identity.canonical)
+            || self
+                .state
+                .lock()
+                .expect("state lock")
+                .devices
+                .values()
+                .any(|device| device.path == identity.canonical);
+        if !detected {
+            return Err(ErrorBody::new(
+                ErrorCode::NotFound,
+                format!("{} is not a detected serial device", identity.canonical),
+            ));
+        }
+        Ok(identity)
+    }
+
+    fn start_sharing(
+        self: &Arc<Self>,
+        client_id: u64,
+        params: ShareStartParams,
+    ) -> Result<ResponseData, ErrorBody> {
+        let (kind, _) = self.identity(client_id);
+        if kind != ClientKind::Human {
+            return Err(ErrorBody::new(
+                ErrorCode::PermissionDenied,
+                "only a local human terminal may enable sharing",
+            ));
+        }
+        let mut guard = self.sharing.lock().expect("sharing lock");
+        if guard.is_some() {
+            return Err(ErrorBody::new(
+                ErrorCode::BadRequest,
+                "sharing is already active; stop it before starting again",
+            ));
+        }
+        params
+            .bind
+            .validate()
+            .map_err(|message| ErrorBody::new(ErrorCode::BadRequest, message))?;
+        if params.devices.len() > MAX_SHARED_DEVICES {
+            return Err(ErrorBody::new(
+                ErrorCode::LimitExceeded,
+                format!("at most {MAX_SHARED_DEVICES} devices may be shared"),
+            ));
+        }
+        let mut identities = Vec::new();
+        let mut seen = HashSet::new();
+        for path in &params.devices {
+            let identity = self.detected_device(path)?;
+            if seen.insert(identity.canonical.clone()) {
+                identities.push(identity);
+            }
+        }
+        // Binding is synchronous: a failure here leaves sharing off.
+        let prepared = share::prepare(client_id, &params, identities, self.share_limits())
+            .map_err(|message| ErrorBody::new(ErrorCode::DeviceFailed, message))?;
+        *guard = Some(Arc::clone(&prepared.session));
+        if let Err(error) = share::spawn_listener(Arc::clone(self), Arc::clone(&prepared.session)) {
+            guard.take();
+            prepared.session.stop();
+            return Err(ErrorBody::new(
+                ErrorCode::Internal,
+                format!("could not start the sharing listener: {error}"),
+            ));
+        }
+        drop(guard);
+        Ok(ResponseData::ShareStarted(prepared.info))
+    }
+
+    /// Stop sharing: close the listener, disconnect every remote client and
+    /// revoke the session's credentials.
+    pub fn stop_sharing(&self) {
+        let session = self.sharing.lock().expect("sharing lock").take();
+        if let Some(session) = session {
+            session.stop();
+        }
+    }
+
+    fn stop_sharing_from_owner(&self, client_id: u64) -> Result<ResponseData, ErrorBody> {
+        self.owner_session(client_id)?;
+        self.stop_sharing();
+        Ok(ResponseData::ShareStopped(
+            serial_nexus_protocol::ShareStopped { was_active: true },
+        ))
+    }
+
+    fn check_shared_devices(
+        &self,
+        client_id: u64,
+        params: ShareDevicesParams,
+    ) -> Result<ResponseData, ErrorBody> {
+        let session = self.owner_session(client_id)?;
+        if session.is_stopped() {
+            return Err(ErrorBody::new(
+                ErrorCode::ShuttingDown,
+                "sharing is stopping",
+            ));
+        }
+        for path in &params.devices {
+            let identity = self.detected_device(path)?;
+            session.check(identity)?;
+        }
+        Ok(ResponseData::Sharing(session.snapshot()))
+    }
+
+    fn uncheck_shared_devices(
+        &self,
+        client_id: u64,
+        params: ShareDevicesParams,
+    ) -> Result<ResponseData, ErrorBody> {
+        let session = self.owner_session(client_id)?;
+        for path in &params.devices {
+            if let Some(identity) = session.uncheck(path) {
+                let device_ids: Vec<u64> = self
+                    .state
+                    .lock()
+                    .expect("state lock")
+                    .devices
+                    .iter()
+                    .filter(|(_, device)| device.path == identity.canonical)
+                    .map(|(id, _)| *id)
+                    .collect();
+                // Revoke immediately: detach remote clients and fail their
+                // pending work. Local clients and other devices are untouched.
+                self.detach_remote_clients(&device_ids, "device was unshared");
+            }
+        }
+        Ok(ResponseData::Sharing(session.snapshot()))
+    }
+
+    fn sharing_status(&self, client_id: u64) -> Result<ResponseData, ErrorBody> {
+        match self.sharing_session() {
+            Some(session) if session.owner_client_id() == client_id => {
+                Ok(ResponseData::Sharing(session.snapshot()))
+            }
+            Some(_) => Err(ErrorBody::new(
+                ErrorCode::PermissionDenied,
+                "only the local terminal that started sharing may control it",
+            )),
+            None => Ok(ResponseData::Sharing(share::inactive_snapshot())),
+        }
+    }
+
+    /// Register an authenticated remote connection. The role came from the
+    /// credential; it is never read from the request.
+    pub fn register_remote_client(
+        &self,
+        tx: Sender<ServerMessage>,
+        session: Arc<SharingSession>,
+        kind: ClientKind,
+        name: Option<String>,
+    ) -> u64 {
+        let id = self.next_client_id.fetch_add(1, Ordering::SeqCst);
+        self.clients.lock().expect("clients lock").insert(
+            id,
+            ClientRecord {
+                tx,
+                kind,
+                name,
+                hello_done: true,
+                remote: Some(session),
+            },
+        );
+        self.client_count.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut state) = self.state.lock() {
+            state.grace_since = None;
+        }
+        id
+    }
+
+    fn remote_scope(&self, client_id: u64) -> Option<Arc<SharingSession>> {
+        self.clients
+            .lock()
+            .expect("clients lock")
+            .get(&client_id)
+            .and_then(|record| record.remote.clone())
+    }
+
+    /// Every remote operation goes through here: ACL, role and lifecycle are
+    /// enforced on the request, not on a UI.
+    pub fn handle_remote(
+        self: &Arc<Self>,
+        client_id: u64,
+        request: Request,
+    ) -> Result<ResponseData, ErrorBody> {
+        let Some(session) = self.remote_scope(client_id) else {
+            return Err(ErrorBody::new(
+                ErrorCode::PermissionDenied,
+                "not an authenticated remote client",
+            ));
+        };
+        if session.is_stopped() {
+            return Err(ErrorBody::new(ErrorCode::ShuttingDown, "sharing stopped"));
+        }
+        if self.is_shutting_down() && !matches!(request, Request::Ping) {
+            return Err(ErrorBody::new(
+                ErrorCode::ShuttingDown,
+                "core is shutting down",
+            ));
+        }
+        match request {
+            Request::Ping => Ok(ResponseData::Pong),
+            Request::ListDevices => {
+                let mut devices = self.list_devices();
+                devices
+                    .devices
+                    .retain(|device| session.allows_path(&device.path));
+                Ok(ResponseData::Devices(devices))
+            }
+            Request::Open(params) => {
+                let identity = session.authorize(&params.port)?;
+                self.open_with_identity(
+                    client_id,
+                    OpenParams {
+                        port: identity.canonical.clone(),
+                        ..params
+                    },
+                    Some(&identity),
+                )
+            }
+            Request::Close(device) => {
+                self.authorize_remote_device(&session, device.device_id)?;
+                self.handle(client_id, Request::Close(device))
+            }
+            Request::Read(params) => {
+                self.authorize_remote_device(&session, params.device_id)?;
+                self.handle(client_id, Request::Read(params))
+            }
+            Request::Status(device) => {
+                self.authorize_remote_device(&session, device.device_id)?;
+                self.handle(client_id, Request::Status(device))
+            }
+            Request::Write(_) => Err(ErrorBody::new(
+                ErrorCode::Internal,
+                "writes are authorized separately",
+            )),
+            Request::Hello(_) => Err(ErrorBody::new(
+                ErrorCode::BadRequest,
+                "the connection is already authenticated",
+            )),
+            Request::ShareStart(_)
+            | Request::ShareStop
+            | Request::ShareCheck(_)
+            | Request::ShareUncheck(_)
+            | Request::ShareStatus => Err(ErrorBody::new(
+                ErrorCode::PermissionDenied,
+                "sharing is controlled only by the local owner",
+            )),
+        }
+    }
+
+    /// Validate a remote write's device before it is queued.
+    pub fn handle_remote_write(
+        &self,
+        client_id: u64,
+        params: WriteParams,
+    ) -> Result<WriteStart, ErrorBody> {
+        let Some(session) = self.remote_scope(client_id) else {
+            return Err(ErrorBody::new(
+                ErrorCode::PermissionDenied,
+                "not an authenticated remote client",
+            ));
+        };
+        if session.is_stopped() {
+            return Err(ErrorBody::new(ErrorCode::ShuttingDown, "sharing stopped"));
+        }
+        self.authorize_remote_device(&session, params.device_id)?;
+        self.begin_write(client_id, params)
+    }
+
+    fn authorize_remote_device(
+        &self,
+        session: &SharingSession,
+        device_id: u64,
+    ) -> Result<(), ErrorBody> {
+        let path = self
+            .state
+            .lock()
+            .expect("state lock")
+            .devices
+            .get(&device_id)
+            .map(|device| device.path.clone());
+        let Some(path) = path else {
+            return Err(ErrorBody::new(
+                ErrorCode::NotFound,
+                format!("device {device_id} is not open"),
+            ));
+        };
+        match session.authorize(&path) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                // A changed device revokes access and fails remote work now.
+                self.detach_remote_clients(&[device_id], "device is no longer shared");
+                Err(error)
+            }
+        }
+    }
+
+    /// Detach remote clients from these devices and fail their pending waits,
+    /// leaving local clients and other shared devices alone.
+    fn detach_remote_clients(&self, device_ids: &[u64], reason: &str) {
+        let remote_ids: HashSet<u64> = self
+            .clients
+            .lock()
+            .expect("clients lock")
+            .iter()
+            .filter(|(_, record)| record.remote.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        if device_ids.is_empty() || remote_ids.is_empty() {
+            return;
+        }
+        let mut events = Vec::new();
+        let mut removed = Vec::new();
+        {
+            let mut state = self.state.lock().expect("state lock");
+            for device_id in device_ids {
+                let Some(device) = state.devices.get_mut(device_id) else {
+                    continue;
+                };
+                let detach: Vec<u64> = device
+                    .clients
+                    .keys()
+                    .filter(|client| remote_ids.contains(client))
+                    .copied()
+                    .collect();
+                for client in detach {
+                    if let Some(attached) = device.clients.remove(&client) {
+                        events.push(Event::ClientLeft {
+                            device_id: *device_id,
+                            client: Holder {
+                                client_id: client,
+                                name: attached.name,
+                                kind: attached.kind,
+                            },
+                        });
+                    }
+                    if device
+                        .control
+                        .as_ref()
+                        .is_some_and(|control| control.client_id == client)
+                    {
+                        if let Some(holder) = take_control(device) {
+                            events.push(Event::ControlReleased {
+                                device_id: *device_id,
+                                holder,
+                                reason: ControlReleaseReason::Disconnected,
+                            });
+                        }
+                    }
+                    let mut kept = Vec::new();
+                    for waiter in std::mem::take(&mut device.waiters) {
+                        if waiter.client_id == client {
+                            let _ = waiter.tx.send(WaitOutcome {
+                                lines: waiter.lines,
+                                timed_out: false,
+                                failed: Some(format!("device is no longer shared: {reason}")),
+                            });
+                        } else {
+                            kept.push(waiter);
+                        }
+                    }
+                    device.waiters = kept;
+                }
+                if device.clients.is_empty() {
+                    if let Some(device) =
+                        take_device_locked(&mut state, *device_id, reason, &mut events)
+                    {
+                        removed.push(device);
+                    }
+                }
+            }
+        }
+        join_devices(removed);
         self.emit(events);
     }
 
@@ -1123,14 +1590,48 @@ impl Engine {
         if events.is_empty() {
             return;
         }
-        let clients = self.clients.lock().expect("clients lock");
+        // Copy senders out so the event path never holds the client lock while
+        // looking up a device or a sharing allowlist.
+        let clients: Vec<(Sender<ServerMessage>, Option<Arc<SharingSession>>)> = self
+            .clients
+            .lock()
+            .expect("clients lock")
+            .values()
+            .map(|record| (record.tx.clone(), record.remote.clone()))
+            .collect();
         for event in events {
             let message = ServerMessage::Event {
                 event: event.clone(),
             };
-            for record in clients.values() {
-                let _ = record.tx.send(message.clone());
+            for (tx, remote) in &clients {
+                if let Some(session) = remote {
+                    if !self.remote_may_see(session, &event) {
+                        continue;
+                    }
+                }
+                let _ = tx.send(message.clone());
             }
+        }
+    }
+
+    /// Remote clients see events only for checked devices. A closed device is
+    /// matched by its path, because its engine entry is already gone.
+    fn remote_may_see(&self, session: &SharingSession, event: &Event) -> bool {
+        if let Event::DeviceClosed { path, .. } = event {
+            return session.allows_path(path);
+        }
+        match event.device_id() {
+            Some(device_id) => {
+                let path = self
+                    .state
+                    .lock()
+                    .expect("state lock")
+                    .devices
+                    .get(&device_id)
+                    .map(|device| device.path.clone());
+                path.is_some_and(|path| session.allows_path(&path))
+            }
+            None => true,
         }
     }
 }
