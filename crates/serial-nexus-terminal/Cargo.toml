@@ -21,3 +21,4 @@ unicode-width.workspace = true
 nix.workspace = true
 serial-nexus-core = { path = "../serial-nexus-core" }
 tempfile = "3"
+vt100 = "0.15"

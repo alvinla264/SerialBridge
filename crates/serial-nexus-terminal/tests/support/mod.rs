@@ -16,6 +16,8 @@ use serial_nexus_client::{Client, ClientInfo};
 use serial_nexus_protocol::Event;
 use tempfile::TempDir;
 
+pub mod tui;
+
 /// A PTY pair: the core opens the slave path as a serial port, the test drives
 /// the master side.
 pub struct SimulatedDevice {
@@ -33,6 +35,19 @@ impl SimulatedDevice {
         let link =
             std::fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd())).expect("slave path");
         fcntl(master.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).expect("nonblocking");
+        // A child started by a test (the terminal binary on its own PTY) must
+        // not inherit this device's ends: a stray master fd would keep the
+        // simulated device alive after the test drops it.
+        for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+            let flags = fcntl(fd, FcntlArg::F_GETFD).expect("get fd flags");
+            fcntl(
+                fd,
+                FcntlArg::F_SETFD(
+                    nix::fcntl::FdFlag::from_bits_truncate(flags) | nix::fcntl::FdFlag::FD_CLOEXEC,
+                ),
+            )
+            .expect("close-on-exec");
+        }
         Self {
             path: link.to_string_lossy().into_owned(),
             master,
