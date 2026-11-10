@@ -1442,3 +1442,78 @@ fn an_expired_entry_does_not_leak_events_for_a_later_device_instance() {
         );
     }
 }
+
+#[test]
+fn queued_writes_from_a_detached_remote_client_are_revoked() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let mut device = SimulatedDevice::new();
+    owner
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![device.path.clone()])
+        .expect("start");
+    let human = remote(&info, PairingRole::Human, "remote").expect("pair");
+    let opened = human.open(&device.path, None, false).expect("open");
+
+    // Queue a long backlog and a marker with the PTY not being drained.
+    for _ in 0..40 {
+        human
+            .write_bytes(opened.device_id, &[b'x'; 8 * 1024], None)
+            .expect("queued write");
+    }
+    human
+        .write_bytes(opened.device_id, b"DETACHED-MARKER", None)
+        .expect("queue marker");
+    // The client detaches from the device, then the owner unchecks it.
+    human.close(opened.device_id).expect("detach");
+    owner
+        .uncheck_shared_devices(vec![device.path.clone()])
+        .expect("uncheck");
+
+    let received = device.read_available(Duration::from_millis(300));
+    assert!(
+        !String::from_utf8_lossy(&received).contains("DETACHED-MARKER"),
+        "a queued write from a detached remote client ran after uncheck"
+    );
+}
+
+#[test]
+fn an_oversized_waited_write_answer_stays_a_successful_write() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let mut device = SimulatedDevice::new();
+    owner
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![device.path.clone()])
+        .expect("start");
+    let human = remote(&info, PairingRole::Human, "remote").expect("pair");
+    let opened = human.open(&device.path, None, false).expect("open");
+
+    let waiting = human.clone();
+    let device_id = opened.device_id;
+    let pending = std::thread::spawn(move || {
+        waiting.write_bytes(
+            device_id,
+            b"EXECUTED-ONCE",
+            Some(WaitSpec {
+                lines: 200,
+                timeout_ms: Some(5_000),
+            }),
+        )
+    });
+    device.read_until(b"EXECUTED-ONCE", Duration::from_secs(3));
+    for _ in 0..200 {
+        device.write(format!("{}\r\n", "z".repeat(600)).as_bytes());
+    }
+    let written = pending
+        .join()
+        .expect("thread")
+        .expect("the write succeeded and its answer must say so");
+    assert_eq!(written.bytes_written, b"EXECUTED-ONCE".len());
+    assert!(written.truncated, "the answer must be trimmed to fit");
+    assert!(!written.timed_out);
+}

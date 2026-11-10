@@ -1,8 +1,7 @@
-use std::collections::HashMap;
 use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -139,20 +138,22 @@ impl DeviceIdentity {
     }
 }
 
-/// One accepted write, tagged so a revoked remote client's queued work can be
-/// dropped by the writer before it reaches the device.
+/// One accepted write, tagged so revoked remote work can be dropped by the
+/// writer before it reaches the device.
 #[derive(Debug)]
 pub struct WriteCommand {
     pub device_id: u64,
-    pub client_id: u64,
-    /// The client's write generation for this device. A revocation bumps it,
-    /// which invalidates every command queued with the old value.
+    /// True for a remote client. Local work is never revoked.
+    pub remote: bool,
+    /// The device's remote-write generation when the write was accepted. Any
+    /// revocation bumps it, invalidating every remote command already queued
+    /// (including commands from clients that have since detached).
     pub epoch: u64,
     pub bytes: Vec<u8>,
 }
 
-/// Per-device write generations, keyed by client id.
-pub type WriteEpochs = Arc<Mutex<HashMap<u64, u64>>>;
+/// The remote-write generation for one device.
+pub type WriteEpoch = Arc<AtomicU64>;
 
 /// Open a serial port with the first version's fixed framing: 8N1, no flow
 /// control, configurable baud, short read timeout so threads can stop.
@@ -219,7 +220,7 @@ pub fn spawn_io(
     mut read_port: Box<dyn serialport::SerialPort>,
     mut write_port: Box<dyn serialport::SerialPort>,
     write_rx: Receiver<WriteCommand>,
-    write_epochs: WriteEpochs,
+    write_epoch: WriteEpoch,
     stop: Arc<AtomicBool>,
     events: Sender<DeviceEvent>,
 ) -> io::Result<IoThreads> {
@@ -273,15 +274,9 @@ pub fn spawn_io(
             // not silently drop bytes that already have a successful answer.
             // (On a device failure the write below reports the error.)
             while let Ok(command) = write_rx.recv() {
-                // A revoked remote client's queued work is dropped before it
-                // touches the device; the write already in progress finishes.
-                let current = write_epochs
-                    .lock()
-                    .expect("write epochs lock")
-                    .get(&command.client_id)
-                    .copied()
-                    .unwrap_or(0);
-                if current != command.epoch {
+                // Revoked remote work is dropped before it touches the device;
+                // the write already in progress finishes.
+                if command.remote && write_epoch.load(Ordering::SeqCst) != command.epoch {
                     continue;
                 }
                 let bytes = command.bytes;

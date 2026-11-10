@@ -108,8 +108,8 @@ type:
   partially reach the device; there is no rollback and no automatic replay.
 - **Owner loss / stop.** The listener is closed, every remote socket is shut
   down and every remote client's write generation is bumped, so queued but not
-  yet started remote writes are dropped (a write already in progress may
-  finish). Remote waits fail and the client reports uncertainty
+  yet started remote writes are dropped, including writes from clients that
+  have since detached (a write already in progress may finish). Remote waits fail and the client reports uncertainty
   (`ClientError::WriteUncertain` / `may_have_reached_device: true`); nothing is
   retried.
 
@@ -117,7 +117,8 @@ type:
 
 - `MAX_REMOTE_FRAME_BYTES` per frame in either direction. An answer that cannot
   fit becomes a request-level `BadRequest` ("response too large"), not a
-  dropped connection.
+  dropped connection; a successful waited write is trimmed and stays a
+  successful `WriteResult`, never an error.
 - A bounded per-device write queue (64 accepted writes). A full queue answers
   `LimitExceeded` before accepting bytes, so a slow device cannot accumulate
   unbounded work from any client.

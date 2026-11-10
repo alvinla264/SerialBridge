@@ -84,22 +84,27 @@ impl SimulatedDevice {
         }
     }
 
-    /// Everything currently readable, waiting briefly for more.
-    pub fn read_available(&mut self, wait: Duration) -> Vec<u8> {
-        let deadline = Instant::now() + wait;
+    /// Drain everything the core writes until the device has been quiet for
+    /// `quiet`. Large buffered backlogs are read in 64 KiB chunks.
+    pub fn read_available(&mut self, quiet: Duration) -> Vec<u8> {
         let mut got = Vec::new();
+        let mut last_data = Instant::now();
         loop {
-            let mut buffer = [0u8; 512];
+            let mut buffer = [0u8; 64 * 1024];
             match self.master.read(&mut buffer) {
                 Ok(0) => {}
-                Ok(read) => got.extend_from_slice(&buffer[..read]),
+                Ok(read) => {
+                    got.extend_from_slice(&buffer[..read]);
+                    last_data = Instant::now();
+                    continue;
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(_) => return got,
             }
-            if Instant::now() >= deadline {
+            if last_data.elapsed() >= quiet {
                 return got;
             }
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 

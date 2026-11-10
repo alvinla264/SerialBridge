@@ -660,6 +660,39 @@ fn run_connection(
     Ok(())
 }
 
+/// Keep a successful waited-write answer inside one remote frame. Trimming a
+/// result must never turn "the bytes were written" into an error.
+fn fit_write_answer(
+    mut result: serial_nexus_protocol::WriteResult,
+) -> serial_nexus_protocol::WriteResult {
+    // JSON can escape every byte as six, so 8 KiB of text always fits a
+    // 64 KiB frame with room for the rest of the result.
+    const BUDGET: usize = 8 * 1024;
+    let mut kept = Vec::new();
+    let mut total = 0usize;
+    let mut truncated = false;
+    for mut line in result.lines.into_iter().rev() {
+        if line.text.len() > BUDGET {
+            let mut cut = BUDGET;
+            while cut > 0 && !line.text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            line.text.truncate(cut);
+            truncated = true;
+        }
+        if !kept.is_empty() && total + line.text.len() > BUDGET {
+            truncated = true;
+            break;
+        }
+        total += line.text.len();
+        kept.push(line);
+    }
+    kept.reverse();
+    result.lines = kept;
+    result.truncated |= truncated;
+    result
+}
+
 /// Write one bounded frame. A response that cannot fit the remote frame limit
 /// becomes a request-level error instead of closing the whole connection.
 fn write_server_message(
@@ -735,6 +768,10 @@ fn handle_remote_request(
         }
         other => engine.handle_remote(client_id, other),
     };
+    let answer = answer.map(|result| match result {
+        ResponseData::Written(result) => ResponseData::Written(fit_write_answer(result)),
+        other => other,
+    });
     let message = match answer {
         Ok(result) => ServerMessage::Response { id, result },
         Err(error) => ServerMessage::Error { id, error },
@@ -753,7 +790,17 @@ fn spawn_write_wait(
     let spawned = thread::Builder::new()
         .name("serial-nexus-share-write-wait".into())
         .spawn(move || {
-            let answer = engine.finish_write(pending).map(ResponseData::Written);
+            let answer = engine
+                .finish_write(pending)
+                .map(ResponseData::Written)
+                .map(|result| match result {
+                    // Trim a large successful write answer so it always fits a
+                    // remote frame; the write itself already happened.
+                    ResponseData::Written(written) => {
+                        ResponseData::Written(fit_write_answer(written))
+                    }
+                    other => other,
+                });
             pending_counter.fetch_sub(1, Ordering::SeqCst);
             let message = match answer {
                 Ok(result) => ServerMessage::Response { id, result },

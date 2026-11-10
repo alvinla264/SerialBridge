@@ -82,7 +82,9 @@ struct Device {
     clients: BTreeMap<u64, Attached>,
     control: Option<Control>,
     write_tx: Option<Sender<device::WriteCommand>>,
-    write_epochs: device::WriteEpochs,
+    write_epoch: device::WriteEpoch,
+    /// Identity authorized for sharing when this instance was opened, if any.
+    shared: Option<DeviceIdentity>,
     stop: Arc<AtomicBool>,
     waiters: Vec<Waiter>,
     io: Option<device::IoThreads>,
@@ -490,6 +492,9 @@ impl Engine {
                         .with_details(serde_json::json!({ "active_baud": device.baud })));
                     }
                 }
+                if let Some(session) = session.as_ref() {
+                    device.shared = session.authorize(&device.path).ok();
+                }
                 attach(
                     device,
                     client_id,
@@ -546,7 +551,7 @@ impl Engine {
                 // Bounded so a slow device cannot accumulate unbounded queued
                 // write bytes from any client.
                 let (write_tx, write_rx) = crossbeam_channel::bounded(64);
-                let write_epochs: device::WriteEpochs = Arc::new(Mutex::new(HashMap::new()));
+                let write_epoch: device::WriteEpoch = Arc::new(AtomicU64::new(0));
                 let stop = Arc::new(AtomicBool::new(false));
                 let io = device::spawn_io(
                     device_id,
@@ -554,7 +559,7 @@ impl Engine {
                     read_port,
                     write_port,
                     write_rx,
-                    Arc::clone(&write_epochs),
+                    Arc::clone(&write_epoch),
                     Arc::clone(&stop),
                     self.events_tx.clone(),
                 )
@@ -564,6 +569,13 @@ impl Engine {
                         format!("could not start I/O for {port}: {error}"),
                     )
                 })?;
+                let shared_identity = match session.as_ref() {
+                    Some(session) => match expected {
+                        Some(identity) => Some(identity.clone()),
+                        None => session.authorize(&port).ok(),
+                    },
+                    None => None,
+                };
                 let device = Device {
                     id: device_id,
                     path: port,
@@ -574,13 +586,17 @@ impl Engine {
                     clients: BTreeMap::new(),
                     control: None,
                     write_tx: Some(write_tx),
-                    write_epochs,
+                    write_epoch,
+                    shared: shared_identity,
                     stop,
                     waiters: Vec::new(),
                     io: Some(io),
                 };
                 state.devices.insert(device_id, device);
                 let device = state.devices.get_mut(&device_id).expect("just inserted");
+                if let Some(session) = session.as_ref() {
+                    device.shared = session.authorize(&device.path).ok();
+                }
                 attach(
                     device,
                     client_id,
@@ -796,13 +812,8 @@ impl Engine {
             ));
         }
         refresh_control(device, client_id);
-        let epoch = device
-            .write_epochs
-            .lock()
-            .expect("write epochs lock")
-            .get(&client_id)
-            .copied()
-            .unwrap_or(0);
+        let remote = self.remote_scope(client_id).is_some();
+        let epoch = device.write_epoch.load(Ordering::SeqCst);
         device
             .write_tx
             .as_ref()
@@ -814,7 +825,7 @@ impl Engine {
             })?
             .try_send(device::WriteCommand {
                 device_id: params.device_id,
-                client_id,
+                remote,
                 epoch,
                 bytes: data.clone(),
             })
@@ -1203,6 +1214,26 @@ impl Engine {
 
     // ---- LAN sharing ------------------------------------------------------
 
+    /// Mark already-open engine devices whose path is checked, so their events
+    /// and discovery entries are visible to remote clients.
+    fn refresh_shared_instances(&self, session: &SharingSession) {
+        let checked: Vec<String> = session
+            .snapshot()
+            .checked
+            .into_iter()
+            .map(|device| device.path)
+            .collect();
+        let mut state = self.state.lock().expect("state lock");
+        for path in checked {
+            let identity = session.authorize(&path).ok();
+            for device in state.devices.values_mut() {
+                if device.path == path {
+                    device.shared = identity.clone();
+                }
+            }
+        }
+    }
+
     fn share_limits(&self) -> ShareLimits {
         ShareLimits {
             handshake_timeout: self.cfg.share_handshake_timeout,
@@ -1308,6 +1339,9 @@ impl Engine {
             ));
         }
         drop(guard);
+        // Devices opened before sharing started are authorized for this
+        // instance now that the allowlist exists.
+        self.refresh_shared_instances(&prepared.session);
         Ok(ResponseData::ShareStarted(prepared.info))
     }
 
@@ -1324,31 +1358,9 @@ impl Engine {
     }
 
     fn revoke_remote_writes(&self) {
-        let remote_ids: HashSet<u64> = self
-            .clients
-            .lock()
-            .expect("clients lock")
-            .iter()
-            .filter(|(_, record)| record.remote.is_some())
-            .map(|(id, _)| *id)
-            .collect();
-        if remote_ids.is_empty() {
-            return;
-        }
-        let mut state = self.state.lock().expect("state lock");
-        for device in state.devices.values_mut() {
-            for client in device
-                .clients
-                .keys()
-                .filter(|client| remote_ids.contains(client))
-            {
-                *device
-                    .write_epochs
-                    .lock()
-                    .expect("write epochs lock")
-                    .entry(*client)
-                    .or_insert(0) += 1;
-            }
+        let state = self.state.lock().expect("state lock");
+        for device in state.devices.values() {
+            device.write_epoch.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -1374,7 +1386,20 @@ impl Engine {
         }
         for path in &params.devices {
             let identity = self.detected_device(path)?;
-            session.check(identity)?;
+            let canonical = identity.canonical.clone();
+            session.check(identity.clone())?;
+            // A device already open when it is checked is authorized for this
+            // instance without reopening it.
+            if let Some(device) = self
+                .state
+                .lock()
+                .expect("state lock")
+                .devices
+                .values_mut()
+                .find(|device| device.path == canonical)
+            {
+                device.shared = Some(identity);
+            }
         }
         Ok(ResponseData::Sharing(session.snapshot()))
     }
@@ -1396,6 +1421,16 @@ impl Engine {
                     .filter(|(_, device)| device.path == identity.canonical)
                     .map(|(id, _)| *id)
                     .collect();
+                // Invalidate queued remote writes for this device even when
+                // their client has already detached.
+                {
+                    let state = self.state.lock().expect("state lock");
+                    for device_id in &device_ids {
+                        if let Some(device) = state.devices.get(device_id) {
+                            device.write_epoch.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                }
                 // Revoke immediately: detach remote clients and fail their
                 // pending work. Local clients and other devices are untouched.
                 self.detach_remote_clients(&device_ids, "device was unshared");
@@ -1478,9 +1513,18 @@ impl Engine {
             Request::Ping => Ok(ResponseData::Pong),
             Request::ListDevices => {
                 let mut devices = self.list_devices();
-                devices
-                    .devices
-                    .retain(|device| session.allows_path(&device.path));
+                devices.devices.retain(|device| match device.device_id {
+                    // An open instance is visible only if it was authorized
+                    // for sharing when it opened.
+                    Some(device_id) => self
+                        .state
+                        .lock()
+                        .expect("state lock")
+                        .devices
+                        .get(&device_id)
+                        .is_some_and(|open| open.shared.is_some()),
+                    None => session.authorize(&device.path).is_ok(),
+                });
                 Ok(ResponseData::Devices(devices))
             }
             Request::Open(params) => {
@@ -1613,14 +1657,9 @@ impl Engine {
                             },
                         });
                     }
-                    // Drop this remote client's queued, not-yet-started writes.
-                    // The write already in the writer finishes (no rollback).
-                    *device
-                        .write_epochs
-                        .lock()
-                        .expect("write epochs lock")
-                        .entry(client)
-                        .or_insert(0) += 1;
+                    // Drop every queued, not-yet-started remote write for this
+                    // device. The write already in the writer finishes.
+                    device.write_epoch.fetch_add(1, Ordering::SeqCst);
                     if device
                         .control
                         .as_ref()
@@ -1735,16 +1774,13 @@ impl Engine {
             return session.is_vacated(path);
         }
         match event.device_id() {
-            Some(device_id) => {
-                let path = self
-                    .state
-                    .lock()
-                    .expect("state lock")
-                    .devices
-                    .get(&device_id)
-                    .map(|device| device.path.clone());
-                path.is_some_and(|path| session.allows_path(&path))
-            }
+            Some(device_id) => self
+                .state
+                .lock()
+                .expect("state lock")
+                .devices
+                .get(&device_id)
+                .is_some_and(|device| device.shared.is_some() && session.allows_path(&device.path)),
             None => true,
         }
     }
