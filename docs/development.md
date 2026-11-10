@@ -98,7 +98,14 @@ settings page on the right with mouse and keyboard Save/Cancel, a failed save
 leaving the options unchanged, a dirty draft surviving a resize and refusing
 device opening, explicit disconnect and an unplug leaving the other session
 usable, literal `Ctrl+]`, `Tab`/arrows/`Ctrl+Q` forwarding, an AI client writing
-beside the human, local echo off, scrollback off, and `Ctrl+Q` quitting.
+beside the human, local echo off, scrollback off clearing every session's kept
+rows (also while it is off) without them returning when it is turned back on,
+and `Ctrl+Q` quitting. It joins both devices before resizing, so both sessions
+are shown to survive with their own output and keys.
+
+The PTY fixtures pre-open their devices, so opening a closed device through the
+baud prompt, device discovery, and a hand-edited invalid settings file staying
+untouched are covered at the app and client/core seams, not through this PTY.
 
 `serial-nexus-mcp` additionally has end-to-end tests over real MCP stdio framing:
 handshake and tool listing, protocol errors, default and joined baud, rejected

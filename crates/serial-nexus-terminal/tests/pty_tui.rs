@@ -326,6 +326,97 @@ fn two_devices_keep_their_own_scrollback() {
 }
 
 #[test]
+fn scrollback_off_clears_kept_rows_for_every_session() {
+    let mut fixture = Fixture::new();
+    let first_path = fixture.first.path.clone();
+    let second_path = fixture.second.path.clone();
+    let mut tui = fixture.tui();
+    tui.wait_for_text("Devices (");
+
+    // Two sessions with identifiable rows already scrolled off the live view.
+    open_device(&mut tui, &first_path);
+    wait_for_shown(&mut tui, &first_path);
+    for line in 0..30 {
+        fixture
+            .first
+            .write(format!("OLD-A{line:02}\r\n").as_bytes());
+    }
+    tui.wait_for_text("OLD-A29");
+    tui.send(KEY_CTRL_BRACKET);
+    tui.wait_for_text("focus: sidebar");
+    open_device(&mut tui, &second_path);
+    wait_for_shown(&mut tui, &second_path);
+    for line in 0..30 {
+        fixture
+            .second
+            .write(format!("OLD-B{line:02}\r\n").as_bytes());
+    }
+    tui.wait_for_text("OLD-B29");
+
+    // Turn scrollback off; both sessions' kept rows are freed.
+    tui.send(KEY_CTRL_BRACKET);
+    tui.wait_for_text("focus: sidebar");
+    tui.click(3, tui.rows() - 3);
+    tui.wait_for_text("focus: settings");
+    tui.send(KEY_DOWN);
+    tui.send_text(" ");
+    wait_flag(&mut tui, "Scrollback", "off");
+    tui.send(KEY_CTRL_S);
+    tui.wait_for_text("settings saved");
+    tui.wait_for_text("focus: stream");
+
+    // Output while off is not kept either: it only lives on the screen.
+    for line in 0..30 {
+        fixture
+            .first
+            .write(format!("OFF-A{line:02}\r\n").as_bytes());
+        fixture
+            .second
+            .write(format!("OFF-B{line:02}\r\n").as_bytes());
+    }
+    tui.wait_for_text("OFF-B29");
+
+    // Scrollback on again: the old rows must not come back.
+    tui.send(KEY_CTRL_BRACKET);
+    tui.wait_for_text("focus: sidebar");
+    tui.click(3, tui.rows() - 3);
+    tui.wait_for_text("focus: settings");
+    tui.send(KEY_DOWN);
+    tui.send_text(" ");
+    wait_flag(&mut tui, "Scrollback", "on");
+    tui.send(KEY_CTRL_S);
+    tui.wait_for_text("settings saved");
+    tui.wait_for_text("focus: stream");
+
+    // The second session (shown) kept nothing from before or during the off
+    // period beyond what still fits on its live screen.
+    tui.send(KEY_CTRL_BRACKET);
+    tui.wait_for_text("focus: sidebar");
+    tui.send_text("b");
+    tui.wait_for_text("focus: scrollback");
+    tui.send(KEY_PAGE_UP);
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(!tui.text().contains("OLD-B"), "{}", tui.text());
+    assert!(!tui.text().contains("OFF-B00"), "{}", tui.text());
+    tui.send(KEY_ESC);
+    tui.wait_for_text("focus: stream");
+
+    // The first session is the same: nothing was retained for it.
+    tui.send(KEY_CTRL_BRACKET);
+    tui.wait_for_text("focus: sidebar");
+    open_device(&mut tui, &first_path);
+    wait_for_shown(&mut tui, &first_path);
+    tui.send(KEY_CTRL_BRACKET);
+    tui.wait_for_text("focus: sidebar");
+    tui.send_text("b");
+    tui.wait_for_text("focus: scrollback");
+    tui.send(KEY_PAGE_UP);
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(!tui.text().contains("OLD-A"), "{}", tui.text());
+    assert!(!tui.text().contains("OFF-A00"), "{}", tui.text());
+}
+
+#[test]
 fn ctrl_bracket_and_narrow_resize_keep_the_sessions_and_scrollback() {
     let mut fixture = Fixture::new();
     let first_path = fixture.first.path.clone();
@@ -333,12 +424,25 @@ fn ctrl_bracket_and_narrow_resize_keep_the_sessions_and_scrollback() {
     let mut tui = fixture.tui();
     tui.wait_for_text("Devices (");
 
+    // Both devices are joined by the terminal itself before the resize.
     open_device(&mut tui, &first_path);
     wait_for_shown(&mut tui, &first_path);
     for line in 0..30 {
         fixture.first.write(format!("A{line:02}\r\n").as_bytes());
     }
     tui.wait_for_text("A29");
+    tui.send(KEY_CTRL_BRACKET);
+    tui.wait_for_text("focus: sidebar");
+    open_device(&mut tui, &second_path);
+    wait_for_shown(&mut tui, &second_path);
+    for line in 0..30 {
+        fixture.second.write(format!("B{line:02}\r\n").as_bytes());
+    }
+    tui.wait_for_text("B29");
+    tui.send(KEY_CTRL_BRACKET);
+    tui.wait_for_text("focus: sidebar");
+    open_device(&mut tui, &first_path);
+    wait_for_shown(&mut tui, &first_path);
 
     // The sidebar's `b` opens the kept rows; scroll back a little.
     tui.send(KEY_CTRL_BRACKET);
@@ -377,16 +481,27 @@ fn ctrl_bracket_and_narrow_resize_keep_the_sessions_and_scrollback() {
     tui.resize(ROWS, COLS);
     tui.wait_until("both panes again", |text| text.contains('│'));
     assert_eq!(stream_row(&tui, 1), top, "the scroll position is unchanged");
-    assert!(
-        tui.text().contains(&second_path),
-        "the other session is still open"
-    );
 
-    // Leaving the scrollback returns to the live stream of the same device.
+    // Both sessions survived: each still has its own output and answers keys.
     tui.send(KEY_ESC);
     tui.wait_for_text("focus: stream");
     tui.send_text("k");
     fixture.first.read_until(b"k", STEP);
+    tui.send(KEY_CTRL_BRACKET);
+    tui.wait_for_text("focus: sidebar");
+    open_device(&mut tui, &second_path);
+    wait_for_shown(&mut tui, &second_path);
+    tui.wait_for_text("B29");
+    tui.send(KEY_CTRL_BRACKET);
+    tui.wait_for_text("focus: sidebar");
+    tui.send_text("b");
+    tui.wait_for_text("focus: scrollback");
+    tui.send(KEY_PAGE_UP);
+    tui.wait_for_text("B00");
+    tui.send(KEY_ESC);
+    tui.wait_for_text("focus: stream");
+    tui.send_text("s");
+    fixture.second.read_until(b"s", STEP);
 }
 
 #[test]
@@ -412,6 +527,7 @@ fn settings_open_on_the_right_and_mouse_and_keyboard_save_and_cancel_work() {
     tui.send_text(" ");
     wait_flag(&mut tui, "Local echo", "off");
     tui.send(KEY_CTRL_BRACKET);
+    tui.wait_for_text("focus: sidebar");
     tui.resize(20, 40);
     tui.wait_until("the narrow sidebar", |text| {
         text.contains("Devices (") && !text.contains('│')
