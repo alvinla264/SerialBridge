@@ -73,7 +73,8 @@ configuration details.
 - **serial-nexus-core** owns devices and enforces one AI writer per device, while
   allowing multiple readers and human writes.
 - **serial-nexus-mcp** exposes devices to an AI host through MCP tool calls.
-- **serial-nexus-terminal** provides the human terminal and device sidebar.
+- **serial-nexus-terminal** provides the human terminal: a device sidebar
+  beside the live stream of the device you are watching.
 - **serial-nexus-client** and **serial-nexus-protocol** share the core interface
   and communication types.
 

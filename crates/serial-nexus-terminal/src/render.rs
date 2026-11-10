@@ -4,6 +4,11 @@
 //! One layout function decides where everything sits, including the cells the
 //! mouse can click, so drawing, resizing the stream screen and hit testing
 //! always agree.
+//!
+//! At a usable width the sidebar and the right pane are drawn side by side:
+//! the sidebar on the left, the shown device's stream (or its scrollback, or
+//! the settings) on the right. A narrow terminal cannot show both, so it shows
+//! the focused pane and `Ctrl+]` switches which one that is.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -11,13 +16,22 @@ use ratatui::style::{Color as RColor, Modifier, Style as RStyle};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::screen::{Color, Style};
-use crate::state::{AppState, Severity, View, SETTINGS_ROWS};
+use crate::state::{AppState, Focus, Severity, View, SETTINGS_ROWS};
+
+/// The sidebar's preferred narrowest width when both panes are shown.
+pub const MIN_SIDEBAR_WIDTH: u16 = 20;
+/// The right pane needs this much room to be usable next to the sidebar.
+pub const MIN_RIGHT_WIDTH: u16 = 40;
+/// The sidebar never grows past this, however wide the terminal is.
+pub const MAX_SIDEBAR_WIDTH: u16 = 36;
+/// The column between the two panes.
+const SEPARATOR_WIDTH: u16 = 1;
 
 /// Where each part of the interface sits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Chrome {
     pub header: Rect,
-    /// The area the stream view, the sidebar or the settings use.
+    /// The area the panes share: the sidebar and the right pane.
     pub main: Rect,
     /// One or two rows at the bottom: the status line and the key hints.
     pub footer: Rect,
@@ -58,12 +72,65 @@ pub fn chrome(area: Rect) -> Chrome {
     }
 }
 
-/// The stream's drawing area. The sidebar hides while the stream is shown, so
-/// the stream gets the whole main area; sessions are sized to it even when
-/// another view is on screen.
-pub fn stream_body_area(area: Rect) -> Option<Rect> {
+/// Where the sidebar and the right pane sit in this terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Panes {
+    /// Whether both panes are shown. When false, the sidebar and right rects
+    /// are the same full area and only the focused one is drawn.
+    pub split: bool,
+    pub sidebar: Rect,
+    /// The right pane: the stream's drawing area, or the settings/scrollback.
+    /// It keeps this size even when a narrow terminal hides it, so moving the
+    /// focus or resizing never reshapes a session's screen.
+    pub right: Rect,
+    pub separator: Option<Rect>,
+}
+
+/// Compute the panes for `area`, independently of which pane has the focus.
+pub fn panes(area: Rect) -> Panes {
     let main = chrome(area).main;
-    (main.width > 0 && main.height > 0).then_some(main)
+    if main.width == 0 || main.height == 0 {
+        let empty = Rect::new(main.x, main.y, 0, 0);
+        return Panes {
+            split: false,
+            sidebar: empty,
+            right: empty,
+            separator: None,
+        };
+    }
+    if main.width < MIN_SIDEBAR_WIDTH + SEPARATOR_WIDTH + MIN_RIGHT_WIDTH {
+        return Panes {
+            split: false,
+            sidebar: main,
+            right: main,
+            separator: None,
+        };
+    }
+    let room = main.width.saturating_sub(MIN_RIGHT_WIDTH + SEPARATOR_WIDTH);
+    let width = (main.width / 3)
+        .clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH)
+        .min(room);
+    let sidebar = Rect::new(main.x, main.y, width, main.height);
+    let separator = Rect::new(main.x + width, main.y, SEPARATOR_WIDTH, main.height);
+    let right = Rect::new(
+        separator.x + SEPARATOR_WIDTH,
+        main.y,
+        main.width - width - SEPARATOR_WIDTH,
+        main.height,
+    );
+    Panes {
+        split: true,
+        sidebar,
+        right,
+        separator: Some(separator),
+    }
+}
+
+/// The stream's drawing area: the right pane, whatever has the focus. Sessions
+/// are sized to it even when a narrow terminal is showing the sidebar.
+pub fn stream_body_area(area: Rect) -> Option<Rect> {
+    let right = panes(area).right;
+    (right.width > 0 && right.height > 0).then_some(right)
 }
 
 /// The sidebar's rows: a title, the device list, and the Settings button.
@@ -74,16 +141,16 @@ pub struct Sidebar {
     pub button: Rect,
 }
 
-/// Where the sidebar puts its parts, or `None` when there is no room.
-pub fn sidebar(area: Rect) -> Option<Sidebar> {
-    let main = chrome(area).main;
-    if main.height < 2 || main.width < 8 {
+/// Where the sidebar puts its parts inside `rect`, or `None` when there is no
+/// room.
+pub fn sidebar(rect: Rect) -> Option<Sidebar> {
+    if rect.height < 2 || rect.width < 8 {
         return None;
     }
-    let title = Rect::new(main.x, main.y, main.width, 1);
-    let button = Rect::new(main.x, main.y + main.height - 1, main.width, 1);
-    let list_height = main.height - 2;
-    let list = Rect::new(main.x, main.y + 1, main.width, list_height);
+    let title = Rect::new(rect.x, rect.y, rect.width, 1);
+    let button = Rect::new(rect.x, rect.y + rect.height - 1, rect.width, 1);
+    let list_height = rect.height - 2;
+    let list = Rect::new(rect.x, rect.y + 1, rect.width, list_height);
     Some(Sidebar {
         title,
         list,
@@ -93,7 +160,7 @@ pub fn sidebar(area: Rect) -> Option<Sidebar> {
 
 /// The Settings button's row, for the mouse and for tests.
 pub fn settings_button(area: Rect) -> Option<Rect> {
-    sidebar(area).map(|sidebar| sidebar.button)
+    sidebar(panes(area).sidebar).map(|sidebar| sidebar.button)
 }
 
 /// The settings view's parts: a title, the flag rows, a bar with the Save and
@@ -116,36 +183,36 @@ pub enum SettingsHit {
     Cancel,
 }
 
-/// Where the settings view puts its parts, or `None` when there is no room.
-/// The Save and Cancel buttons get their own row: the settings are only kept
-/// by an explicit action, so it is always visible when the view is drawn.
-pub fn settings_layout(area: Rect) -> Option<SettingsLayout> {
-    let main = chrome(area).main;
-    if main.height < 2 || main.width < 12 {
+/// Where the settings view puts its parts inside the right pane, or `None`
+/// when there is no room. The Save and Cancel buttons get their own row: the
+/// settings are only kept by an explicit action, so it is always visible when
+/// the view is drawn.
+pub fn settings_layout(right: Rect) -> Option<SettingsLayout> {
+    if right.height < 2 || right.width < 12 {
         return None;
     }
-    let hint_height = if main.height >= 5 { 1 } else { 0 };
+    let hint_height = if right.height >= 5 { 1 } else { 0 };
     // A title and a bar of buttons do not both fit in a very short area: the
     // flags and the Save button win, the title gives way first.
-    let title_height = if main.height >= 4 { 1 } else { 0 };
-    let title = Rect::new(main.x, main.y, main.width, title_height);
+    let title_height = if right.height >= 4 { 1 } else { 0 };
+    let title = Rect::new(right.x, right.y, right.width, title_height);
     let bar = Rect::new(
-        main.x,
-        main.y + main.height - 1 - hint_height,
-        main.width,
+        right.x,
+        right.y + right.height - 1 - hint_height,
+        right.width,
         1,
     );
     let hints = Rect::new(
-        main.x,
-        main.y + main.height - hint_height,
-        main.width,
+        right.x,
+        right.y + right.height - hint_height,
+        right.width,
         hint_height,
     );
     let rows = Rect::new(
-        main.x,
-        main.y + title_height,
-        main.width,
-        main.height - title_height - 1 - hint_height,
+        right.x,
+        right.y + title_height,
+        right.width,
+        right.height - title_height - 1 - hint_height,
     );
     // `[ Save ]` first, then `[ Cancel ]`, both wide enough to read.
     let save_width = 8;
@@ -168,14 +235,14 @@ pub fn settings_layout(area: Rect) -> Option<SettingsLayout> {
     })
 }
 
-/// Hit test one click in the settings view.
+/// Hit test one click in the settings view, which the right pane holds.
 pub fn settings_hit_test(
     state: &AppState,
-    area: Rect,
+    right: Rect,
     column: u16,
     row: u16,
 ) -> Option<SettingsHit> {
-    let layout = settings_layout(area)?;
+    let layout = settings_layout(right)?;
     if in_rect(layout.save, column, row) {
         return Some(SettingsHit::Save);
     }
@@ -207,9 +274,15 @@ pub enum Hit {
     Settings,
 }
 
-/// Hit test one click against the sidebar as it is drawn.
+/// Hit test one click against the sidebar as it is drawn. The sidebar takes
+/// clicks when it is split beside the right pane, or when it is the focused
+/// pane of a narrow terminal.
 pub fn hit_test(state: &AppState, area: Rect, column: u16, row: u16) -> Option<Hit> {
-    let sidebar = sidebar(area)?;
+    let panes = panes(area);
+    if !panes.split && state.focus != Focus::Sidebar {
+        return None;
+    }
+    let sidebar = sidebar(panes.sidebar)?;
     if in_rect(sidebar.button, column, row) {
         return Some(Hit::Settings);
     }
@@ -221,7 +294,7 @@ pub fn hit_test(state: &AppState, area: Rect, column: u16, row: u16) -> Option<H
     (index < state.devices.len()).then_some(Hit::Device(index))
 }
 
-/// The first device index the list shows, so the selection stays in view.
+/// The first device index the list shows, so the highlight stays in view.
 fn first_device_row(state: &AppState, sidebar: Sidebar) -> usize {
     let capacity = sidebar.list.height.max(1) as usize;
     if state.selected >= capacity {
@@ -244,13 +317,49 @@ pub fn render(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16,
     }
     let chrome = chrome(area);
     draw_header(state, buffer, chrome.header);
-    let cursor = match state.view {
-        View::Stream | View::Scrollback => draw_stream(state, buffer, chrome.main),
-        View::Devices => draw_sidebar(state, buffer, area),
-        View::Settings => draw_settings(state, buffer, area),
+    let panes = panes(area);
+    let cursor = if panes.split {
+        let sidebar_cursor = draw_sidebar(state, buffer, panes.sidebar);
+        draw_separator(state, buffer, panes.separator);
+        let right_cursor = draw_right(state, buffer, panes.right);
+        if state.focus == Focus::Sidebar {
+            sidebar_cursor
+        } else {
+            right_cursor
+        }
+    } else {
+        match state.focus {
+            Focus::Sidebar => draw_sidebar(state, buffer, panes.sidebar),
+            Focus::Right => draw_right(state, buffer, panes.right),
+        }
     };
     draw_footer(state, buffer, chrome.footer);
     cursor
+}
+
+/// The right pane holds the stream, its scrollback, or the settings.
+fn draw_right(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16, u16)> {
+    match state.view {
+        View::Stream => draw_stream(state, buffer, area),
+        View::Scrollback => draw_stream(state, buffer, area),
+        View::Settings => draw_settings(state, buffer, area),
+    }
+}
+
+fn draw_separator(state: &AppState, buffer: &mut Buffer, separator: Option<Rect>) {
+    let Some(separator) = separator else {
+        return;
+    };
+    let style = if state.focus == Focus::Right {
+        RStyle::default()
+            .fg(RColor::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        dim()
+    };
+    for row in 0..separator.height {
+        put_cell(buffer, separator.x, separator.y + row, "│", style);
+    }
 }
 
 fn draw_header(state: &AppState, buffer: &mut Buffer, area: Rect) {
@@ -260,12 +369,12 @@ fn draw_header(state: &AppState, buffer: &mut Buffer, area: Rect) {
     let device = state.shown_device();
     let path = device
         .map(|device| device.path.as_str())
-        .unwrap_or("no device selected");
+        .unwrap_or("no device shown");
     let baud = device
         .and_then(|device| device.baud)
         .map(|baud| baud.to_string())
         .unwrap_or_else(|| "-".to_string());
-    let session = state.selected_session();
+    let session = state.shown_session();
     let control = session
         .and_then(|session| session.control.as_deref())
         .or_else(|| device.and_then(|device| device.control.as_deref()))
@@ -275,11 +384,11 @@ fn draw_header(state: &AppState, buffer: &mut Buffer, area: Rect) {
     } else {
         "detached"
     };
-    let view = match state.view {
-        View::Devices => "sidebar",
-        View::Stream => "stream",
-        View::Settings => "settings",
-        View::Scrollback => "scrollback",
+    let view = match (state.focus, state.view) {
+        (Focus::Sidebar, _) => "focus: sidebar",
+        (Focus::Right, View::Stream) => "focus: stream",
+        (Focus::Right, View::Settings) => "focus: settings",
+        (Focus::Right, View::Scrollback) => "focus: scrollback",
     };
 
     let brand = " SerialNexus ";
@@ -312,24 +421,33 @@ fn draw_header(state: &AppState, buffer: &mut Buffer, area: Rect) {
         RStyle::default().add_modifier(Modifier::BOLD),
     );
     if hint_fits {
+        let style = if state.focus == Focus::Right {
+            RStyle::default()
+                .fg(RColor::Black)
+                .bg(RColor::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            dim()
+        };
         put(
             buffer,
             Rect::new(area.x + area.width - right_width, area.y, right_width, 1),
             0,
             &right,
-            dim(),
+            style,
         );
     }
 }
 
 /// The sidebar: every device, then the Settings button, then room for more
-/// devices than fit.
-fn draw_sidebar(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16, u16)> {
-    let sidebar = sidebar(area)?;
+/// devices than fit. The highlighted row and the row shown in the right pane
+/// are marked differently, so choosing a row never looks like switching.
+fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u16, u16)> {
+    let sidebar = sidebar(rect)?;
     let list = sidebar.list;
-    // With no room for a device row, the title row carries the selected device
-    // instead, so the cursor never points at the Settings button while a
-    // device owns the keys.
+    // With no room for a device row, the title row carries the highlighted
+    // device instead, so the cursor never points at the Settings button while
+    // a device owns the keys.
     let title = if list.height == 0 && !state.settings_button_selected() {
         match state.selected_device() {
             Some(device) => format!("› {} ", device.path),
@@ -338,10 +456,16 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u1
     } else {
         format!(" Devices ({}) ", state.devices.len())
     };
-    let title_style = RStyle::default()
-        .fg(RColor::Black)
-        .bg(RColor::Cyan)
-        .add_modifier(Modifier::BOLD);
+    let title_style = if state.focus == Focus::Sidebar {
+        RStyle::default()
+            .fg(RColor::Black)
+            .bg(RColor::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        RStyle::default()
+            .fg(RColor::Cyan)
+            .add_modifier(Modifier::BOLD)
+    };
     put(buffer, sidebar.title, 0, &title, title_style);
     if state.devices.is_empty() && list.height > 0 {
         put(
@@ -352,6 +476,7 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u1
             dim(),
         );
     }
+    let shown = state.shown_device().map(|device| device.path.clone());
     let first = first_device_row(state, sidebar);
     for (offset, (index, device)) in state.devices.iter().enumerate().skip(first).enumerate() {
         if offset >= list.height as usize {
@@ -360,7 +485,15 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u1
         let y = list.y + offset as u16;
         let row = Rect::new(list.x, y, list.width, 1);
         let selected = index == state.selected;
-        let marker = if selected { "›" } else { " " };
+        let shown_here = shown.as_deref() == Some(device.path.as_str());
+        // `▸` is the row both highlighted and shown, `›` only highlighted,
+        // `▹` only shown.
+        let marker = match (selected, shown_here) {
+            (true, true) => "▸",
+            (true, false) => "›",
+            (false, true) => "▹",
+            (false, false) => " ",
+        };
         let dot = if device.open { "●" } else { "○" };
         let label = format!("{marker} {dot} {}", device.path);
         let attached = state
@@ -386,7 +519,17 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u1
         if let Some(description) = &device.description {
             status.push_str(&format!(" · {description}"));
         }
-        draw_row(buffer, row, &label, &status, highlighted(selected));
+        // The shown device is legible even when the highlight is elsewhere.
+        let style = if selected {
+            highlighted(true)
+        } else if shown_here {
+            RStyle::default()
+                .fg(RColor::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            RStyle::default()
+        };
+        draw_row(buffer, row, &label, &status, style);
     }
 
     // The Settings button is a real row: selected with the arrow keys and
@@ -412,36 +555,31 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u1
         // The device is shown on the title row when no device row fits.
         Some((sidebar.title.x + 1, sidebar.title.y))
     } else {
-        // The selected device row, which the list has kept in view.
+        // The highlighted device row, which the list has kept in view.
         let offset = state.selected.saturating_sub(first) as u16;
         Some((list.x + 1, list.y + offset))
     }
 }
 
-/// The settings view in the terminal area: the two flags, edited as a draft.
+/// The settings view in the right pane: the two flags, edited as a draft.
 fn draw_settings(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16, u16)> {
     let Some(layout) = settings_layout(area) else {
         // No room for buttons: still say how to save and leave by keyboard.
-        put(
-            buffer,
-            chrome(area).main,
-            0,
-            " Esc closes · Ctrl+S saves ",
-            dim(),
-        );
+        put(buffer, area, 0, " Esc closes · Ctrl+S saves ", dim());
         return None;
     };
     if layout.title.height > 0 {
-        put(
-            buffer,
-            layout.title,
-            0,
-            " Settings ",
+        let title_style = if state.focus == Focus::Right {
             RStyle::default()
                 .fg(RColor::Black)
                 .bg(RColor::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+                .add_modifier(Modifier::BOLD)
+        } else {
+            RStyle::default()
+                .fg(RColor::Cyan)
+                .add_modifier(Modifier::BOLD)
+        };
+        put(buffer, layout.title, 0, " Settings ", title_style);
     }
     let first = settings_first_row(state, layout);
     let visible = layout.rows.height.max(1) as usize;
@@ -533,12 +671,12 @@ fn draw_stream(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16
     if area.height == 0 || area.width == 0 {
         return None;
     }
-    let Some(session) = state.selected_session() else {
+    let Some(session) = state.shown_session() else {
         put(
             buffer,
             area,
             1,
-            "Select a device in the sidebar and press Enter to open or join it.",
+            "Highlight a device on the left and press Enter to open or join it.",
             dim(),
         );
         return Some((area.x + 1, area.y));
@@ -563,8 +701,21 @@ fn draw_stream(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16
     if scroll > 0 || state.view == View::Scrollback {
         return None;
     }
-    // The device's own cursor, so typing happens where the device expects it.
     let (row, col) = session.screen.cursor();
+    // When the sidebar has the hardware cursor, the stream still shows where
+    // the device's live cursor is with a reversed cell.
+    if state.focus != Focus::Right {
+        let visible_row = row.min(area.height.saturating_sub(1) as usize);
+        let visible_col = col.min(area.width.saturating_sub(1) as usize);
+        let cell = session.screen.view_cell(visible_row, visible_col);
+        put_cell(
+            buffer,
+            area.x + visible_col as u16,
+            area.y + visible_row as u16,
+            &cell.ch.to_string(),
+            screen_style(cell.style).add_modifier(Modifier::REVERSED),
+        );
+    }
     Some((
         area.x + col.min(area.width.saturating_sub(1) as usize) as u16,
         area.y + row.min(area.height.saturating_sub(1) as usize) as u16,
@@ -623,7 +774,7 @@ fn draw_status(state: &AppState, buffer: &mut Buffer, area: Rect) -> bool {
     if state.view == View::Scrollback {
         // Say where the view is: the footer's hints stay the same.
         let lines = state
-            .selected_session()
+            .shown_session()
             .map(|session| session.screen.scroll())
             .unwrap_or(0);
         let text = if lines == 0 {
@@ -646,21 +797,22 @@ fn draw_status(state: &AppState, buffer: &mut Buffer, area: Rect) -> bool {
 }
 
 fn draw_hints(state: &AppState, buffer: &mut Buffer, area: Rect) {
-    let hints: String = match state.view {
-        View::Devices => {
-            " ↑/↓ select · Enter open/join · b scrollback · d disconnect · Ctrl+] stream · Ctrl+Q quit "
+    let hints: String = match (state.focus, state.view) {
+        (Focus::Sidebar, _) => {
+            " ↑/↓ · Enter/dbl-click open · b scroll · d disconnect · Ctrl+] right · Ctrl+Q quit "
                 .to_string()
         }
-        View::Stream => {
+        (Focus::Right, View::Stream) => {
             // The stream forwards every ordinary key, so Ctrl+] is the way out.
-            " Typing goes to the device (Tab and Ctrl+Q too) · Ctrl+] back to the sidebar "
-                .to_string()
+            " Typing goes to the shown device (Tab and Ctrl+Q too) · Ctrl+] sidebar ".to_string()
         }
         // The scrollback view's keys navigate; none of them reach the device.
-        View::Scrollback => {
+        (Focus::Right, View::Scrollback) => {
             " ↑/↓ line · PageUp/PageDown page · Esc back to live · Ctrl+] sidebar ".to_string()
         }
-        View::Settings => " Ctrl+S save · Esc cancel · Tab/↑↓ move · Space toggle ".to_string(),
+        (Focus::Right, View::Settings) => {
+            " Ctrl+S save · Esc cancel · Tab/↑↓ move · Space toggle ".to_string()
+        }
     };
     put(buffer, area, 0, &hints, dim());
 }
@@ -687,12 +839,9 @@ fn row_text(label: &str, value: &str, width: usize) -> String {
         line.push_str(value);
         fit(&line, width)
     } else {
-        // Too narrow for both: keep the value, clip the label.
-        let keep = width.saturating_sub(value_width + 1);
-        let mut line = fit(&clip(label, keep), keep);
-        line.push(' ');
-        line.push_str(value);
-        fit(&line, width)
+        // Too narrow for both: the label wins, and the value gives way. A
+        // sidebar this narrow must still name the device in full.
+        fit(label, width)
     }
 }
 
@@ -750,11 +899,6 @@ fn fit(text: &str, width: usize) -> String {
     out
 }
 
-/// The first `width` display columns of `text`.
-fn clip(text: &str, width: usize) -> String {
-    fit(text, width).trim_end().to_string()
-}
-
 fn display_width(text: &str) -> u16 {
     UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16
 }
@@ -794,8 +938,8 @@ fn to_ratatui(colour: Color) -> RColor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{AppState, DeviceEntry, View};
-    use serial_nexus_protocol::{Event, Source};
+    use crate::state::{AppState, DeviceEntry, Focus, View};
+    use serial_nexus_protocol::Event;
 
     fn screen(state: &AppState, width: u16, height: u16) -> Vec<String> {
         let area = Rect::new(0, 0, width, height);
@@ -822,46 +966,79 @@ mod tests {
         second.baud = Some(57_600);
         state.set_devices(vec![first, second]);
         state.add_session(7, "/dev/ttyUSB1", 57_600, None);
-        state.select_path("/dev/ttyUSB1");
         state
     }
 
     #[test]
-    fn the_sidebar_lists_devices_with_state_and_a_settings_button() {
-        let state = demo();
-        let text = screen(&state, 100, 16).join("\n");
-        assert!(text.contains("Devices (2)"), "{text}");
-        assert!(text.contains("/dev/ttyUSB0"), "{text}");
-        assert!(text.contains("/dev/ttyUSB1"), "{text}");
-        assert!(text.contains("closed"), "{text}");
-        assert!(text.contains("open 57600"), "{text}");
-        assert!(text.contains("FTDI adapter"), "{text}");
-        assert!(text.contains("[ Settings ]"), "{text}");
-    }
-
-    #[test]
-    fn the_stream_hides_the_sidebar_and_uses_the_whole_width() {
+    fn a_usable_width_shows_the_sidebar_beside_the_stream() {
         let mut state = demo();
-        state.view = View::Stream;
         state.apply_event(&Event::device_output(7, b"ready\r\n"));
-        state.apply_event(&Event::write(7, Source::Ai, b"AT+GMR\r\n"));
         let area = Rect::new(0, 0, 100, 16);
+        let panes = panes(area);
+        assert!(panes.split, "100 columns fits both panes");
+        assert_eq!(panes.sidebar.height, panes.right.height);
+        assert_eq!(panes.right.x, panes.sidebar.right() + 1);
+
         let mut buffer = Buffer::empty(area);
         render(&state, &mut buffer, area);
         let text = screen(&state, 100, 16).join("\n");
-        assert!(
-            !text.contains("Devices ("),
-            "no sidebar in the stream: {text}"
-        );
-        assert!(text.contains("ready"), "{text}");
-        assert!(text.contains("AT+GMR"), "{text}");
-        // The stream starts at the left edge, not after a sidebar.
-        assert_eq!(buffer[(0, 1)].symbol(), "r");
-        assert_eq!(chrome(area).main.height, 13, "header and footer only");
+        assert!(text.contains("Devices (2)"), "{text}");
+        assert!(text.contains("/dev/ttyUSB0"), "{text}");
+        assert!(text.contains("[ Settings ]"), "{text}");
+        assert!(text.contains("ready"), "the stream is beside it: {text}");
+        // The stream starts in the right pane, not at the screen edge.
+        assert_eq!(buffer[(panes.right.x, panes.right.y)].symbol(), "r");
     }
 
     #[test]
-    fn the_header_names_the_device_and_the_view() {
+    fn a_narrow_terminal_shows_only_the_focused_pane() {
+        let mut state = demo();
+        let area = Rect::new(0, 0, 50, 16);
+        let panes = panes(area);
+        assert!(!panes.split, "50 columns is too narrow for both panes");
+
+        // Sidebar focused: no stream on screen, the device list is.
+        let text = screen(&state, 50, 16).join("\n");
+        assert!(text.contains("Devices (2)"), "{text}");
+        assert!(!text.contains("ready"), "{text}");
+
+        // Right focused: the stream fills the pane, no sidebar.
+        state.focus = Focus::Right;
+        state.apply_event(&Event::device_output(7, b"ready\r\n"));
+        let text = screen(&state, 50, 16).join("\n");
+        assert!(text.contains("ready"), "{text}");
+        assert!(!text.contains("Devices ("), "{text}");
+    }
+
+    #[test]
+    fn the_highlighted_and_shown_rows_are_marked_differently() {
+        let mut state = demo();
+        state.select_index(0);
+        let lines = screen(&state, 100, 16);
+        let first = lines
+            .iter()
+            .find(|line| line.contains("○ /dev/ttyUSB0"))
+            .expect("first row");
+        let second = lines
+            .iter()
+            .find(|line| line.contains("● /dev/ttyUSB1"))
+            .expect("shown row");
+        assert!(first.contains('›'), "highlighted, not shown: {first:?}");
+        assert!(second.contains('▹'), "shown, not highlighted: {second:?}");
+
+        // The shown row keeps a legible marker even when it is also
+        // highlighted.
+        state.select_path("/dev/ttyUSB1");
+        let lines = screen(&state, 100, 16);
+        let second = lines
+            .iter()
+            .find(|line| line.contains("● /dev/ttyUSB1"))
+            .expect("shown row");
+        assert!(second.contains('▸'), "{second:?}");
+    }
+
+    #[test]
+    fn the_header_names_the_shown_device_and_the_focused_pane() {
         let mut state = demo();
         state.sessions.get_mut(&7).unwrap().control = Some("claude".into());
         let header = &screen(&state, 100, 16)[0];
@@ -869,34 +1046,55 @@ mod tests {
         assert!(header.contains("57600 baud"), "{header}");
         assert!(header.contains("AI control: claude"), "{header}");
         assert!(header.contains("attached"), "{header}");
-        assert!(header.contains("sidebar"), "{header}");
+        assert!(header.contains("focus: sidebar"), "{header}");
 
-        state.view = View::Stream;
-        assert!(screen(&state, 100, 16)[0].contains("stream"));
+        state.focus = Focus::Right;
+        assert!(screen(&state, 100, 16)[0].contains("focus: stream"));
     }
 
     #[test]
-    fn the_cursor_sits_on_the_device_cursor_in_the_stream() {
+    fn the_cursor_sits_on_the_device_cursor_in_the_focused_stream() {
         let mut state = demo();
-        state.view = View::Stream;
+        state.focus = Focus::Right;
         state.apply_event(&Event::device_output(7, b"boot> "));
         let area = Rect::new(0, 0, 100, 16);
         let mut buffer = Buffer::empty(area);
         let cursor = render(&state, &mut buffer, area);
-        assert_eq!(cursor, Some((6, 1)), "six columns along the first row");
+        let right = panes(area).right;
+        assert_eq!(cursor, Some((right.x + 6, right.y)), "six columns along");
     }
 
     #[test]
-    fn the_cursor_sits_on_the_selected_sidebar_row_and_the_button() {
+    fn the_live_cursor_is_visible_even_when_the_sidebar_is_focused() {
+        let mut state = demo();
+        state.apply_event(&Event::device_output(7, b"boot> "));
+        assert_eq!(state.focus, Focus::Sidebar);
+        let area = Rect::new(0, 0, 100, 16);
+        let right = panes(area).right;
+        let mut buffer = Buffer::empty(area);
+        render(&state, &mut buffer, area);
+        let cell = &buffer[(right.x + 6, right.y)];
+        assert_eq!(cell.symbol(), " ");
+        assert!(
+            cell.modifier.contains(Modifier::REVERSED),
+            "the live cursor is drawn as a reversed cell: {cell:?}"
+        );
+    }
+
+    #[test]
+    fn the_cursor_sits_on_the_highlighted_sidebar_row_and_the_button() {
         let mut state = demo();
         let area = Rect::new(0, 0, 100, 16);
         let mut buffer = Buffer::empty(area);
         let cursor = render(&state, &mut buffer, area).expect("cursor");
-        let list = sidebar(area).unwrap().list;
-        let first = first_device_row(&state, sidebar(area).unwrap());
+        let sidebar = sidebar(panes(area).sidebar).unwrap();
+        let first = first_device_row(&state, sidebar);
         assert_eq!(
             cursor,
-            (list.x + 1, list.y + (state.selected - first) as u16)
+            (
+                sidebar.list.x + 1,
+                sidebar.list.y + (state.selected - first) as u16
+            )
         );
 
         state.select_settings_button();
@@ -906,10 +1104,10 @@ mod tests {
     }
 
     #[test]
-    fn clicks_find_device_rows_and_the_settings_button() {
+    fn clicks_find_device_rows_and_the_settings_button_beside_the_stream() {
         let state = demo();
         let area = Rect::new(0, 0, 100, 16);
-        let sidebar = sidebar(area).unwrap();
+        let sidebar = sidebar(panes(area).sidebar).unwrap();
         assert_eq!(
             hit_test(&state, area, sidebar.list.x, sidebar.list.y),
             Some(Hit::Device(0))
@@ -928,6 +1126,11 @@ mod tests {
             None,
             "the header is not a control"
         );
+        assert_eq!(
+            hit_test(&state, area, panes(area).right.x, panes(area).right.y),
+            None,
+            "the right pane is not a sidebar control"
+        );
     }
 
     #[test]
@@ -939,6 +1142,10 @@ mod tests {
         assert!(text.contains("Settings"), "{text}");
         assert!(text.contains("Local echo"), "{text}");
         assert!(text.contains("Scrollback"), "{text}");
+        assert!(
+            text.contains("Devices (2)"),
+            "the sidebar stays visible while Settings is open: {text}"
+        );
         let row = text
             .lines()
             .find(|line| line.contains("Local echo"))
@@ -959,7 +1166,7 @@ mod tests {
         let area = Rect::new(0, 0, 100, 16);
         let mut buffer = Buffer::empty(area);
         let cursor = render(&state, &mut buffer, area).expect("cursor");
-        let rows = settings_layout(area).unwrap().rows;
+        let rows = settings_layout(panes(area).right).unwrap().rows;
         assert_eq!(cursor.1, rows.y);
 
         state.settings_row = 1;
@@ -968,33 +1175,36 @@ mod tests {
     }
 
     #[test]
-    fn clcks_find_the_flags_and_the_save_and_cancel_buttons() {
+    fn clicks_find_the_flags_and_the_save_and_cancel_buttons() {
         let mut state = demo();
         state.begin_settings();
         let area = Rect::new(0, 0, 100, 16);
-        let layout = settings_layout(area).unwrap();
+        let right = panes(area).right;
+        let layout = settings_layout(right).unwrap();
         assert_eq!(
-            settings_hit_test(&state, area, layout.save.x, layout.save.y),
+            settings_hit_test(&state, right, layout.save.x, layout.save.y),
             Some(SettingsHit::Save)
         );
         assert_eq!(
-            settings_hit_test(&state, area, layout.cancel.x, layout.cancel.y),
+            settings_hit_test(&state, right, layout.cancel.x, layout.cancel.y),
             Some(SettingsHit::Cancel)
         );
         assert_eq!(
-            settings_hit_test(&state, area, layout.rows.x, layout.rows.y),
+            settings_hit_test(&state, right, layout.rows.x, layout.rows.y),
             Some(SettingsHit::Flag(0))
         );
         assert_eq!(
-            settings_hit_test(&state, area, layout.rows.x, layout.rows.y + 1),
+            settings_hit_test(&state, right, layout.rows.x, layout.rows.y + 1),
             Some(SettingsHit::Flag(1))
         );
-        assert_eq!(settings_hit_test(&state, area, 0, 0), None);
+        assert_eq!(settings_hit_test(&state, right, 0, 0), None);
 
         // A very short terminal still draws the buttons when the area allows.
         let small = Rect::new(0, 0, 40, 7);
-        let layout = settings_layout(small).unwrap();
-        assert!(settings_hit_test(&state, small, layout.save.x, layout.save.y).is_some());
+        let layout = settings_layout(panes(small).right).unwrap();
+        assert!(
+            settings_hit_test(&state, panes(small).right, layout.save.x, layout.save.y).is_some()
+        );
     }
 
     #[test]
@@ -1009,7 +1219,7 @@ mod tests {
         let area = Rect::new(0, 0, 80, 6);
         let mut buffer = Buffer::empty(area);
         let cursor = render(&state, &mut buffer, area).expect("cursor");
-        let rows = settings_layout(area).unwrap().rows;
+        let rows = settings_layout(panes(area).right).unwrap().rows;
         assert!(
             cursor.1 >= rows.y && cursor.1 < rows.y + rows.height,
             "the cursor stays on a flag row, not the hints: {cursor:?}"
@@ -1022,7 +1232,7 @@ mod tests {
     }
 
     #[test]
-    fn a_four_row_sidebar_shows_the_selected_device_under_the_cursor() {
+    fn a_four_row_sidebar_shows_the_highlighted_device_under_the_cursor() {
         let state = demo();
         let area = Rect::new(0, 0, 80, 4);
         let mut buffer = Buffer::empty(area);
@@ -1032,7 +1242,7 @@ mod tests {
             .collect();
         assert!(
             row.contains(&state.devices[state.selected].path),
-            "the cursor row names the selected device: {row:?}"
+            "the cursor row names the highlighted device: {row:?}"
         );
         assert!(!row.contains("[ Settings ]"), "{row:?}");
     }
@@ -1045,7 +1255,7 @@ mod tests {
         let area = Rect::new(0, 0, 80, 4);
         let mut buffer = Buffer::empty(area);
         let cursor = render(&state, &mut buffer, area).expect("cursor");
-        let rows = settings_layout(area).unwrap().rows;
+        let rows = settings_layout(panes(area).right).unwrap().rows;
         assert!(
             cursor.1 >= rows.y && cursor.1 < rows.y + rows.height,
             "the cursor is on a flag row, not the footer: {cursor:?}"
@@ -1057,8 +1267,9 @@ mod tests {
     }
 
     #[test]
-    fn the_scrollback_view_draws_the_kept_rows_and_says_where_it_is() {
+    fn the_scrollback_view_draws_the_kept_rows_in_the_right_pane() {
         let mut state = demo();
+        state.focus = Focus::Right;
         state.view = View::Scrollback;
         state.resize(4, 40);
         for index in 0..8u8 {
@@ -1068,7 +1279,10 @@ mod tests {
         let live = screen(&state, 100, 7).join("\n");
         assert!(live.contains("line7"), "{live}");
         assert!(live.contains("At the live screen"), "{live}");
-        assert!(live.contains("scrollback"), "{live}");
+        assert!(
+            live.contains("Devices (2)"),
+            "the sidebar is still beside the scrollback: {live}"
+        );
 
         let history = state.sessions.get(&7).unwrap().screen.history_len();
         assert!(history > 0, "the rows above the live view were kept");
@@ -1088,7 +1302,7 @@ mod tests {
     #[test]
     fn the_cursor_is_hidden_in_the_scrollback_view() {
         let mut state = demo();
-        state.view = View::Stream;
+        state.focus = Focus::Right;
         state.resize(4, 40);
         state.apply_event(&Event::device_output(
             7,
@@ -1109,9 +1323,9 @@ mod tests {
     #[test]
     fn the_scrollback_hints_name_its_keys_and_the_stream_keeps_its_own() {
         let mut state = demo();
-        state.view = View::Stream;
+        state.focus = Focus::Right;
         let stream = screen(&state, 100, 16).join("\n");
-        assert!(stream.contains("Ctrl+] back to the sidebar"), "{stream}");
+        assert!(stream.contains("Ctrl+] sidebar"), "{stream}");
         assert!(!stream.contains("Shift+PageUp"), "{stream}");
 
         state.view = View::Scrollback;
@@ -1123,9 +1337,9 @@ mod tests {
     #[test]
     fn both_the_scroll_and_the_way_out_stay_readable_in_80_columns() {
         let mut state = demo();
-        state.view = View::Stream;
+        state.focus = Focus::Right;
         let stream = screen(&state, 80, 24).join("\n");
-        assert!(stream.contains("Ctrl+] back to the sidebar"), "{stream}");
+        assert!(stream.contains("Ctrl+] sidebar"), "{stream}");
 
         state.view = View::Scrollback;
         let scrollback = screen(&state, 80, 24).join("\n");
@@ -1135,16 +1349,14 @@ mod tests {
     }
 
     #[test]
-    fn the_footer_hints_match_the_view() {
+    fn the_footer_hints_match_the_focused_pane() {
         let mut state = demo();
         let sidebar_hints = screen(&state, 100, 16).join("\n");
         assert!(sidebar_hints.contains("Ctrl+Q quit"), "{sidebar_hints}");
-        state.view = View::Stream;
+        assert!(sidebar_hints.contains("dbl-click open"), "{sidebar_hints}");
+        state.focus = Focus::Right;
         let stream_hints = screen(&state, 100, 16).join("\n");
-        assert!(
-            stream_hints.contains("Ctrl+] back to the sidebar"),
-            "{stream_hints}"
-        );
+        assert!(stream_hints.contains("Ctrl+] sidebar"), "{stream_hints}");
         assert!(!stream_hints.contains("Shift+PageUp"), "{stream_hints}");
         assert!(!stream_hints.contains("Ctrl+Q quit"), "{stream_hints}");
         state.begin_settings();
@@ -1155,7 +1367,7 @@ mod tests {
     #[test]
     fn a_notice_leads_the_footer_and_stays_out_of_the_stream() {
         let mut state = demo();
-        state.view = View::Stream;
+        state.focus = Focus::Right;
         state.notice = Some(crate::state::Notice::error("write failed"));
         let area = Rect::new(0, 0, 100, 16);
         let footer_top = (area.y + area.height - chrome(area).footer.height) as usize;
@@ -1181,7 +1393,7 @@ mod tests {
     }
 
     #[test]
-    fn the_sidebar_scrolls_to_keep_the_selection_visible() {
+    fn the_sidebar_scrolls_to_keep_the_highlight_visible() {
         let mut state = AppState::new(12, 40);
         state.set_devices(
             (0..12)
@@ -1198,7 +1410,7 @@ mod tests {
     #[test]
     fn a_short_terminal_keeps_the_stream_and_one_footer_row() {
         let mut state = demo();
-        state.view = View::Stream;
+        state.focus = Focus::Right;
         state.notice = Some(crate::state::Notice::error("boom"));
         let lines = screen(&state, 100, 5);
         assert!(lines[0].contains("SerialNexus"), "{lines:?}");
@@ -1213,20 +1425,21 @@ mod tests {
         let state = AppState::new(12, 40);
         let text = screen(&state, 100, 16).join("\n");
         assert!(text.contains("no serial devices"), "{text}");
-        assert!(text.contains("no device selected"), "{text}");
+        assert!(text.contains("no device shown"), "{text}");
         assert!(text.contains("[ Settings ]"), "{text}");
     }
 
     #[test]
     fn screen_cells_keep_the_device_style() {
         let mut state = demo();
-        state.view = View::Stream;
+        state.focus = Focus::Right;
         state.apply_event(&Event::device_output(7, b"\x1b[31mR\x1b[0mN"));
         let area = Rect::new(0, 0, 100, 16);
+        let right = panes(area).right;
         let mut buffer = Buffer::empty(area);
         render(&state, &mut buffer, area);
-        assert_eq!(buffer[(0, 1)].symbol(), "R");
-        assert_eq!(buffer[(0, 1)].fg, RColor::Indexed(1));
+        assert_eq!(buffer[(right.x, right.y)].symbol(), "R");
+        assert_eq!(buffer[(right.x, right.y)].fg, RColor::Indexed(1));
     }
 
     #[test]
@@ -1237,8 +1450,8 @@ mod tests {
         )]);
         let header = &screen(&state, 60, 10)[0];
         assert!(
-            !header.contains("sidebar"),
-            "the view hint gives way: {header:?}"
+            !header.contains("focus: sidebar"),
+            "the focus hint gives way: {header:?}"
         );
 
         let mut state = demo();

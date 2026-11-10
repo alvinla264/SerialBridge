@@ -3,7 +3,7 @@
 use std::io;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{self, KeyEventKind, MouseEvent};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
@@ -103,16 +103,9 @@ fn event_loop(
     }
 }
 
-/// A click on a device row selects it; a click on the sidebar's Settings
-/// button opens the settings, just as Enter does. In the stream, the wheel
-/// scrolls the kept output.
+/// A click on a device row highlights it; a double-click opens or joins it,
+/// just as Enter does. A click on the sidebar's Settings button opens the
+/// settings. In the scrollback view, the wheel scrolls the kept output.
 fn handle_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
-    match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            app.handle_click(area, mouse.column, mouse.row);
-        }
-        MouseEventKind::ScrollUp => app.handle_scroll(true),
-        MouseEventKind::ScrollDown => app.handle_scroll(false),
-        _ => {}
-    }
+    app.handle_mouse(area, mouse.kind, mouse.column, mouse.row, Instant::now());
 }
