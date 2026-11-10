@@ -748,13 +748,15 @@ fn stream_keys_ai_output_local_echo_and_scrollback_off_are_visible() {
     tui.wait_for_text("focus: stream");
     tui.send_text("WWW");
     fixture.first.read_until(b"WWW", STEP);
+    // Device output after the typed keys is the render barrier: a local echo
+    // would have been drawn before it, so the absence below is meaningful.
+    fixture.first.write(b"device-echo\r\n");
+    tui.wait_for_text("device-echo");
     assert!(
         !tui.text().contains("WWW"),
         "local echo is off:\n{}",
         tui.text()
     );
-    fixture.first.write(b"device-echo\r\n");
-    tui.wait_for_text("device-echo");
 }
 
 /// A quitting terminal leaves the alternate screen and restores cooked
