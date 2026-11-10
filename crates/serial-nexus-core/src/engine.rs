@@ -81,7 +81,8 @@ struct Device {
     tail_seq: Option<u64>,
     clients: BTreeMap<u64, Attached>,
     control: Option<Control>,
-    write_tx: Option<Sender<Vec<u8>>>,
+    write_tx: Option<Sender<device::WriteCommand>>,
+    write_epochs: device::WriteEpochs,
     stop: Arc<AtomicBool>,
     waiters: Vec<Waiter>,
     io: Option<device::IoThreads>,
@@ -244,6 +245,7 @@ impl Engine {
     /// Remove a connection: detach it from every device, release control it
     /// held, and close devices it was the last client of.
     pub fn unregister_client(&self, client_id: u64) {
+        let session = self.sharing_session();
         // The owning local terminal is the only reason sharing exists: when
         // its connection goes away, close the listener and every remote
         // session before anything else is torn down.
@@ -323,6 +325,7 @@ impl Engine {
                     device_id,
                     "last client disconnected",
                     &mut events,
+                    session.as_deref(),
                 ) {
                     removed.push(device);
                 }
@@ -446,7 +449,7 @@ impl Engine {
     }
 
     fn open(&self, client_id: u64, params: OpenParams) -> Result<ResponseData, ErrorBody> {
-        self.open_with_identity(client_id, params, None)
+        self.open_with_identity(client_id, params, None, None)
     }
 
     fn open_with_identity(
@@ -454,6 +457,7 @@ impl Engine {
         client_id: u64,
         params: OpenParams,
         expected: Option<&DeviceIdentity>,
+        session: Option<&Arc<SharingSession>>,
     ) -> Result<ResponseData, ErrorBody> {
         let (kind, name) = self.identity(client_id);
         // Resolve aliases (symlinks, `..`) so two paths to one device join the
@@ -510,6 +514,21 @@ impl Engine {
                         };
                         ErrorBody::new(code, format!("could not open {port}: {error}"))
                     })?;
+                // Re-check that the authorization still exists after the open,
+                // while the engine state lock keeps a concurrent close/revoke
+                // from racing this device into service.
+                if let (Some(session), Some(expected)) = (session, expected) {
+                    let still_shared = session
+                        .authorize(&port)
+                        .map(|current| current == *expected)
+                        .unwrap_or(false);
+                    if !still_shared {
+                        return Err(ErrorBody::new(
+                            ErrorCode::DeviceFailed,
+                            format!("{port} is no longer shared; check it again"),
+                        ));
+                    }
+                }
                 let write_port = read_port.try_clone().map_err(|error| {
                     ErrorBody::new(
                         ErrorCode::Internal,
@@ -518,7 +537,10 @@ impl Engine {
                 })?;
                 let device_id = state.next_device_id;
                 state.next_device_id += 1;
-                let (write_tx, write_rx) = unbounded();
+                // Bounded so a slow device cannot accumulate unbounded queued
+                // write bytes from any client.
+                let (write_tx, write_rx) = crossbeam_channel::bounded(64);
+                let write_epochs: device::WriteEpochs = Arc::new(Mutex::new(HashMap::new()));
                 let stop = Arc::new(AtomicBool::new(false));
                 let io = device::spawn_io(
                     device_id,
@@ -526,6 +548,7 @@ impl Engine {
                     read_port,
                     write_port,
                     write_rx,
+                    Arc::clone(&write_epochs),
                     Arc::clone(&stop),
                     self.events_tx.clone(),
                 )
@@ -545,6 +568,7 @@ impl Engine {
                     clients: BTreeMap::new(),
                     control: None,
                     write_tx: Some(write_tx),
+                    write_epochs,
                     stop,
                     waiters: Vec::new(),
                     io: Some(io),
@@ -589,6 +613,7 @@ impl Engine {
 
     fn close(&self, client_id: u64, device_id: u64) -> Result<ResponseData, ErrorBody> {
         let (kind, name) = self.identity(client_id);
+        let session = self.sharing_session();
         let mut state = self.state.lock().expect("state lock");
         let mut events = Vec::new();
         let mut removed = None;
@@ -635,6 +660,7 @@ impl Engine {
                 device_id,
                 "last client disconnected",
                 &mut events,
+                session.as_deref(),
             );
         }
         drop(state);
@@ -764,6 +790,13 @@ impl Engine {
             ));
         }
         refresh_control(device, client_id);
+        let epoch = device
+            .write_epochs
+            .lock()
+            .expect("write epochs lock")
+            .get(&client_id)
+            .copied()
+            .unwrap_or(0);
         record_written_lines(device, source, &data);
         device
             .write_tx
@@ -774,12 +807,24 @@ impl Engine {
                     format!("device {} was closed", params.device_id),
                 )
             })?
-            .send(data.clone())
-            .map_err(|_| {
-                ErrorBody::new(
+            .try_send(device::WriteCommand {
+                device_id: params.device_id,
+                client_id,
+                epoch,
+                bytes: data.clone(),
+            })
+            .map_err(|error| match error {
+                crossbeam_channel::TrySendError::Full(_) => ErrorBody::new(
+                    ErrorCode::LimitExceeded,
+                    format!(
+                        "device {} has too much queued work; retry shortly",
+                        params.device_id
+                    ),
+                ),
+                crossbeam_channel::TrySendError::Disconnected(_) => ErrorBody::new(
                     ErrorCode::DeviceClosed,
                     format!("device {} was closed", params.device_id),
-                )
+                ),
             })?;
 
         let pending = params.wait.and_then(|spec| {
@@ -1009,13 +1054,19 @@ impl Engine {
     }
 
     fn on_device_failed(&self, device_id: u64, reason: String) {
+        let session = self.sharing_session();
         let mut events = Vec::new();
         let reason_text = format!("device failed: {reason}");
         let removed = {
             let mut state = self.state.lock().expect("state lock");
-            take_device_locked(&mut state, device_id, &reason_text, &mut events)
+            take_device_locked(
+                &mut state,
+                device_id,
+                &reason_text,
+                &mut events,
+                session.as_deref(),
+            )
         };
-        let path = removed.as_ref().map(|device| device.path.clone());
         if let Some(device) = removed {
             join_devices(vec![device]);
         }
@@ -1023,13 +1074,6 @@ impl Engine {
         // names the path, so a shared device's failure is reported rather than
         // silently disappearing.
         self.emit(events);
-        if let Some(path) = path {
-            // An unplugged or replaced device loses its authorization: sharing
-            // it again needs an explicit check.
-            if let Some(session) = self.sharing.lock().expect("sharing lock").as_ref() {
-                session.revoke_path(&path);
-            }
-        }
     }
 
     fn remove_waiter(&self, device_id: u64, waiter_id: u64) -> Vec<HistoryLine> {
@@ -1118,6 +1162,7 @@ impl Engine {
 
     /// Close every device and tell clients the core is going away.
     pub fn shutdown_all(&self, reason: &str) {
+        let session = self.sharing_session();
         self.shutting_down.store(true, Ordering::SeqCst);
         // Close the sharing listener first: no new remote work can start, and
         // every remote session is disconnected before devices close.
@@ -1128,8 +1173,13 @@ impl Engine {
             let mut state = self.state.lock().expect("state lock");
             let ids: Vec<u64> = state.devices.keys().copied().collect();
             for device_id in ids {
-                if let Some(device) = take_device_locked(&mut state, device_id, reason, &mut events)
-                {
+                if let Some(device) = take_device_locked(
+                    &mut state,
+                    device_id,
+                    reason,
+                    &mut events,
+                    session.as_deref(),
+                ) {
                     removed.push(device);
                 }
             }
@@ -1400,6 +1450,7 @@ impl Engine {
                         ..params
                     },
                     Some(&identity),
+                    Some(&session),
                 )
             }
             Request::Close(device) => {
@@ -1483,6 +1534,7 @@ impl Engine {
     /// Detach remote clients from these devices and fail their pending waits,
     /// leaving local clients and other shared devices alone.
     fn detach_remote_clients(&self, device_ids: &[u64], reason: &str) {
+        let session = self.sharing_session();
         let remote_ids: HashSet<u64> = self
             .clients
             .lock()
@@ -1519,6 +1571,14 @@ impl Engine {
                             },
                         });
                     }
+                    // Drop this remote client's queued, not-yet-started writes.
+                    // The write already in the writer finishes (no rollback).
+                    *device
+                        .write_epochs
+                        .lock()
+                        .expect("write epochs lock")
+                        .entry(client)
+                        .or_insert(0) += 1;
                     if device
                         .control
                         .as_ref()
@@ -1547,9 +1607,13 @@ impl Engine {
                     device.waiters = kept;
                 }
                 if device.clients.is_empty() {
-                    if let Some(device) =
-                        take_device_locked(&mut state, *device_id, reason, &mut events)
-                    {
+                    if let Some(device) = take_device_locked(
+                        &mut state,
+                        *device_id,
+                        reason,
+                        &mut events,
+                        session.as_deref(),
+                    ) {
                         removed.push(device);
                     }
                 }
@@ -1626,7 +1690,7 @@ impl Engine {
     /// matched by its path, because its engine entry is already gone.
     fn remote_may_see(&self, session: &SharingSession, event: &Event) -> bool {
         if let Event::DeviceClosed { path, .. } = event {
-            return session.allows_path(path);
+            return session.names_path(path);
         }
         match event.device_id() {
             Some(device_id) => {
@@ -1770,8 +1834,14 @@ fn take_device_locked(
     device_id: u64,
     reason: &str,
     events: &mut Vec<Event>,
+    session: Option<&SharingSession>,
 ) -> Option<Device> {
     let mut device = state.devices.remove(&device_id)?;
+    // A closed device can no longer prove its identity (a replacement can
+    // reuse its path), so its authorization ends here and must be rechecked.
+    if let Some(session) = session {
+        session.revoke_path(&device.path);
+    }
     device.stop.store(true, Ordering::SeqCst);
     // End the writer thread. The caller joins both I/O threads after the
     // engine lock is released, so a closed device's serial file is released.

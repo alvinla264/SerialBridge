@@ -23,7 +23,14 @@ use serial_nexus_protocol::{
 
 use crate::ClientError;
 
-type PendingMap = Arc<Mutex<HashMap<u64, Sender<Result<ResponseData, ClientError>>>>>;
+struct Pending {
+    tx: Sender<Result<ResponseData, ClientError>>,
+    /// Writes may already have reached the device even when the answer never
+    /// arrives, so failures must report uncertainty instead of a plain close.
+    is_write: bool,
+}
+
+type PendingMap = Arc<Mutex<HashMap<u64, Pending>>>;
 
 struct Inner {
     outgoing: Sender<Vec<u8>>,
@@ -293,23 +300,35 @@ impl RemoteClient {
         }
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = bounded(1);
+        let is_write = matches!(request, Request::Write(_));
         self.inner
             .pending
             .lock()
             .expect("pending lock")
-            .insert(id, tx);
+            .insert(id, Pending { tx, is_write });
         let frame = encode_frame(&RequestMessage { id, request })?;
         if self.inner.outgoing.send(frame).is_err() {
-            self.inner.pending.lock().expect("pending lock").remove(&id);
+            let pending = self.inner.pending.lock().expect("pending lock").remove(&id);
+            if pending.is_some_and(|pending| pending.is_write) {
+                return Err(ClientError::WriteUncertain(
+                    "the connection ended before the write was acknowledged; the bytes may already have reached the device and were not replayed".into(),
+                ));
+            }
             return Err(ClientError::Disconnected("connection thread ended".into()));
         }
         match rx.recv_timeout(timeout) {
             Ok(result) => result,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                self.inner.pending.lock().expect("pending lock").remove(&id);
-                Err(ClientError::Timeout(format!(
-                    "no answer within {timeout:?} (request id {id})"
-                )))
+                let pending = self.inner.pending.lock().expect("pending lock").remove(&id);
+                if pending.is_some_and(|pending| pending.is_write) {
+                    Err(ClientError::WriteUncertain(format!(
+                        "no answer within {timeout:?} (request id {id}); the bytes may already have reached the device and were not replayed"
+                    )))
+                } else {
+                    Err(ClientError::Timeout(format!(
+                        "no answer within {timeout:?} (request id {id})"
+                    )))
+                }
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                 Err(ClientError::Disconnected("remote connection closed".into()))
@@ -398,13 +417,13 @@ fn dispatch(
 ) {
     match message {
         ServerMessage::Response { id, result } => {
-            if let Some(tx) = pending.lock().expect("pending lock").remove(&id) {
-                let _ = tx.send(Ok(result));
+            if let Some(pending) = pending.lock().expect("pending lock").remove(&id) {
+                let _ = pending.tx.send(Ok(result));
             }
         }
         ServerMessage::Error { id, error } => {
-            if let Some(tx) = pending.lock().expect("pending lock").remove(&id) {
-                let _ = tx.send(Err(ClientError::from(error)));
+            if let Some(pending) = pending.lock().expect("pending lock").remove(&id) {
+                let _ = pending.tx.send(Err(ClientError::from(error)));
             }
         }
         ServerMessage::Event { event } => {
@@ -423,8 +442,15 @@ fn fail(
     reason: &str,
 ) {
     connected.store(false, Ordering::SeqCst);
-    for (_, tx) in pending.lock().expect("pending lock").drain() {
-        let _ = tx.send(Err(ClientError::Disconnected(reason.to_string())));
+    for (_, pending) in pending.lock().expect("pending lock").drain() {
+        let error = if pending.is_write {
+            ClientError::WriteUncertain(format!(
+                "{reason}; the bytes may already have reached the device and were not replayed"
+            ))
+        } else {
+            ClientError::Disconnected(reason.to_string())
+        };
+        let _ = pending.tx.send(Err(error));
     }
     let event = Event::TransportClosed {
         reason: reason.to_string(),

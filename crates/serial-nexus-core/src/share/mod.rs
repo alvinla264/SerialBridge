@@ -86,9 +86,18 @@ struct RemoteSocket {
     stream: TcpStream,
 }
 
+/// One entry in the session allowlist.
+struct AuthorizedDevice {
+    identity: DeviceIdentity,
+    /// Set when the device closed, failed or changed. An expired entry still
+    /// names the path so that remote clients attached to it receive the
+    /// `DeviceClosed` event, but it grants no access and is not "checked".
+    expired: bool,
+}
+
 struct SessionState {
     /// Canonical path to the identity authorized at check time.
-    devices: BTreeMap<String, DeviceIdentity>,
+    devices: BTreeMap<String, AuthorizedDevice>,
     authenticated: usize,
     pending: usize,
 }
@@ -154,7 +163,13 @@ pub fn prepare(
 
     let mut allowlist = BTreeMap::new();
     for identity in devices {
-        allowlist.insert(identity.canonical.clone(), identity);
+        allowlist.insert(
+            identity.canonical.clone(),
+            AuthorizedDevice {
+                identity,
+                expired: false,
+            },
+        );
     }
 
     let session = Arc::new(SharingSession {
@@ -251,17 +266,26 @@ impl SharingSession {
             .to_string_lossy()
             .into_owned();
         let mut state = self.state.lock().expect("share state lock");
-        let Some(stored) = state.devices.get(&canonical).cloned() else {
+        let Some(stored) = state.devices.get(&canonical) else {
             return Err(ErrorBody::new(
                 ErrorCode::PermissionDenied,
                 format!("{canonical} is not shared"),
             ));
         };
+        if stored.expired {
+            return Err(ErrorBody::new(
+                ErrorCode::DeviceFailed,
+                format!("{canonical} is no longer available; check it again"),
+            ));
+        }
+        let stored = stored.identity.clone();
         let current = DeviceIdentity::capture(&canonical).ok();
         match current {
             Some(current) if current == stored => Ok(current),
             _ => {
-                state.devices.remove(&canonical);
+                if let Some(entry) = state.devices.get_mut(&canonical) {
+                    entry.expired = true;
+                }
                 Err(ErrorBody::new(
                     ErrorCode::DeviceFailed,
                     format!("{canonical} changed since it was checked; check it again"),
@@ -270,18 +294,35 @@ impl SharingSession {
         }
     }
 
-    /// Add one detected device to the allowlist.
+    /// Add one detected device to the allowlist (or refresh an expired entry).
     pub fn check(&self, identity: DeviceIdentity) -> Result<(), ErrorBody> {
         let mut state = self.state.lock().expect("share state lock");
-        if !state.devices.contains_key(&identity.canonical)
-            && state.devices.len() >= MAX_SHARED_DEVICES
-        {
-            return Err(ErrorBody::new(
-                ErrorCode::LimitExceeded,
-                format!("at most {MAX_SHARED_DEVICES} devices may be shared"),
-            ));
+        let replacing = state
+            .devices
+            .get(&identity.canonical)
+            .is_some_and(|entry| !entry.expired);
+        if !replacing {
+            let live = state
+                .devices
+                .values()
+                .filter(|entry| !entry.expired)
+                .count();
+            if live >= MAX_SHARED_DEVICES {
+                return Err(ErrorBody::new(
+                    ErrorCode::LimitExceeded,
+                    format!("at most {MAX_SHARED_DEVICES} devices may be shared"),
+                ));
+            }
+            // Drop stale expired entries for other paths when making room.
+            state.devices.retain(|_, entry| !entry.expired);
         }
-        state.devices.insert(identity.canonical.clone(), identity);
+        state.devices.insert(
+            identity.canonical.clone(),
+            AuthorizedDevice {
+                identity,
+                expired: false,
+            },
+        );
         Ok(())
     }
 
@@ -294,22 +335,39 @@ impl SharingSession {
             .expect("share state lock")
             .devices
             .remove(&canonical)
+            .map(|entry| entry.identity)
     }
 
-    /// Drop an allowlist entry (used when a device fails or is unplugged).
+    /// Expire an allowlist entry (used when a device closes, fails or is
+    /// replaced). Access stops immediately; the path is kept so attached
+    /// remote clients still see the `DeviceClosed` event.
     pub fn revoke_path(&self, path: &str) {
         let mut state = self.state.lock().expect("share state lock");
         // The stored key is canonical, but a removed device may no longer
         // resolve, so match the given path directly as well.
-        state.devices.remove(path);
+        if let Some(entry) = state.devices.get_mut(path) {
+            entry.expired = true;
+        }
         if let Ok(canonical) = std::fs::canonicalize(path) {
-            state.devices.remove(canonical.to_string_lossy().as_ref());
+            if let Some(entry) = state.devices.get_mut(canonical.to_string_lossy().as_ref()) {
+                entry.expired = true;
+            }
         }
     }
 
-    /// Allowlist membership without touching the filesystem; used to filter
-    /// events so remote clients never see unchecked devices.
+    /// True when the path is checked and grants access now.
     pub fn allows_path(&self, path: &str) -> bool {
+        self.state
+            .lock()
+            .expect("share state lock")
+            .devices
+            .get(path)
+            .is_some_and(|entry| !entry.expired)
+    }
+
+    /// True when the path was checked in this session, even if it has since
+    /// expired; used only to filter events for attached remote clients.
+    pub fn names_path(&self, path: &str) -> bool {
         self.state
             .lock()
             .expect("share state lock")
@@ -326,9 +384,10 @@ impl SharingSession {
             checked: state
                 .devices
                 .values()
-                .map(|identity| SharedDevice {
-                    path: identity.canonical.clone(),
-                    identity: identity.describe(),
+                .filter(|entry| !entry.expired)
+                .map(|entry| SharedDevice {
+                    path: entry.identity.canonical.clone(),
+                    identity: entry.identity.describe(),
                 })
                 .collect(),
             remote_clients: state.authenticated,
@@ -551,14 +610,10 @@ fn run_connection(
             handle_remote_request(engine, session, id, message, &responses_tx, &pending_writes);
         }
         while let Ok(message) = responses_rx.try_recv() {
-            let frame = encode_frame(&message).map_err(|_| ())?;
-            let deadline = Instant::now() + Duration::from_secs(30);
-            tlsio::write_frame(&mut connection, &mut tcp, &frame, deadline).map_err(|_| ())?;
+            write_server_message(&mut connection, &mut tcp, &message)?;
         }
         while let Ok(message) = events_rx.try_recv() {
-            let frame = encode_frame(&message).map_err(|_| ())?;
-            let deadline = Instant::now() + Duration::from_secs(30);
-            tlsio::write_frame(&mut connection, &mut tcp, &frame, deadline).map_err(|_| ())?;
+            write_server_message(&mut connection, &mut tcp, &message)?;
         }
         if session.is_stopped() {
             break;
@@ -570,6 +625,35 @@ fn run_connection(
         }
     }
     Ok(())
+}
+
+/// Write one bounded frame. A response that cannot fit the remote frame limit
+/// becomes a request-level error instead of closing the whole connection.
+fn write_server_message(
+    connection: &mut rustls::Connection,
+    tcp: &mut TcpStream,
+    message: &ServerMessage,
+) -> Result<(), ()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let frame = match encode_frame(message) {
+        Ok(frame) => frame,
+        Err(serial_nexus_protocol::ProtocolError::TooLarge { .. }) => {
+            let id = match message {
+                ServerMessage::Response { id, .. } | ServerMessage::Error { id, .. } => *id,
+                ServerMessage::Event { .. } => return Ok(()),
+            };
+            let fallback = ServerMessage::Error {
+                id,
+                error: ErrorBody::new(
+                    ErrorCode::BadRequest,
+                    "response too large for a remote frame; request fewer lines",
+                ),
+            };
+            encode_frame(&fallback).map_err(|_| ())?
+        }
+        Err(_) => return Err(()),
+    };
+    tlsio::write_frame(connection, tcp, &frame, deadline).map_err(|_| ())
 }
 
 /// Handle one remote request. Writes enqueue in arrival order and, when they

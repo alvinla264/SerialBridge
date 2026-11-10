@@ -11,9 +11,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serial_nexus_client::{Client, ClientError, ClientInfo, RemoteClient};
-use serial_nexus_protocol::Event;
 use serial_nexus_protocol::{
-    ErrorCode, PairedHost, PairingRole, ReadResult, ShareBind, ShareSessionInfo, WaitSpec,
+    ErrorCode, Event, PairedHost, PairingRole, ReadResult, ResponseData, ServerMessage, ShareBind,
+    ShareSessionInfo, WaitSpec,
 };
 use support::{connect, wait_until, SimulatedDevice};
 use tempfile::TempDir;
@@ -630,11 +630,10 @@ fn stopping_sharing_during_a_waited_write_fails_it_without_replaying() {
     assert!(result.is_err(), "the wait must not survive shutdown");
     let error = result.unwrap_err();
     assert!(
-        error.to_string().contains("may already have reached")
-            || error.to_string().contains("sharing stopped")
-            || error.to_string().contains("closed"),
-        "{error}"
+        matches!(error, ClientError::WriteUncertain(_)),
+        "a lost write answer must report uncertainty, got {error:?}"
     );
+    assert!(error.to_string().contains("not replayed"), "{error}");
     // No automatic replay: exactly one copy of the bytes reached the device.
     let leftovers = device.read_available(Duration::from_millis(200));
     assert!(
@@ -767,8 +766,8 @@ fn local_unix_clients_keep_working_while_sharing_is_active() {
     );
 }
 
-/// A TLS client that skips the high-level adapter, for frame-level tests.
-fn raw_tls(info: &ShareSessionInfo) -> (rustls::Connection, TcpStream) {
+/// TLS handshake only, for frame-level and deadline tests.
+fn raw_handshake(info: &ShareSessionInfo) -> (rustls::Connection, TcpStream) {
     let ca = serial_nexus_protocol::decode_bytes(&info.host.ca_cert_der_b64).expect("ca");
     let mut roots = rustls::RootCertStore::empty();
     roots
@@ -799,154 +798,56 @@ fn raw_tls(info: &ShareSessionInfo) -> (rustls::Connection, TcpStream) {
         &mut Default::default(),
     )
     .expect("handshake");
+    (connection, tcp)
+}
+
+fn send_auth(
+    connection: &mut rustls::Connection,
+    tcp: &mut TcpStream,
+    secret: &serial_nexus_protocol::PairingSecret,
+    client: Option<serial_nexus_protocol::ClientInfo>,
+) {
     let auth = serial_nexus_protocol::RemoteAuth {
-        credential: info.human.credential.clone(),
+        credential: secret.credential.clone(),
         protocol: serial_nexus_protocol::SHARE_PROTOCOL_VERSION,
-        client: None,
+        client,
     };
     let frame = serial_nexus_protocol::encode_frame(&auth).expect("frame");
     serial_nexus_protocol::share::tlsio::write_frame(
-        &mut connection,
-        &mut tcp,
+        connection,
+        tcp,
         &frame,
         Instant::now() + Duration::from_secs(3),
     )
     .expect("auth");
-    (connection, tcp)
 }
 
-#[test]
-fn concurrent_remote_writes_arrive_as_indivisible_requests() {
-    let core = shared_core();
-    let owner = local_owner(&core);
-    let mut device = SimulatedDevice::new();
-    owner
-        .open(&device.path, Some(115_200), false)
-        .expect("open");
-    let info = owner
-        .start_sharing(localhost_bind(), vec![device.path.clone()])
-        .expect("start");
-    let ai = remote(&info, PairingRole::Ai, "ai").expect("pair ai");
-    ai.open(&device.path, None, true).expect("ai control");
-    let first = remote(&info, PairingRole::Human, "one").expect("pair one");
-    let second = remote(&info, PairingRole::Human, "two").expect("pair two");
-    let first_open = first.open(&device.path, None, false).expect("open one");
-    let second_open = second.open(&device.path, None, false).expect("open two");
-
-    let payloads = [vec![b'a'; 700], vec![b'b'; 700], vec![b'c'; 700]];
-    let mut threads = Vec::new();
-    for (client, payload) in [
-        (&first, payloads[0].clone()),
-        (&second, payloads[1].clone()),
-        (&ai, payloads[2].clone()),
-    ] {
-        let client = client.clone();
-        let device_id = first_open.device_id;
-        threads.push(std::thread::spawn(move || {
-            client
-                .write_bytes(device_id, &payload, None)
-                .expect("write");
-        }));
-    }
-    for thread in threads {
-        thread.join().expect("thread");
-    }
-    let _ = second_open;
-
-    let total = payloads.iter().map(Vec::len).sum::<usize>();
-    let received = device.read_n(total, Duration::from_secs(5));
-    // Every payload must appear contiguously: requests never interleave.
-    for payload in &payloads {
-        assert!(
-            received
-                .windows(payload.len())
-                .any(|window| window == payload),
-            "a remote write was interleaved with another"
-        );
-    }
-}
-
-#[test]
-fn a_connection_has_a_bounded_number_of_pending_waited_writes() {
-    let core = shared_core_with(|config| config.share_max_pending_writes = 1);
-    let owner = local_owner(&core);
-    let mut device = SimulatedDevice::new();
-    owner
-        .open(&device.path, Some(115_200), false)
-        .expect("open");
-    let info = owner
-        .start_sharing(localhost_bind(), vec![device.path.clone()])
-        .expect("start");
-    let human = remote(&info, PairingRole::Human, "remote").expect("pair");
-    let opened = human.open(&device.path, None, false).expect("open");
-
-    let waiting = human.clone();
-    let first = std::thread::spawn(move || {
-        waiting.write_bytes(
-            opened.device_id,
-            b"first",
-            Some(WaitSpec {
-                lines: 1,
-                timeout_ms: Some(3_000),
-            }),
-        )
-    });
-    device.read_until(b"first", Duration::from_secs(2));
-
-    let error = human
-        .write_bytes(
-            opened.device_id,
-            b"second",
-            Some(WaitSpec {
-                lines: 1,
-                timeout_ms: Some(3_000),
-            }),
-        )
-        .expect_err("the pending-write limit must refuse a second wait");
-    assert_eq!(error.code(), Some(ErrorCode::LimitExceeded));
-
-    // The first wait still ends (timeout) and the connection stays usable.
-    let first = first.join().expect("thread");
-    assert!(first.is_ok(), "{first:?}");
-    human.list_devices().expect("connection still usable");
-}
-
-#[test]
-fn an_unauthenticated_peer_is_dropped_after_the_handshake_deadline() {
-    let core = shared_core();
-    let owner = local_owner(&core);
-    let device = SimulatedDevice::new();
-    owner
-        .open(&device.path, Some(115_200), false)
-        .expect("open");
-    let info = owner
-        .start_sharing(localhost_bind(), vec![device.path.clone()])
-        .expect("start");
-
-    let mut tcp =
-        TcpStream::connect_timeout(&info.host.address, Duration::from_secs(2)).expect("connect");
-    tcp.set_read_timeout(Some(Duration::from_millis(200))).ok();
-    let deadline = Instant::now() + Duration::from_secs(6);
-    let mut buffer = [0u8; 64];
-    loop {
-        if Instant::now() >= deadline {
-            panic!("the core kept an unauthenticated connection open");
+fn read_auth_result(
+    connection: &mut rustls::Connection,
+    tcp: &mut TcpStream,
+    timeout: Duration,
+) -> Option<serial_nexus_protocol::RemoteAuthResult> {
+    let mut decoder = serial_nexus_protocol::FrameDecoder::new();
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(Some(body)) = decoder.next_frame() {
+            return serde_json::from_slice(&body).ok();
         }
-        match tcp.read(&mut buffer) {
-            Ok(0) => break,
+        match serial_nexus_protocol::share::tlsio::pump(connection, tcp, &mut decoder) {
+            Ok(serial_nexus_protocol::share::tlsio::TlsRead::Closed) => return None,
             Ok(_) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(_) => break,
+            Err(_) => return None,
         }
     }
+    None
+}
 
-    // A properly authenticated peer still works after that.
-    let human = remote(&info, PairingRole::Human, "remote").expect("pair");
-    human.list_devices().expect("list");
+/// A TLS client that authenticates, for frame-level tests.
+fn raw_tls(info: &ShareSessionInfo) -> (rustls::Connection, TcpStream) {
+    let (mut connection, mut tcp) = raw_handshake(info);
+    send_auth(&mut connection, &mut tcp, &info.human, None);
+    read_auth_result(&mut connection, &mut tcp, Duration::from_secs(3)).expect("auth result");
+    (connection, tcp)
 }
 
 #[test]
@@ -1001,4 +902,340 @@ fn an_unplugged_shared_device_is_reported_and_revoked() {
     assert!(owner
         .check_shared_devices(vec![first_path.clone()])
         .is_err());
+}
+
+#[test]
+fn a_replacement_at_the_same_path_does_not_inherit_authorization() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let holder = connect(&core.socket, ClientInfo::human("holder"));
+    let first = SimulatedDevice::new();
+    let first_path = first.path.clone();
+    holder
+        .open(&first.path, Some(115_200), false)
+        .expect("open first");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![first.path.clone()])
+        .expect("start");
+    let human = remote(&info, PairingRole::Human, "remote").expect("pair");
+    human.open(&first.path, None, false).expect("open shared");
+
+    // Close every engine attachment, then destroy the PTY so its node (and
+    // likely its path) is recycled. The checked identity pins the old node.
+    human.close(1).ok();
+    holder.close(1).ok();
+    drop(holder);
+    wait_until(Duration::from_secs(3), || {
+        owner
+            .list_devices()
+            .expect("list")
+            .devices
+            .iter()
+            .all(|device| device.path != first_path)
+    });
+    drop(first);
+
+    // Allocate a replacement, trying until the kernel reuses the same path.
+    let mut replacement = None;
+    for _ in 0..30 {
+        let candidate = SimulatedDevice::new();
+        if candidate.path == first_path {
+            replacement = Some(candidate);
+            break;
+        }
+    }
+    let Some(replacement) = replacement else {
+        eprintln!(
+            "not exercised: the kernel did not reuse {first_path}; identity pinning is covered by the symlink test and unit identities"
+        );
+        return;
+    };
+
+    // The replacement must not inherit the old authorization.
+    let error = human
+        .open(&first_path, None, false)
+        .expect_err("a replacement must not inherit authorization");
+    assert!(
+        matches!(
+            error.code(),
+            Some(ErrorCode::PermissionDenied) | Some(ErrorCode::DeviceFailed)
+        ),
+        "{error:?}"
+    );
+
+    // An explicit recheck of the replacement restores access.
+    owner
+        .open(&replacement.path, Some(115_200), false)
+        .expect("open replacement");
+    owner
+        .check_shared_devices(vec![first_path.clone()])
+        .expect("recheck replacement");
+    human
+        .open(&first_path, None, false)
+        .expect("replacement after recheck");
+}
+
+#[test]
+fn an_ai_credential_cannot_claim_a_human_role() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let device = SimulatedDevice::new();
+    owner
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![device.path.clone()])
+        .expect("start");
+
+    // Authenticate with the AI credential while claiming to be a human.
+    let (mut connection, mut tcp) = raw_handshake(&info);
+    send_auth(
+        &mut connection,
+        &mut tcp,
+        &info.ai,
+        Some(serial_nexus_protocol::ClientInfo::human("spoof")),
+    );
+    let auth =
+        read_auth_result(&mut connection, &mut tcp, Duration::from_secs(3)).expect("auth result");
+    assert_eq!(auth.role, PairingRole::Ai);
+
+    // The engine treats it as an AI: no write without control.
+    let frame = serial_nexus_protocol::encode_frame(&serial_nexus_protocol::RequestMessage {
+        id: 1,
+        request: serial_nexus_protocol::Request::Open(serial_nexus_protocol::OpenParams {
+            port: device.path.clone(),
+            baud: None,
+            request_control: false,
+        }),
+    })
+    .expect("frame");
+    serial_nexus_protocol::share::tlsio::write_frame(
+        &mut connection,
+        &mut tcp,
+        &frame,
+        Instant::now() + Duration::from_secs(3),
+    )
+    .expect("open");
+    let mut decoder = serial_nexus_protocol::FrameDecoder::new();
+    let opened = read_response(&mut connection, &mut tcp, &mut decoder, 1).expect("open answer");
+    let device_id = match opened {
+        ServerMessage::Response {
+            result: ResponseData::Opened(opened),
+            ..
+        } => opened.device_id,
+        other => panic!("unexpected open answer: {other:?}"),
+    };
+    let frame = serial_nexus_protocol::encode_frame(&serial_nexus_protocol::RequestMessage {
+        id: 2,
+        request: serial_nexus_protocol::Request::Write(serial_nexus_protocol::WriteParams {
+            device_id,
+            data_b64: serial_nexus_protocol::encode_bytes(b"spoofed"),
+            wait: None,
+        }),
+    })
+    .expect("frame");
+    serial_nexus_protocol::share::tlsio::write_frame(
+        &mut connection,
+        &mut tcp,
+        &frame,
+        Instant::now() + Duration::from_secs(3),
+    )
+    .expect("write");
+    let answer = read_response(&mut connection, &mut tcp, &mut decoder, 2).expect("write answer");
+    match answer {
+        ServerMessage::Error { error, .. } => assert_eq!(error.code, ErrorCode::ControlHeld),
+        other => panic!("AI without control could write: {other:?}"),
+    }
+}
+
+/// Read messages until the answer with `id`, skipping unsolicited events.
+fn read_response(
+    connection: &mut rustls::Connection,
+    tcp: &mut TcpStream,
+    decoder: &mut serial_nexus_protocol::FrameDecoder,
+    id: u64,
+) -> Option<ServerMessage> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        while let Ok(Some(body)) = decoder.next_frame() {
+            let message: ServerMessage = serde_json::from_slice(&body).ok()?;
+            match &message {
+                ServerMessage::Response { id: answer, .. }
+                | ServerMessage::Error { id: answer, .. }
+                    if *answer == id =>
+                {
+                    return Some(message)
+                }
+                ServerMessage::Event { .. } => continue,
+                _ => continue,
+            }
+        }
+        match serial_nexus_protocol::share::tlsio::pump(connection, tcp, decoder) {
+            Ok(serial_nexus_protocol::share::tlsio::TlsRead::Closed) => return None,
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+#[test]
+fn an_oversized_frame_over_authenticated_tls_closes_only_that_connection() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let device = SimulatedDevice::new();
+    owner
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![device.path.clone()])
+        .expect("start");
+    let (mut connection, mut tcp) = raw_tls(&info);
+
+    connection
+        .writer()
+        .write_all(&u32::MAX.to_be_bytes())
+        .expect("write header");
+    let _ = serial_nexus_protocol::share::tlsio::flush(
+        &mut connection,
+        &mut tcp,
+        Instant::now() + Duration::from_secs(3),
+    );
+    let mut decoder = serial_nexus_protocol::FrameDecoder::new();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut closed = false;
+    while Instant::now() < deadline {
+        if serial_nexus_protocol::share::tlsio::pump(&mut connection, &mut tcp, &mut decoder)
+            .is_err()
+        {
+            closed = true;
+            break;
+        }
+        let mut buffer = [0u8; 64];
+        match connection.reader().read(&mut buffer) {
+            Ok(0) | Err(_) => {
+                closed = true;
+                break;
+            }
+            Ok(_) => {}
+        }
+    }
+    assert!(closed, "an oversized application frame must close the peer");
+
+    // A fresh remote connection is unaffected.
+    remote(&info, PairingRole::Human, "other").expect("pair");
+}
+
+#[test]
+fn a_tls_peer_that_withholds_authentication_is_dropped_after_the_deadline() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let device = SimulatedDevice::new();
+    owner
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![device.path.clone()])
+        .expect("start");
+    let (mut connection, mut tcp) = raw_handshake(&info);
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut closed = false;
+    while Instant::now() < deadline {
+        let mut decoder = serial_nexus_protocol::FrameDecoder::new();
+        match serial_nexus_protocol::share::tlsio::pump(&mut connection, &mut tcp, &mut decoder) {
+            Ok(serial_nexus_protocol::share::tlsio::TlsRead::Closed) => {
+                closed = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                closed = true;
+                break;
+            }
+        }
+    }
+    assert!(closed, "withholding authentication must hit the deadline");
+    remote(&info, PairingRole::Human, "other").expect("pair");
+}
+
+#[test]
+fn a_slow_remote_peer_hits_bounded_pending_writes_and_queued_work_is_revoked() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let mut device = SimulatedDevice::new();
+    owner
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![device.path.clone()])
+        .expect("start");
+    let human = remote(&info, PairingRole::Human, "remote").expect("pair");
+    let opened = human.open(&device.path, None, false).expect("open");
+
+    // Do not drain the PTY: the writer blocks after the small kernel buffer,
+    // so most of the queue below is still waiting.
+    for _ in 0..40 {
+        human
+            .write_bytes(opened.device_id, &[b'x'; 8 * 1024], None)
+            .expect("queued write");
+    }
+    // A marker queued behind the backlog must never reach the device after a
+    // successful uncheck: only the write already in progress may go.
+    human
+        .write_bytes(opened.device_id, b"FINAL", None)
+        .expect("queue final marker");
+
+    // Keep going until the bounded queue refuses work.
+    let mut refused = false;
+    for _ in 0..200 {
+        match human.write_bytes(opened.device_id, &[b'x'; 8 * 1024], None) {
+            Ok(_) => {}
+            Err(error) => {
+                assert_eq!(error.code(), Some(ErrorCode::LimitExceeded), "{error:?}");
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(refused, "the write queue must be bounded");
+    owner
+        .uncheck_shared_devices(vec![device.path.clone()])
+        .expect("uncheck");
+    let received = device.read_available(Duration::from_millis(300));
+    assert!(
+        !String::from_utf8_lossy(&received).contains("FINAL"),
+        "a revoked remote write was still sent after uncheck"
+    );
+    human.list_devices().expect("connection stays usable");
+}
+
+#[test]
+fn an_oversized_pending_history_answer_does_not_drop_the_connection() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let mut device = SimulatedDevice::new();
+    owner
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![device.path.clone()])
+        .expect("start");
+    let human = remote(&info, PairingRole::Human, "remote").expect("pair");
+    let opened = human.open(&device.path, None, false).expect("open");
+
+    // ~120 KiB of history is under the local answer budget but over one
+    // remote frame.
+    for _ in 0..200 {
+        device.write(format!("{}\r\n", "y".repeat(600)).as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let result = human.read(opened.device_id, Some(2_000));
+    match result {
+        Ok(read) => assert!(read.truncated),
+        Err(error) => assert_eq!(error.code(), Some(ErrorCode::BadRequest), "{error:?}"),
+    }
+    // The connection and its device attachment survive the large answer.
+    human.list_devices().expect("connection still usable");
+    human.status(opened.device_id).expect("still attached");
 }

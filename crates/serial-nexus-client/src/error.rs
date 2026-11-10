@@ -46,6 +46,11 @@ pub enum ClientError {
     /// The pairing credential was refused or never answered.
     #[error("authentication failed: {0}")]
     Authentication(String),
+
+    /// A write request may have reached the device but its answer was lost.
+    /// The adapter never replays such a write.
+    #[error("write outcome uncertain: {0}")]
+    WriteUncertain(String),
 }
 
 impl ClientError {

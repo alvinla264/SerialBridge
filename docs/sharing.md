@@ -81,12 +81,14 @@ type:
   canonical device path to `DeviceIdentity`. A device may be checked when it is
   enumerated now or already open in the core; it does not need to stay open.
 - **Identity.** `DeviceIdentity` is the node's `(st_dev, st_ino, st_rdev)`
-  captured when checked. It is revalidated on `Open`, `Read`, `Write`,
-  `Status`, `Close` and on the open itself: the serial descriptor's `fstat` and
-  the canonical path must both still be that node. A changed node is removed
-  from the allowlist and access is revoked; sharing it again requires an
-  explicit `ShareCheck`. A device unplugged while shared loses its
-  authorization the same way.
+  plus an `O_PATH` descriptor that pins the node, captured when checked. It is
+  revalidated on `Open`, `Read`, `Write`, `Status`, `Close` and on the open
+  itself: the serial descriptor's `fstat` and the canonical path must both
+  still be that node. A changed node, an unplug, or the device closing for any
+  reason expires the entry: access stops at once and the path stays only long
+  enough for attached remote clients to receive `DeviceClosed`. Expired
+  entries are not "checked", are not listed, and never grant access; an
+  explicit `ShareCheck` with a live identity is required again.
 - **Every operation.** `ListDevices` is filtered to checked devices. Remote
   requests for other device ids or paths fail with `PermissionDenied`,
   `NotFound` or `NotAttached`; they are not merely hidden from a UI. Events are
@@ -96,10 +98,11 @@ type:
   rule (`ControlHeld` without control); humans write without control. Control
   is shared across local and remote clients on the same device.
 - **Unchecking.** `ShareUncheck` removes the entry, detaches every remote
-  client from that device, releases any control it held and fails its pending
-  waited writes. Local clients and other shared devices are untouched. A write
-  already queued can still finish or partially reach the device; there is no
-  rollback and no automatic replay.
+  client from that device, releases any control it held, fails its pending
+  waited writes and bumps that client's write generation so its queued but not
+  yet started commands are dropped by the writer. Local clients and other
+  shared devices are untouched. A write already in progress can still finish or
+  partially reach the device; there is no rollback and no automatic replay.
 - **Owner loss / stop.** The listener is closed and every remote socket is shut
   down; remote waits fail and the client sees the connection end. Late writes
   that were already queued are reported as uncertain
@@ -107,7 +110,12 @@ type:
 
 ## Bound resources
 
-- `MAX_REMOTE_FRAME_BYTES` per frame in either direction.
+- `MAX_REMOTE_FRAME_BYTES` per frame in either direction. An answer that cannot
+  fit becomes a request-level `BadRequest` ("response too large"), not a
+  dropped connection.
+- A bounded per-device write queue (64 accepted writes). A full queue answers
+  `LimitExceeded` before accepting bytes, so a slow device cannot accumulate
+  unbounded work from any client.
 - TLS handshake deadline (`share_handshake_timeout`) and pairing deadline
   (`share_auth_timeout`).
 - At most `share_max_connections` connections, counting peers still
