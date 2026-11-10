@@ -3,7 +3,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::state::{AppState, View};
+use crate::state::{AppState, Focus, View};
 
 /// A key the TUI understands, independent of the terminal library.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,21 +36,23 @@ pub enum Action {
     OpenSelected,
     DisconnectSelected,
     StartBaudPrompt,
-    /// Show the stream or the sidebar.
-    ToggleView,
+    /// Move the keyboard focus between the sidebar and the right pane.
+    ToggleFocus,
     PromptChar(char),
     PromptBackspace,
     PromptSubmit,
     PromptCancel,
-    /// Bytes for the selected device. Never drawn locally unless local echo is
+    /// Bytes for the shown device. Never drawn locally unless local echo is
     /// on.
     Write(Vec<u8>),
     /// Scroll the scrollback view back (`> 0`) or forward by lines.
     Scroll(i32),
-    /// Show the selected device's kept rows.
+    /// Show the highlighted device's kept rows in the right pane.
     EnterScrollback,
     /// Leave the scrollback view for the live stream.
     LeaveScrollback,
+    /// Cancel a pending baud prompt and move the keyboard focus.
+    PromptCancelFocus,
     /// Open the settings that the sidebar button offers.
     OpenSettings,
     SettingsMove(i32),
@@ -63,25 +65,36 @@ pub enum Action {
 /// Map a key to an action for the current state.
 ///
 /// The stream is a transparent terminal: every key it can encode goes to the
-/// device, `Tab` and `Ctrl+Q` included. Only `Ctrl+]` leaves it, which is why
-/// the sidebar's `]` sends a literal `Ctrl+]`. The sidebar is the command
-/// surface: `Ctrl+Q` quits there, `b` shows the selected device's scrollback,
+/// shown device, `Tab` and `Ctrl+Q` included. Only `Ctrl+]` leaves it, which is
+/// why the sidebar's `]` sends a literal `Ctrl+]`. The sidebar is the command
+/// surface: `Ctrl+Q` quits there, `b` shows the highlighted device's scrollback,
 /// and the settings button is a row of it. The scrollback view navigates with
 /// the arrow and page keys; they never reach the device from there.
+///
+/// The device keys always belong to the *shown* device, never to the sidebar's
+/// highlighted row.
 pub fn map_key(state: &AppState, key: Key) -> Action {
     if state.prompt.is_some() {
         return match key {
             // The prompt belongs to the sidebar, so the sidebar's quit still
             // works while it is open.
-            Key::Ctrl('q') | Key::F(10) if state.view == View::Devices => Action::Quit,
+            Key::Ctrl('q') | Key::F(10) if state.focus == Focus::Sidebar => Action::Quit,
             Key::Char(ch) => Action::PromptChar(ch),
             Key::Enter => Action::PromptSubmit,
             Key::Esc => Action::PromptCancel,
+            // The prompt is modal, but the focus shortcut still works: it
+            // drops the prompt and moves to the other pane.
+            Key::Ctrl(']') => Action::PromptCancelFocus,
             Key::Backspace => Action::PromptBackspace,
             _ => Action::Ignore,
         };
     }
-    if state.view == View::Settings {
+    if key == Key::Ctrl(']') {
+        // The focus moves even while Settings are open: the sidebar stays
+        // visible beside them, and the draft is kept until Save or Cancel.
+        return Action::ToggleFocus;
+    }
+    if state.view == View::Settings && state.focus == Focus::Right {
         return match key {
             Key::Ctrl('s') => Action::SettingsSave,
             Key::Esc => Action::SettingsCancel,
@@ -91,17 +104,14 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
             _ => Action::Ignore,
         };
     }
-    if key == Key::Ctrl(']') {
-        return Action::ToggleView;
-    }
-    match state.view {
-        View::Devices => match key {
+    match (state.focus, state.view) {
+        (Focus::Sidebar, _) => match key {
             Key::Ctrl('q') | Key::F(10) => Action::Quit,
-            // The sidebar can still feed a device: `]` is the literal
-            // Ctrl+] the stream cannot send without leaving it, and Tab is
-            // ordinary terminal input.
-            Key::Char(']') => Action::Write(vec![0x1d]),
-            Key::Tab => Action::Write(vec![b'\t']),
+            // The sidebar can still feed the shown device while the right
+            // pane is its stream: `]` is the literal Ctrl+] the stream cannot
+            // send without leaving it. It writes nothing while the settings
+            // or scrollback own the pane.
+            Key::Char(']') if state.view == View::Stream => Action::Write(vec![0x1d]),
             Key::Up | Key::Char('k') => Action::Select(-1),
             Key::Down | Key::Char('j') => Action::Select(1),
             Key::PageUp => Action::Select(-10),
@@ -109,18 +119,19 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
             Key::Home => Action::Select(i32::MIN),
             Key::End => Action::Select(i32::MAX),
             Key::Enter | Key::Char('o') => Action::OpenSelected,
-            // `b` is the scrollback of the attached device; a closed device has
-            // no scrollback, so `b` keeps asking for its baud rate.
-            Key::Char('b') if state.selected_session().is_some() => Action::EnterScrollback,
+            // `b` is the scrollback of the attached device under the
+            // highlight; a closed device has no scrollback, so `b` keeps
+            // asking for its baud rate.
+            Key::Char('b') if state.highlighted_session().is_some() => Action::EnterScrollback,
             Key::Char('b') => Action::StartBaudPrompt,
             Key::Char('d') => Action::DisconnectSelected,
             _ => Action::Ignore,
         },
-        View::Stream => match encode_key(key) {
+        (Focus::Right, View::Stream) => match encode_key(key) {
             Some(bytes) => Action::Write(bytes),
             None => Action::Ignore,
         },
-        View::Scrollback => match key {
+        (Focus::Right, View::Scrollback) => match key {
             // Navigation, not device input: nothing typed here is forwarded.
             Key::Up => Action::Scroll(1),
             Key::Down => Action::Scroll(-1),
@@ -129,7 +140,9 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
             Key::Esc => Action::LeaveScrollback,
             _ => Action::Ignore,
         },
-        View::Settings => Action::Ignore,
+        // The settings branch above owns a right-focused settings view; the
+        // left-focused one takes the sidebar's commands instead.
+        (Focus::Right, View::Settings) => Action::Ignore,
     }
 }
 
@@ -166,7 +179,7 @@ pub fn translate(event: KeyEvent) -> Option<Key> {
     }
 }
 
-/// Bytes a stream-focused key sends to the selected device.
+/// Bytes a stream-focused key sends to the shown device.
 ///
 /// This is ordinary terminal input: arrows are ANSI sequences, Enter is CR and
 /// Backspace is DEL. Human writes are echoed locally only when the `local_echo`
@@ -250,6 +263,15 @@ mod tests {
         state
     }
 
+    fn state_with_two_devices() -> AppState {
+        let mut state = AppState::new(20, 80);
+        state.set_devices(vec![
+            DeviceEntry::new("/dev/ttyUSB0"),
+            DeviceEntry::new("/dev/ttyUSB1"),
+        ]);
+        state
+    }
+
     #[test]
     fn sidebar_keys_select_open_disconnect_and_prompt() {
         let state = state_with_device();
@@ -263,17 +285,20 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_bracket_switches_views_from_either_side() {
+    fn ctrl_bracket_switches_focus_from_either_pane() {
         let mut state = state_with_device();
-        assert_eq!(map_key(&state, Key::Ctrl(']')), Action::ToggleView);
-        state.view = View::Stream;
-        assert_eq!(map_key(&state, Key::Ctrl(']')), Action::ToggleView);
+        assert_eq!(state.focus, Focus::Sidebar);
+        assert_eq!(map_key(&state, Key::Ctrl(']')), Action::ToggleFocus);
+        state.focus = Focus::Right;
+        assert_eq!(map_key(&state, Key::Ctrl(']')), Action::ToggleFocus);
     }
 
     #[test]
     fn the_stream_is_transparent_for_tab_and_ctrl_q() {
         let mut state = state_with_device();
-        state.view = View::Stream;
+        state.add_session(7, "/dev/ttyUSB0", 115_200, None);
+        assert_eq!(state.focus, Focus::Sidebar);
+        state.focus = Focus::Right;
         assert_eq!(map_key(&state, Key::Tab), Action::Write(b"\t".to_vec()));
         assert_eq!(
             map_key(&state, Key::Ctrl('q')),
@@ -297,12 +322,37 @@ mod tests {
     }
 
     #[test]
-    fn the_sidebar_sends_the_literal_ctrl_bracket_and_tab() {
-        let state = state_with_device();
+    fn the_sidebar_sends_only_the_literal_ctrl_bracket_to_the_shown_device() {
+        let mut state = state_with_two_devices();
+        state.add_session(7, "/dev/ttyUSB0", 115_200, None);
+        // The highlight moves to another row; the shown device does not.
+        state.select_index(1);
         assert_eq!(map_key(&state, Key::Char(']')), Action::Write(vec![0x1d]));
-        assert_eq!(map_key(&state, Key::Tab), Action::Write(b"\t".to_vec()));
+        assert_eq!(
+            map_key(&state, Key::Tab),
+            Action::Ignore,
+            "typed device input belongs to the focused stream"
+        );
         // Printable commands are still commands here.
         assert_eq!(map_key(&state, Key::Char('b')), Action::StartBaudPrompt);
+    }
+
+    #[test]
+    fn the_sidebar_writes_nothing_while_settings_or_scrollback_own_the_pane() {
+        let mut state = state_with_two_devices();
+        state.add_session(7, "/dev/ttyUSB0", 115_200, None);
+        state.begin_settings();
+        state.focus = Focus::Sidebar;
+        assert_eq!(map_key(&state, Key::Char(']')), Action::Ignore);
+        assert_eq!(map_key(&state, Key::Tab), Action::Ignore);
+
+        state.view = View::Scrollback;
+        assert_eq!(map_key(&state, Key::Char(']')), Action::Ignore);
+        assert_eq!(map_key(&state, Key::Tab), Action::Ignore);
+
+        state.view = View::Stream;
+        assert_eq!(map_key(&state, Key::Char(']')), Action::Write(vec![0x1d]));
+        assert_eq!(map_key(&state, Key::Tab), Action::Ignore);
     }
 
     #[test]
@@ -313,8 +363,8 @@ mod tests {
         assert_eq!(map_key(&state, Key::Enter), Action::PromptSubmit);
         assert_eq!(map_key(&state, Key::Esc), Action::PromptCancel);
         assert_eq!(map_key(&state, Key::Backspace), Action::PromptBackspace);
-        // The prompt owns the keys: Ctrl+] cannot pull the view away.
-        assert_eq!(map_key(&state, Key::Ctrl(']')), Action::Ignore);
+        // Ctrl+] drops the prompt so the focus can move.
+        assert_eq!(map_key(&state, Key::Ctrl(']')), Action::PromptCancelFocus);
     }
 
     #[test]
@@ -362,6 +412,7 @@ mod tests {
         let mut state = state_with_device();
         state.begin_settings();
         assert_eq!(state.view, View::Settings);
+        assert_eq!(state.focus, Focus::Right);
         assert_eq!(map_key(&state, Key::Tab), Action::SettingsMove(1));
         assert_eq!(map_key(&state, Key::BackTab), Action::SettingsMove(-1));
         assert_eq!(map_key(&state, Key::Down), Action::SettingsMove(1));
@@ -372,11 +423,12 @@ mod tests {
         assert_eq!(map_key(&state, Key::Esc), Action::SettingsCancel);
         // Nothing typed here reaches a device.
         assert_eq!(map_key(&state, Key::Char('x')), Action::Ignore);
-        assert_eq!(map_key(&state, Key::Ctrl(']')), Action::Ignore);
+        // The focus can still move to the sidebar; the settings stay open.
+        assert_eq!(map_key(&state, Key::Ctrl(']')), Action::ToggleFocus);
     }
 
     #[test]
-    fn the_sidebar_opens_scrollback_for_an_attached_device_only() {
+    fn the_sidebar_opens_scrollback_for_an_attached_device_under_the_highlight() {
         let mut state = state_with_device();
         assert_eq!(
             map_key(&state, Key::Char('b')),
@@ -392,6 +444,7 @@ mod tests {
         let mut state = state_with_device();
         state.add_session(7, "/dev/ttyUSB0", 115_200, None);
         state.view = View::Scrollback;
+        state.focus = Focus::Right;
         assert_eq!(map_key(&state, Key::Up), Action::Scroll(1));
         assert_eq!(map_key(&state, Key::Down), Action::Scroll(-1));
         assert_eq!(map_key(&state, Key::PageUp), Action::Scroll(20));
@@ -402,14 +455,14 @@ mod tests {
         assert_eq!(map_key(&state, Key::Tab), Action::Ignore);
         assert_eq!(map_key(&state, Key::Ctrl('q')), Action::Ignore);
         // …but Ctrl+] still leaves for the sidebar.
-        assert_eq!(map_key(&state, Key::Ctrl(']')), Action::ToggleView);
+        assert_eq!(map_key(&state, Key::Ctrl(']')), Action::ToggleFocus);
     }
 
     #[test]
     fn the_stream_keeps_every_key_for_the_device_including_shifted_pages() {
         let mut state = state_with_device();
         state.add_session(7, "/dev/ttyUSB0", 115_200, None);
-        state.view = View::Stream;
+        state.focus = Focus::Right;
         // Shift does not turn the page keys into terminal commands: the device
         // sees the same bytes as before.
         use crossterm::event::KeyEvent;

@@ -1,4 +1,4 @@
-//! The TUI's state: devices, open sessions, selection, prompt and notices.
+//! The TUI's state: devices, open sessions, focus, prompt and notices.
 //!
 //! This module has no terminal or socket code, so the interesting behaviour
 //! (switching, filtering human writes, unplug notices) is testable on its own.
@@ -10,14 +10,18 @@ use serial_nexus_protocol::{Event, Holder, Source, DEFAULT_BAUD};
 use crate::screen::{Screen, SCROLLBACK_ROWS};
 use crate::settings::TerminalSettings;
 
-/// Which view receives keys. The sidebar is shown while choosing a device and
-/// hides itself in the stream, so the device gets the whole screen. Settings is
-/// its own view in the terminal area, opened from the sidebar's button.
-/// Scrollback is the stream's kept rows, entered from the sidebar with `b`, so
-/// its keys navigate instead of reaching the device.
+/// Which pane receives keys: the device sidebar on the left, or the right-hand
+/// pane (the shown device's stream, its scrollback, or the settings).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Focus {
+    Sidebar,
+    Right,
+}
+
+/// What the right-hand pane shows. The sidebar is beside it, never instead of
+/// it, except in narrow terminals where only the focused pane is drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
-    Devices,
     Stream,
     Settings,
     Scrollback,
@@ -130,15 +134,24 @@ impl BaudPrompt {
 }
 
 /// Everything the renderer needs.
+///
+/// The sidebar's highlighted row and the device shown in the right pane are
+/// deliberately separate: moving or clicking the highlight never changes where
+/// typed device input goes.
 pub struct AppState {
     pub devices: Vec<DeviceEntry>,
-    /// The selected device row. It stays on a device while the Settings button
-    /// has the focus, so discovery cannot turn the button into a device.
+    /// The highlighted sidebar row. It stays on a device while the Settings
+    /// button has the focus, so discovery cannot turn the button into a device.
     pub selected: usize,
-    /// Whether the sidebar's Settings button has the focus.
+    /// Whether the sidebar's Settings button is highlighted.
     settings_button_selected: bool,
+    /// Which pane receives keys.
+    pub focus: Focus,
+    /// What the right pane shows.
     pub view: View,
     pub sessions: BTreeMap<u64, Session>,
+    /// The session shown in the right pane, if any.
+    shown: Option<u64>,
     pub notice: Option<Notice>,
     pub prompt: Option<BaudPrompt>,
     pub quit: bool,
@@ -149,13 +162,6 @@ pub struct AppState {
     /// The settings being edited; only Ctrl+S copies them into `settings` and
     /// saves them. Escape throws them away.
     pub draft: TerminalSettings,
-    /// The device path the settings were opened from, put back on the way out.
-    /// A path survives the device list being re-sorted or changing while the
-    /// settings are open; a row number would not.
-    selection_before_settings: Option<String>,
-    /// The last device that was selected, so leaving the Settings button lands
-    /// on a device even after discovery changed the list.
-    last_device_path: Option<String>,
     rows: usize,
     cols: usize,
 }
@@ -172,16 +178,16 @@ impl AppState {
             devices: Vec::new(),
             selected: 0,
             settings_button_selected: false,
-            view: View::Devices,
+            focus: Focus::Sidebar,
+            view: View::Stream,
             sessions: BTreeMap::new(),
+            shown: None,
             notice: None,
             prompt: None,
             quit: false,
             settings_row: 0,
             settings: TerminalSettings::default(),
             draft: TerminalSettings::default(),
-            selection_before_settings: None,
-            last_device_path: None,
             rows: rows.max(1),
             cols: cols.max(1),
         }
@@ -226,21 +232,25 @@ impl AppState {
         }
     }
 
-    /// Start editing the settings: the draft begins as a copy of what is in
-    /// effect, so Escape can throw every change away.
+    /// Whether the settings are open with changes that Save or Cancel would
+    /// still keep or throw away.
+    pub fn has_unsaved_settings(&self) -> bool {
+        self.view == View::Settings && self.draft != self.settings
+    }
+
+    /// Open the settings in the right pane. The draft begins as a copy of what
+    /// is in effect, so Escape can throw every change away. Re-opening the
+    /// settings that are already open keeps the draft exactly as it is.
     pub fn begin_settings(&mut self) {
-        self.draft = self.settings.clone();
-        self.settings_row = 0;
-        // Coming from the Settings button itself, fall back to the last device
-        // row, so leaving the settings lands on a device.
         // Opening the settings abandons a baud prompt: the settings keys would
         // otherwise reach the hidden prompt.
         self.prompt = None;
-        self.selection_before_settings = self
-            .devices
-            .get(self.selected)
-            .map(|device| device.path.clone())
-            .or_else(|| self.last_device_path.clone());
+        self.focus = Focus::Right;
+        if self.view == View::Settings {
+            return;
+        }
+        self.draft = self.settings.clone();
+        self.settings_row = 0;
         self.view = View::Settings;
         self.notice = None;
     }
@@ -267,19 +277,20 @@ impl AppState {
         }
     }
 
+    /// Return to the stream of the device the right pane was showing. Save and
+    /// Cancel both land here, on the live screen the human was looking at.
     fn leave_settings(&mut self) {
-        // The Settings button is not a device: go back to the device the
-        // settings were opened from, found by path in the list as it is now.
-        let row = self
-            .selection_before_settings
-            .as_deref()
-            .and_then(|path| self.devices.iter().position(|device| device.path == path))
-            .unwrap_or_else(|| self.last_device_index());
-        self.select_index(row);
-        self.view = View::Devices;
+        // A baud prompt belongs to the sidebar; leaving the settings must not
+        // hand the returned stream's keys back to it.
+        self.prompt = None;
+        self.view = View::Stream;
+        self.focus = Focus::Right;
+        if let Some(session) = self.shown_session_mut() {
+            session.screen.scroll_to_bottom();
+        }
     }
 
-    /// Whether the sidebar's Settings button has the focus.
+    /// Whether the sidebar's Settings button is highlighted.
     pub fn settings_button_selected(&self) -> bool {
         self.settings_button_selected
     }
@@ -301,7 +312,9 @@ impl AppState {
         self.cols
     }
 
-    /// Resize every device screen to the new stream area.
+    /// Resize every device screen to the new right-pane size. Each screen keeps
+    /// its kept rows and scrolled position, so a resize never teleports a
+    /// session's scrollback or drops another session.
     pub fn resize(&mut self, rows: usize, cols: usize) {
         self.rows = rows.max(1);
         self.cols = cols.max(1);
@@ -312,6 +325,7 @@ impl AppState {
         }
     }
 
+    /// The highlighted device row, or `None` while the Settings button is.
     pub fn selected_device(&self) -> Option<&DeviceEntry> {
         if self.settings_button_selected {
             return None;
@@ -319,30 +333,42 @@ impl AppState {
         self.devices.get(self.selected)
     }
 
-    pub fn selected_device_id(&self) -> Option<u64> {
-        self.selected_device().and_then(|device| device.device_id)
-    }
-
-    pub fn selected_session(&self) -> Option<&Session> {
-        self.selected_device_id()
-            .and_then(|id| self.sessions.get(&id))
-    }
-
-    /// The device the header names: the selected one, or the last device row
-    /// when the Settings button is selected.
+    /// The device shown in the right pane, found by its session.
     pub fn shown_device(&self) -> Option<&DeviceEntry> {
+        let id = self.shown?;
+        let session = self.sessions.get(&id)?;
         self.devices
-            .get(self.selected)
-            .or_else(|| self.devices.get(self.last_device_index()))
+            .iter()
+            .find(|device| device.device_id == Some(id) || device.path == session.path)
     }
 
-    pub fn selected_session_mut(&mut self) -> Option<&mut Session> {
-        let id = self.selected_device_id()?;
+    /// The session shown in the right pane.
+    pub fn shown_session(&self) -> Option<&Session> {
+        self.shown.and_then(|id| self.sessions.get(&id))
+    }
+
+    pub fn shown_session_mut(&mut self) -> Option<&mut Session> {
+        let id = self.shown?;
         self.sessions.get_mut(&id)
     }
 
-    /// Select one sidebar row, keeping the last device row for when the
-    /// Settings button is left. Every selection change goes through here.
+    /// The session of the highlighted device row, if it is attached.
+    pub fn highlighted_session(&self) -> Option<&Session> {
+        let path = &self.selected_device()?.path;
+        self.sessions.values().find(|session| &session.path == path)
+    }
+
+    /// Show a session in the right pane without changing the highlight.
+    pub fn show_device(&mut self, device_id: u64) -> bool {
+        if !self.sessions.contains_key(&device_id) {
+            return false;
+        }
+        self.shown = Some(device_id);
+        true
+    }
+
+    /// Select one sidebar row. The shown stream is untouched: choosing a row
+    /// never redirects typed device input.
     pub fn select_index(&mut self, index: usize) {
         if index >= self.devices.len() {
             self.settings_button_selected = true;
@@ -350,9 +376,6 @@ impl AppState {
         }
         self.settings_button_selected = false;
         self.selected = index;
-        if let Some(device) = self.devices.get(self.selected) {
-            self.last_device_path = Some(device.path.clone());
-        }
     }
 
     /// Move the sidebar selection over the devices and the Settings button,
@@ -363,15 +386,7 @@ impl AppState {
         self.select_index(next.clamp(0, last as i32) as usize);
     }
 
-    /// The row of the last device that was selected, in the list as it is now.
-    pub fn last_device_index(&self) -> usize {
-        self.last_device_path
-            .as_deref()
-            .and_then(|path| self.devices.iter().position(|device| device.path == path))
-            .unwrap_or_else(|| self.selected.min(self.devices.len().saturating_sub(1)))
-    }
-
-    /// Point the sidebar selection at the Settings button. The device row
+    /// Point the sidebar highlight at the Settings button. The device row
     /// stays where it was, so the button is not a row that discovery can
     /// renumber into a device.
     pub fn select_settings_button(&mut self) {
@@ -386,7 +401,7 @@ impl AppState {
             .is_some()
     }
 
-    /// Replace the discovered device list, keeping the selection and any
+    /// Replace the discovered device list, keeping the highlight and any
     /// sessions the core did not enumerate (PTYs in tests, for example).
     pub fn set_devices(&mut self, mut devices: Vec<DeviceEntry>) {
         let selected_path = self.selected_device().map(|device| device.path.clone());
@@ -419,8 +434,8 @@ impl AppState {
         }
         devices.sort_by(|left, right| left.path.cmp(&right.path));
         self.devices = devices;
-        // The Settings button keeps the focus; a device row keeps its device by
-        // path when the list was re-sorted or grew.
+        // The Settings button keeps the highlight; a device row keeps its
+        // device by path when the list was re-sorted or grew.
         if self.settings_button_selected {
             return;
         }
@@ -431,8 +446,8 @@ impl AppState {
         self.select_index(row);
     }
 
-    /// Add a freshly opened session and point the sidebar at it. The screen
-    /// starts empty and is fed only by live events, so output is never
+    /// Add a freshly opened session, point the sidebar at it and show it. The
+    /// screen starts empty and is fed only by live events, so output is never
     /// duplicated by a history snapshot racing the live subscription.
     pub fn add_session(
         &mut self,
@@ -479,8 +494,12 @@ impl AppState {
         if let Some(index) = self.devices.iter().position(|device| device.path == path) {
             self.select_index(index);
         }
+        self.shown = Some(device_id);
     }
 
+    /// Drop a session. A disconnect never closes the terminal and never drops
+    /// the settings view: when the shown device goes away, another attached
+    /// session takes the right pane, or the pane shows its empty hint.
     pub fn remove_session(&mut self, device_id: u64) -> Option<Session> {
         let session = self.sessions.remove(&device_id)?;
         for device in &mut self.devices {
@@ -490,6 +509,31 @@ impl AppState {
                 device.baud = None;
                 device.control = None;
                 device.control_id = None;
+            }
+        }
+        if self.shown == Some(device_id) {
+            self.shown = self
+                .sessions
+                .values()
+                .min_by(|left, right| left.path.cmp(&right.path))
+                .map(|session| session.device_id);
+            match self.view {
+                // The stream forwards keys to the device, so it always shows
+                // the live screen of the session that takes over.
+                View::Stream => {
+                    if let Some(session) = self.shown.and_then(|id| self.sessions.get_mut(&id)) {
+                        session.screen.scroll_to_bottom();
+                    }
+                    // A stream that suddenly belongs to another device must
+                    // not swallow the next queued keys as writes: the human
+                    // opens or joins it again before typing.
+                    self.focus = Focus::Sidebar;
+                }
+                // Scrollback keys only navigate; a remaining session keeps its
+                // own kept rows and scrolled position. With nothing left, the
+                // view falls back to the empty stream.
+                View::Scrollback if self.shown.is_none() => self.view = View::Stream,
+                View::Scrollback | View::Settings => {}
             }
         }
         Some(session)
@@ -528,10 +572,6 @@ impl AppState {
             } => {
                 self.remove_session(*device_id);
                 self.notice = Some(Notice::error(format!("unplugged: {path} ({reason})")));
-                // Nothing is left to scroll: the sidebar is the way on.
-                if self.view == View::Scrollback && self.selected_session().is_none() {
-                    self.view = View::Devices;
-                }
             }
             Event::ControlGranted { device_id, holder } => {
                 self.set_control(*device_id, Some(holder));
@@ -586,10 +626,10 @@ impl AppState {
         }
     }
 
-    /// Start the baud prompt for the selected closed device.
+    /// Start the baud prompt for the highlighted closed device.
     pub fn begin_baud_prompt(&mut self) -> bool {
         let Some(device) = self.selected_device() else {
-            self.notice = Some(Notice::error("no device selected"));
+            self.notice = Some(Notice::error("no device highlighted"));
             return false;
         };
         if device.device_id.is_some() {
@@ -642,37 +682,119 @@ mod tests {
     }
 
     #[test]
-    fn settings_restore_the_device_by_path_when_discovery_changes() {
+    fn highlighting_a_row_does_not_change_the_shown_stream() {
         let mut state = AppState::new(10, 80);
         state.set_devices(devices(&["/dev/a", "/dev/b"]));
+        state.add_session(7, "/dev/a", 115_200, None);
         state.select_index(1);
-        state.begin_settings();
 
-        // A device that sorts first appears while the settings are open, as an
-        // AI opening it would make it do.
-        state.set_devices(devices(&["/dev/0", "/dev/a", "/dev/b"]));
-        state.cancel_settings();
-
+        assert_eq!(state.selected_device().unwrap().path, "/dev/b");
         assert_eq!(
-            state.selected_device().map(|device| device.path.as_str()),
-            Some("/dev/b"),
-            "the selected device is restored by path, not by row"
+            state.shown_session().map(|session| session.device_id),
+            Some(7),
+            "the stream still belongs to the device that was opened"
         );
     }
 
     #[test]
-    fn settings_opened_from_the_button_return_to_the_last_device_by_path() {
+    fn a_disconnect_shows_another_attached_session_and_keeps_settings_open() {
         let mut state = AppState::new(10, 80);
-        state.set_devices(devices(&["/dev/a", "/dev/b"]));
-        state.select_index(0);
-        state.select_settings_button();
+        state.add_session(7, "/dev/a", 115_200, None);
+        state.add_session(8, "/dev/b", 115_200, None);
         state.begin_settings();
-        state.set_devices(devices(&["/dev/0", "/dev/a", "/dev/b"]));
-        state.commit_settings();
+        state.draft.local_echo = false;
+
+        state.apply_event(&Event::DeviceClosed {
+            device_id: 8,
+            path: "/dev/b".into(),
+            reason: "removed".into(),
+        });
 
         assert_eq!(
+            state.shown_session().map(|session| session.device_id),
+            Some(7),
+            "the other attached session takes the right pane"
+        );
+        assert_eq!(state.view, View::Settings, "the settings stay open");
+        assert!(!state.draft.local_echo, "the draft is kept");
+        let notice = state.notice.as_ref().expect("the disconnect is reported");
+        assert!(notice.text.contains("unplugged"), "{}", notice.text);
+    }
+
+    #[test]
+    fn a_disconnect_in_the_stream_returns_the_keys_to_the_sidebar() {
+        let mut state = AppState::new(10, 80);
+        state.add_session(7, "/dev/a", 115_200, None);
+        state.add_session(8, "/dev/b", 115_200, None);
+        state.show_device(8);
+        state.view = View::Stream;
+        state.focus = Focus::Right;
+
+        state.remove_session(8);
+
+        assert_eq!(state.shown_session().unwrap().device_id, 7);
+        assert_eq!(
+            state.focus,
+            Focus::Sidebar,
+            "the next keys are commands, not writes to the fallback device"
+        );
+    }
+
+    #[test]
+    fn a_disconnect_in_scrollback_leaves_navigation_on_the_remaining_session() {
+        let mut state = AppState::new(6, 20);
+        state.add_session(7, "/dev/a", 115_200, None);
+        state.add_session(8, "/dev/b", 115_200, None);
+        for index in 0..12 {
+            let line = format!("line{index}\r\n");
+            state.apply_event(&Event::device_output(7, line.as_bytes()));
+        }
+        // B is the shown session; its own screen stays where it was.
+        state.show_device(8);
+        state.sessions.get_mut(&8).unwrap().screen.scroll_back(2);
+        state.view = View::Scrollback;
+        state.focus = Focus::Right;
+
+        state.apply_event(&Event::DeviceClosed {
+            device_id: 8,
+            path: "/dev/b".into(),
+            reason: "removed".into(),
+        });
+
+        assert_eq!(
+            state.view,
+            View::Scrollback,
+            "the arrow keys still navigate, not write to the fallback"
+        );
+        assert_eq!(state.shown_session().unwrap().device_id, 7);
+    }
+
+    #[test]
+    fn the_last_disconnect_leaves_the_stream_view_empty() {
+        let mut state = AppState::new(10, 80);
+        state.add_session(7, "/dev/a", 115_200, None);
+        state.view = View::Scrollback;
+
+        state.remove_session(7);
+
+        assert!(state.shown_session().is_none());
+        assert_eq!(
+            state.view,
+            View::Stream,
+            "the scrollback has nothing to show"
+        );
+    }
+
+    #[test]
+    fn restoring_the_highlight_by_path_survives_discovery_changes() {
+        let mut state = AppState::new(10, 80);
+        state.set_devices(devices(&["/dev/a", "/dev/b"]));
+        state.select_index(1);
+        state.set_devices(devices(&["/dev/0", "/dev/a", "/dev/b"]));
+        assert_eq!(
             state.selected_device().map(|device| device.path.as_str()),
-            Some("/dev/a")
+            Some("/dev/b"),
+            "the highlight is restored by path, not by row"
         );
     }
 
@@ -684,21 +806,60 @@ mod tests {
         state.select_settings_button();
         assert!(state.settings_button_selected());
 
-        // A device that sorts first arrives while the button has the focus.
         state.set_devices(devices(&["/dev/0", "/dev/a", "/dev/b"]));
         assert!(
             state.settings_button_selected(),
-            "the button keeps the focus"
+            "the button keeps the highlight"
         );
         assert_eq!(state.selected_device(), None);
+    }
+
+    #[test]
+    fn save_and_cancel_return_to_the_shown_stream_not_the_highlight() {
+        let mut state = AppState::new(10, 80);
+        state.add_session(7, "/dev/a", 115_200, None);
+        state.set_devices(devices(&["/dev/a", "/dev/b"]));
+        state.select_index(1);
+        state.begin_settings();
+        state.draft.local_echo = false;
+
+        state.cancel_settings();
+        assert_eq!(state.view, View::Stream);
+        assert_eq!(state.focus, Focus::Right);
         assert_eq!(
-            state
-                .devices
-                .get(state.last_device_index())
-                .map(|d| d.path.as_str()),
-            Some("/dev/a"),
-            "the remembered device is still A"
+            state.shown_session().map(|session| session.device_id),
+            Some(7),
+            "the shown device did not follow the highlight"
         );
+        assert_eq!(state.selected_device().unwrap().path, "/dev/b");
+
+        state.begin_settings();
+        state.draft.local_echo = false;
+        state.commit_settings();
+        assert_eq!(state.view, View::Stream);
+        assert_eq!(state.shown_session().unwrap().device_id, 7);
+    }
+
+    #[test]
+    fn reopening_the_open_settings_keeps_the_draft() {
+        let mut state = AppState::new(10, 80);
+        state.begin_settings();
+        state.draft.local_echo = false;
+        state.begin_settings();
+        assert!(!state.draft.local_echo, "the unsaved draft is kept");
+        assert_eq!(state.view, View::Settings);
+    }
+
+    #[test]
+    fn unsaved_settings_are_only_reported_while_the_draft_differs() {
+        let mut state = AppState::new(10, 80);
+        assert!(!state.has_unsaved_settings());
+        state.begin_settings();
+        assert!(!state.has_unsaved_settings(), "a fresh draft matches");
+        state.draft.local_echo = false;
+        assert!(state.has_unsaved_settings());
+        state.cancel_settings();
+        assert!(!state.has_unsaved_settings());
     }
 
     fn session_state(rows: usize, scrollback: bool) -> AppState {
@@ -727,14 +888,11 @@ mod tests {
         let session = state.sessions.get_mut(&7).unwrap();
         session.screen.scroll_back(4);
         assert_eq!(session.screen.scroll(), 4);
-        // Scrolled four lines back, the view starts four rows above the live
-        // bottom: at the second kept line.
         let row: String = (0..20)
             .map(|col| session.screen.view_cell(0, col).ch)
             .collect();
         assert_eq!(row.trim_end(), "line1");
 
-        // The oldest line is as far back as it goes.
         session.screen.scroll_to_top();
         assert_eq!(session.screen.scroll(), session.screen.history_len());
         let row: String = (0..20)
@@ -757,7 +915,6 @@ mod tests {
             .map(|col| session.screen.view_cell(0, col).ch)
             .collect();
 
-        // More output that scrolls rows off the top must not slide the view.
         write_lines(&mut state, 8, 2);
         let session = state.sessions.get(&7).unwrap();
         assert!(session.screen.scroll() > 3, "the view stayed on its text");
@@ -804,11 +961,20 @@ mod tests {
     }
 
     #[test]
-    fn the_last_device_index_follows_the_path_after_the_list_changes() {
-        let mut state = AppState::new(10, 80);
-        state.set_devices(devices(&["/dev/a", "/dev/b"]));
-        state.select_index(1);
-        state.set_devices(devices(&["/dev/0", "/dev/a", "/dev/b"]));
-        assert_eq!(state.last_device_index(), 2);
+    fn resizing_keeps_every_sessions_scroll_position() {
+        let mut state = session_state(6, true);
+        write_lines(&mut state, 0, 12);
+        state.sessions.get_mut(&7).unwrap().screen.scroll_back(4);
+        let scroll = state.sessions.get(&7).unwrap().screen.scroll();
+        assert!(scroll > 0);
+
+        state.resize(4, 30);
+        assert_eq!(
+            state.sessions.get(&7).unwrap().screen.scroll(),
+            scroll,
+            "a resize keeps the scrolled position"
+        );
+        state.resize(8, 50);
+        assert_eq!(state.sessions.get(&7).unwrap().screen.scroll(), scroll);
     }
 }

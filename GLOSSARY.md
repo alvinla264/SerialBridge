@@ -48,20 +48,35 @@ these words in their tool names and user-facing text.
 - **Local echo**: showing the keys a human types in the **stream** in the
   terminal's own view. On by default; the `local_echo` **setting** turns it off
   for a device that echoes what it receives.
-- **Sidebar**: the terminal's list of **devices** and its Settings button,
-  shown while a device is chosen. It hides in the **stream**.
-- **Stream**: the terminal view that shows a device's output and sends the
-  keys typed in it to that device.
+- **Sidebar**: the terminal's list of **devices** and its Settings button. At a
+  usable width it sits on the left, beside the right pane; a narrow terminal
+  shows it only while it has the **focus**.
+- **Highlighted row**: the device row the sidebar's arrow keys and commands act
+  on. Moving or clicking it never changes the **shown device**, so it never
+  redirects typed input.
+- **Shown device**: the device whose **stream** (or **scrollback**) occupies the
+  right pane. It changes only when a device is opened/joined, `b` shows an
+  attached device's scrollback, or the shown device disconnects and another
+  session takes over. Row markers tell the two apart: `▸` highlighted and shown,
+  `›` only highlighted, `▹` only shown.
+- **Stream**: the terminal view that shows the **shown device**'s output and
+  sends the keys typed in it to that device.
+- **Focus**: which pane receives keys: the **sidebar** or the right pane
+  (stream, scrollback or settings). `Ctrl+]` moves it; the header and the
+  focused pane's styling show it.
 - **Scrollback**: the rows a **stream** keeps after they scroll off the top of
   the live view, so a human can read earlier output. Bounded, in memory, per
   session, and kept only while the `scrollback` **setting** is on. The
   **scrollback view** shows those rows in place of the live screen; it is
-  opened with `b` from the **sidebar**, navigated with the arrow and page
-  keys, and left with `Esc` for the live **stream**. Its keys never reach the
-  device.
+  opened with `b` from the **sidebar** for the highlighted attached device,
+  navigated with the arrow and page keys, and left with `Esc` for the live
+  **stream**. Its keys never reach the device, and each device keeps its own
+  kept rows and scrolled position across focus switches and resizes.
 - **Settings view**: the terminal view opened from the sidebar's Settings
-  button, where `local_echo` and `scrollback` are edited and saved with
-  `Ctrl+S`.
+  button into the right pane, while the sidebar stays visible. `local_echo` and
+  `scrollback` are edited there and saved with `Ctrl+S` or the Save button.
+  Save and Cancel return to the **shown device**'s stream. While the draft has
+  unsaved changes, opening a device is refused and the draft is kept.
 - **Event**: an unsolicited notification from the core (device output, write
   echo, client joined/left, control granted/released/denied, device closed,
   core shutdown). Clients receive all events from their subscription onward.

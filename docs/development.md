@@ -64,13 +64,18 @@ path as a real serial port and the test drives the master. Covered end to end:
   writes, pipelined writes keeping arrival order, unplug notification;
 - core grace-period shutdown and client auto-start (including an explicit core
   path, a missing binary, and the started core owning a separate session);
-- the terminal's sidebar/prompt/switch/disconnect flows, local echo on by
-  default and off after a saved change, the stream owning `Tab` and `Ctrl+Q`
-  while the sidebar quits on `Ctrl+Q`, the sidebar sending a literal `Ctrl+]`,
-  `b` from the sidebar opening the scrollback and `Esc` returning to the live
-  stream, arrow and page scrolling through kept output with no scroll key
-  reaching the device, nothing kept with the setting off, settings drafts saved on `Ctrl+S` only when the file was
-  written (a forced save failure and a missing settings file leave the options
+- the terminal's side-by-side layout at a usable width and focused-pane layout
+  when narrow, single-click highlight never changing the shown stream,
+  Enter/double-click opening, focus switching with `Ctrl+]` without redirecting
+  writes, local echo on by default and off after a saved change, the stream
+  owning `Tab` and `Ctrl+Q` while the sidebar quits on `Ctrl+Q`, the sidebar
+  sending a literal `Ctrl+]` to the shown device, `b` from the sidebar opening
+  the scrollback and `Esc` returning to the live stream, arrow and page
+  scrolling through kept output with no scroll key reaching the device, nothing
+  kept with the setting off, an unsaved settings draft refusing device opening,
+  a resize keeping the active session, draft and per-device scroll position, a
+  disconnect keeping settings and other sessions, settings drafts saved on
+  `Ctrl+S` only when the file was written (a forced save failure and a missing settings file leave the options
   unchanged and say so), the settings page's mouse toggles and its
   `Save`/`Cancel` buttons (a mouse save that fails changes nothing and stays on
   the page), and discarded on `Esc`, visible AI writes,

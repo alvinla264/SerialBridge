@@ -93,58 +93,85 @@ public for wrappers with their own launch strategy.
 (so a missing core is started automatically) as a human client and never takes
 AI write control.
 
-- The terminal has two working views and a settings view. `Ctrl+]` switches
-  between the sidebar and the stream. The sidebar is where a device is chosen;
-  it hides while the stream is shown, so the stream gets the whole screen. A
-  visible cursor sits on the device's own cursor position in the stream, on the
-  selected row in the sidebar, and on the selected flag in the settings.
-- The header names the selected device, its active baud, the AI control holder,
-  whether this terminal is attached and which view is showing.
-- In the sidebar, `↑`/`↓` (or `j`/`k`) select, `Enter` (or `o`) opens a closed
-  device (after the baud prompt, default `115200`) or rejoins an open one at its
-  active rate, `b` opens the selected device's scrollback (or, for a closed
-  device that has none, the baud prompt) and `d` disconnects. Opened devices
-  stay attached while switching. The bottom row is the Settings button: select
-  it with the arrow keys and open it with `Enter`, or click it with the mouse.
-  `Ctrl+Q` quits from here, even while the baud prompt is open. `]` sends a
-  literal `Ctrl+]` to the selected device and `Tab` sends a tab. Opening the
-  settings abandons an open baud prompt.
-- In the stream, keys are sent to the device as-is: arrows are ANSI sequences,
-  Enter is CR and Backspace is DEL, and `Tab`, `Ctrl+Q` and every printable key
-  go to the device. `Ctrl+]` is the only plain key the terminal keeps, to return
-  to the sidebar; that is why the sidebar's `]` sends the literal byte.
+- At a usable width the terminal shows the device sidebar on the left and the
+  right pane beside it: the shown device's stream, its scrollback, or the
+  Settings view. A narrow terminal cannot fit both, so it shows the focused
+  pane only. `Ctrl+]` moves the keyboard focus between the sidebar and the right
+  pane; the header names the focused pane, the focused pane's title (or the
+  pane edge) is highlighted, and the visible cursor follows the focus — the
+  device's own cursor in the stream, the highlighted row in the sidebar, and
+  the selected flag in the settings. While the sidebar has the focus, the
+  stream still marks the device's live cursor with a reversed cell. The focus
+  can move to the sidebar even while the settings are open; the draft is kept
+  either way.
+- The sidebar's highlighted row and the device shown in the right pane are
+  separate. A single click (or arrow key) only moves the highlight; it never
+  changes the stream, so choosing a row never redirects a write. `Enter` or a
+  double-click opens a closed device (after the baud prompt, default `115200`)
+  or joins an open one at its active rate and shows it. Other attached devices
+  stay attached. The row markers tell them apart: `▸` is both highlighted and
+  shown, `›` only highlighted, `▹` only shown.
+- If the shown device disconnects, a notice says so, the terminal stays open,
+  and the other attached sessions stay attached: the right pane shows the next
+  one and the keyboard focus returns to the sidebar (scrollback keeps its
+  navigation keys). Opening or joining a device takes typing again.
+- In the sidebar, `↑`/`↓` (or `j`/`k`) highlight, `Enter` (or `o`) opens or
+  joins the highlighted device, `b` shows the highlighted attached device's
+  scrollback (or, for a closed device that has none, the baud prompt) and `d`
+  disconnects the highlighted device. The bottom row is the Settings button:
+  highlight it with the arrow keys and open it with `Enter`, or click it with
+  the mouse. `Ctrl+Q` quits from here, even while the baud prompt is open. `]`
+  sends a literal `Ctrl+]` to the shown device while that device's stream is in
+  the right pane; it writes nothing while the settings or scrollback are shown,
+  and no other key typed in the sidebar reaches a device. `Ctrl+]` during the
+  baud prompt drops the prompt and moves the focus. Opening the settings
+  abandons an open baud prompt, and clicking the visible right pane takes the
+  keys back from a pending prompt.
+- In the focused stream, keys are sent to the shown device as-is: arrows are
+  ANSI sequences, Enter is CR and Backspace is DEL, and `Tab`, `Ctrl+Q` and
+  every printable key go to the device. `Ctrl+]` is the only plain key the
+  terminal keeps, to move the focus back to the sidebar; that is why the
+  sidebar's `]` sends the literal byte. The header always names the shown
+  device, its active baud, the AI control holder, whether this terminal is
+  attached and which pane has the focus.
 - The stream keeps its scrolled-off rows (up to 1000) while the `scrollback`
   setting is on, so earlier output can be read again. `Ctrl+]` focuses the
-  sidebar and `b` there opens the scrollback for the attached device; `↑`/`↓`
-  move a line, `PageUp`/`PageDown` move a page, the mouse wheel moves three
-  lines a notch, and `Esc` returns to the live stream (as does `Ctrl+]` and
-  re-entering the stream from the sidebar). The scrollback view starts at the
+  sidebar and `b` there opens the scrollback for the attached device under the
+  highlight; `↑`/`↓` move a line, `PageUp`/`PageDown` move a page, the mouse
+  wheel moves three lines a notch, and `Esc` returns to that device's live
+  stream (as does opening the device again). The scrollback view starts at the
   live screen; its status line says how far back the view is, and its keys are
   never sent to the device. The device cursor is hidden there. With the setting
   off nothing is kept, `b` says so in the footer instead of opening an empty
-  view, and turning the setting off frees what was kept.
+  view, and turning the setting off frees what was kept. Each device keeps its
+  own scrollback and scrolled position, which a focus switch or a resize never
+  resets.
 - Device output is rendered through a small ANSI screen (cursor movement,
   erase, SGR colours/attributes, OSC titles ignored). AI writes appear inline in
   a distinct colour, without labels; human writes are not added to the stream as
   events.
-- Local echo is on by default: the keys a person types in the stream are shown
-  in the screen's default style once the device accepted the write, so typing
-  is visible on a device that does not echo. Turn it off in the settings when
-  the device echoes what it receives.
-- The settings view lists both flags, `local_echo` and `scrollback`. `Tab`,
-  `Shift+Tab` and `↑`/`↓` move between them, `Space` (or `Enter`) toggles the
-  selection, `Ctrl+S` saves the file and only then puts the changes into
-  effect, and `Esc` throws every change away. With the mouse, a flag row
-  toggles on click, and the `[ Save ]` and `[ Cancel ]` buttons on the page do
-  what they say — a mouse save uses the same save-then-apply path as
-  `Ctrl+S`. A save that fails — including a
+- Local echo is on by default: the keys a person types in the focused stream are
+  shown in the screen's default style once the device accepted the write, so
+  typing is visible on a device that does not echo. Turn it off in the settings
+  when the device echoes what it receives.
+- The settings open in the right pane while the sidebar stays visible. The view
+  lists both flags, `local_echo` and `scrollback`. `Tab`, `Shift+Tab` and
+  `↑`/`↓` move between them, `Space` (or `Enter`) toggles the selection, `Ctrl+S`
+  saves the file and only then puts the changes into effect, and `Esc` throws
+  every change away. With the mouse, a flag row toggles on click, and the
+  `[ Save ]` and `[ Cancel ]` buttons on the page do what they say — a mouse
+  save uses the same save-then-apply path as `Ctrl+S`. Save and Cancel both
+  return to the shown device's live stream. A save that fails — including a
   launch with no settings file to write — leaves the options as they were, says
   so in the footer, and stays in the settings so the draft is not lost; the
-  terminal never reports a save it did not make. Scrollback is saved like the
-  other flag: turning it off frees every session's kept rows and brings the
-  view back to live, and turning it on starts keeping rows from then on.
+  terminal never reports a save it did not make. While the settings hold an
+  unsaved draft, a device opening from the sidebar (Enter or a double-click) is
+  refused with a footer message and the draft is kept, even if the sidebar was
+  clicked; Save or Cancel is the way out. Scrollback is saved like the other
+  flag: turning it off frees every session's kept rows and brings the view back
+  to live, and turning it on starts keeping rows from then on.
 - The footer has a status line (errors, unplug notices, setting changes, the
-  baud prompt) and a line of key hints for the current view. A short terminal
+  baud prompt) and a line of key hints for the focused pane. A short terminal
   keeps the status line and hides the hints.
 - Settings are stored per user in `$XDG_CONFIG_HOME/serial-nexus/terminal.json`
   (`~/.config/serial-nexus/terminal.json` when `XDG_CONFIG_HOME` is unset and
@@ -161,15 +188,18 @@ AI write control.
   handled.
 
 Tests drive the real client/core seam through PTY-backed simulated devices:
-opening by prompt and joining, switching without reopening, local echo on by
-default and off after a saved change, the stream owning `Tab` and `Ctrl+Q` while
-the sidebar quits on `Ctrl+Q`, the sidebar sending a literal `Ctrl+]`, `b` from
+opening by prompt, Enter and double-click, joining without reopening, a single
+click only highlighting a row and never redirecting a write, focus switching
+with `Ctrl+]`, the stream owning `Tab` and `Ctrl+Q` while the sidebar quits on
+`Ctrl+Q`, the sidebar sending a literal `Ctrl+]` to the shown device, `b` from
 the sidebar opening the scrollback and `Esc` returning to the live stream,
 scrolling with the arrow and page keys through output kept by the `scrollback`
 setting (and nothing kept when it is off), scrollback keys not reaching the
-device, settings drafts saved on `Ctrl+S`
-and discarded on `Esc`, device echo, visible AI writes, baud conflicts, unplug
-notices, explicit disconnect and shutdown.
+device, settings drafts saved on `Ctrl+S` and discarded on `Esc`, an unsaved
+draft refusing device opening, a resize keeping the session, draft and scroll
+position, a disconnect keeping the settings and other sessions, device echo,
+visible AI writes, baud conflicts, unplug notices, explicit disconnect and
+shutdown.
 State/input/render and the terminal cleanup guard are tested without a real
 terminal.
 
