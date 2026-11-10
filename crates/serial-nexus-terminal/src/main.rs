@@ -92,7 +92,10 @@ fn event_loop(
                     }
                 }
                 event::Event::Mouse(mouse) => handle_mouse(app, last_area, mouse),
-                event::Event::Resize(_, _) => terminal.autoresize()?,
+                event::Event::Resize(_, _) => {
+                    app.handle_resize();
+                    terminal.autoresize()?;
+                }
                 _ => {}
             }
         }

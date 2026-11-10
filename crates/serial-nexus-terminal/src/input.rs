@@ -51,6 +51,8 @@ pub enum Action {
     EnterScrollback,
     /// Leave the scrollback view for the live stream.
     LeaveScrollback,
+    /// Cancel a pending baud prompt and move the keyboard focus.
+    PromptCancelFocus,
     /// Open the settings that the sidebar button offers.
     OpenSettings,
     SettingsMove(i32),
@@ -80,6 +82,9 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
             Key::Char(ch) => Action::PromptChar(ch),
             Key::Enter => Action::PromptSubmit,
             Key::Esc => Action::PromptCancel,
+            // The prompt is modal, but the focus shortcut still works: it
+            // drops the prompt and moves to the other pane.
+            Key::Ctrl(']') => Action::PromptCancelFocus,
             Key::Backspace => Action::PromptBackspace,
             _ => Action::Ignore,
         };
@@ -102,11 +107,11 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
     match (state.focus, state.view) {
         (Focus::Sidebar, _) => match key {
             Key::Ctrl('q') | Key::F(10) => Action::Quit,
-            // The sidebar can still feed the shown device: `]` is the literal
-            // Ctrl+] the stream cannot send without leaving it, and Tab is
-            // ordinary terminal input.
-            Key::Char(']') => Action::Write(vec![0x1d]),
-            Key::Tab => Action::Write(vec![b'\t']),
+            // The sidebar can still feed the shown device while the right
+            // pane is its stream: `]` is the literal Ctrl+] the stream cannot
+            // send without leaving it. It writes nothing while the settings
+            // or scrollback own the pane.
+            Key::Char(']') if state.view == View::Stream => Action::Write(vec![0x1d]),
             Key::Up | Key::Char('k') => Action::Select(-1),
             Key::Down | Key::Char('j') => Action::Select(1),
             Key::PageUp => Action::Select(-10),
@@ -317,15 +322,37 @@ mod tests {
     }
 
     #[test]
-    fn the_sidebar_sends_the_literal_ctrl_bracket_and_tab_to_the_shown_device() {
+    fn the_sidebar_sends_only_the_literal_ctrl_bracket_to_the_shown_device() {
         let mut state = state_with_two_devices();
         state.add_session(7, "/dev/ttyUSB0", 115_200, None);
         // The highlight moves to another row; the shown device does not.
         state.select_index(1);
         assert_eq!(map_key(&state, Key::Char(']')), Action::Write(vec![0x1d]));
-        assert_eq!(map_key(&state, Key::Tab), Action::Write(b"\t".to_vec()));
+        assert_eq!(
+            map_key(&state, Key::Tab),
+            Action::Ignore,
+            "typed device input belongs to the focused stream"
+        );
         // Printable commands are still commands here.
         assert_eq!(map_key(&state, Key::Char('b')), Action::StartBaudPrompt);
+    }
+
+    #[test]
+    fn the_sidebar_writes_nothing_while_settings_or_scrollback_own_the_pane() {
+        let mut state = state_with_two_devices();
+        state.add_session(7, "/dev/ttyUSB0", 115_200, None);
+        state.begin_settings();
+        state.focus = Focus::Sidebar;
+        assert_eq!(map_key(&state, Key::Char(']')), Action::Ignore);
+        assert_eq!(map_key(&state, Key::Tab), Action::Ignore);
+
+        state.view = View::Scrollback;
+        assert_eq!(map_key(&state, Key::Char(']')), Action::Ignore);
+        assert_eq!(map_key(&state, Key::Tab), Action::Ignore);
+
+        state.view = View::Stream;
+        assert_eq!(map_key(&state, Key::Char(']')), Action::Write(vec![0x1d]));
+        assert_eq!(map_key(&state, Key::Tab), Action::Ignore);
     }
 
     #[test]
@@ -336,8 +363,8 @@ mod tests {
         assert_eq!(map_key(&state, Key::Enter), Action::PromptSubmit);
         assert_eq!(map_key(&state, Key::Esc), Action::PromptCancel);
         assert_eq!(map_key(&state, Key::Backspace), Action::PromptBackspace);
-        // The prompt owns the keys: Ctrl+] cannot pull the focus away.
-        assert_eq!(map_key(&state, Key::Ctrl(']')), Action::Ignore);
+        // Ctrl+] drops the prompt so the focus can move.
+        assert_eq!(map_key(&state, Key::Ctrl(']')), Action::PromptCancelFocus);
     }
 
     #[test]

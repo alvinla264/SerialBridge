@@ -276,9 +276,15 @@ fn unplug_is_reported_outside_the_stream_and_session_is_dropped() {
     let notice = app.state.notice.as_ref().expect("unplug notice");
     assert!(notice.text.contains("unplugged"), "{}", notice.text);
     assert!(notice.text.contains(&path), "{}", notice.text);
-    assert_eq!(app.state.focus, Focus::Right, "the terminal stays usable");
+    assert_eq!(
+        app.state.focus,
+        Focus::Sidebar,
+        "the keys return to the sidebar, not to another device"
+    );
 
-    // A write after the unplug is refused with a notice, not a local echo.
+    // Focus the stream again: a write after the unplug is refused with a
+    // notice, not a local echo.
+    app.handle_key(Key::Ctrl(']'));
     app.handle_key(Key::Char('x'));
     app.pump();
     assert!(app.state.sessions.is_empty());
@@ -784,11 +790,14 @@ fn clicking_a_device_row_and_typing_never_redirects_a_write() {
         "nothing was sent to the other device"
     );
 
-    // The sidebar's literal Ctrl+] and Tab also go to the shown device, even
-    // with another row highlighted.
+    // The sidebar's literal Ctrl+] also goes to the shown device, even with
+    // another row highlighted.
     app.handle_key(Key::Ctrl(']'));
     app.handle_key(Key::Char(']'));
     first.read_until(&[0x1d], Duration::from_secs(3));
+    // Tab is typed device input, so it belongs to the focused stream: focus
+    // the right pane first and it reaches the shown device.
+    app.handle_key(Key::Ctrl(']'));
     app.handle_key(Key::Tab);
     first.read_until(b"\t", Duration::from_secs(3));
     assert!(
@@ -1432,6 +1441,180 @@ fn without_scrollback_output_is_not_kept_and_the_keys_do_nothing() {
     let notice = app.state.notice.as_ref().expect("the refusal is reported");
     assert!(notice.text.contains("scrollback is off"), "{}", notice.text);
     assert_eq!(app.state.shown_session().unwrap().screen.scroll(), 0);
+
+    app.shutdown();
+}
+
+#[test]
+fn a_quick_second_click_on_a_settings_flag_is_not_swallowed() {
+    use ratatui::layout::Rect;
+    use serial_nexus_terminal::render::{panes, settings_layout};
+
+    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let mut app = app(&socket);
+    app.open_settings();
+    let area = Rect::new(0, 0, 100, 16);
+    let layout = settings_layout(panes(area).right).expect("settings layout");
+    let at = Instant::now();
+    app.handle_mouse(
+        area,
+        MouseEventKind::Down(MouseButton::Left),
+        layout.rows.x,
+        layout.rows.y,
+        at,
+    );
+    assert!(
+        !app.state.draft.local_echo,
+        "the first click toggles it off"
+    );
+    app.handle_mouse(
+        area,
+        MouseEventKind::Down(MouseButton::Left),
+        layout.rows.x,
+        layout.rows.y,
+        at + Duration::from_millis(50),
+    );
+    assert!(
+        app.state.draft.local_echo,
+        "the second click toggles it back on, not swallowed as a double-click"
+    );
+
+    app.shutdown();
+}
+
+#[test]
+fn ctrl_bracket_drops_a_baud_prompt_and_moves_the_focus() {
+    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let device = SimulatedDevice::new();
+    let mut app = app(&socket);
+    app.state
+        .set_devices(vec![serial_nexus_terminal::state::DeviceEntry::new(
+            &device.path,
+        )]);
+    app.handle_key(Key::Enter);
+    assert!(app.state.prompt.is_some());
+    app.handle_key(Key::Ctrl(']'));
+    assert!(app.state.prompt.is_none(), "the prompt is dropped");
+    assert_eq!(app.state.focus, Focus::Right, "the focus still moves");
+
+    app.shutdown();
+}
+
+#[test]
+fn a_double_click_opens_the_row_it_started_on_after_the_list_scrolls() {
+    use ratatui::layout::Rect;
+    use serial_nexus_terminal::render::{panes, sidebar};
+    use serial_nexus_terminal::state::DeviceEntry;
+
+    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let mut app = app(&socket);
+    let devices: Vec<DeviceEntry> = (0..12)
+        .map(|index| DeviceEntry::new(format!("/dev/ttyUSB{index:02}")))
+        .collect();
+    app.state.set_devices(devices.clone());
+    // Scrolled so the first visible row is device 1 while device 11 is
+    // highlighted.
+    app.state.select_index(11);
+
+    let area = Rect::new(0, 0, 80, 16);
+    let list = sidebar(panes(area).sidebar).unwrap().list;
+    assert_eq!(list.height, 11);
+    let at = Instant::now();
+    app.handle_mouse(
+        area,
+        MouseEventKind::Down(MouseButton::Left),
+        list.x,
+        list.y,
+        at,
+    );
+    // The first click highlighted device 1 and scrolled the list back to the
+    // top, so hit-testing the same cell again would find device 0.
+    assert_eq!(
+        app.state
+            .selected_device()
+            .map(|device| device.path.clone()),
+        Some(devices[1].path.clone())
+    );
+    app.handle_mouse(
+        area,
+        MouseEventKind::Down(MouseButton::Left),
+        list.x,
+        list.y,
+        at + Duration::from_millis(50),
+    );
+    let prompt = app.state.prompt.as_ref().expect("the double-click opened");
+    assert_eq!(prompt.path, devices[1].path, "the row the click started on");
+
+    app.shutdown();
+}
+
+#[test]
+fn clicking_or_leaving_the_right_pane_cancels_a_pending_baud_prompt() {
+    use ratatui::layout::Rect;
+    use serial_nexus_terminal::render::{panes, settings_layout};
+
+    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let device = SimulatedDevice::new();
+    let mut app = app(&socket);
+    app.state
+        .set_devices(vec![serial_nexus_terminal::state::DeviceEntry::new(
+            &device.path,
+        )]);
+
+    // A prompt started from the sidebar is cancelled by clicking the visible
+    // right pane, which then owns the keys.
+    let area = Rect::new(0, 0, 100, 16);
+    app.handle_key(Key::Char('b'));
+    assert!(app.state.prompt.is_some());
+    let right = panes(area).right;
+    click(&mut app, area, right.x, right.y);
+    assert!(app.state.prompt.is_none(), "the click cancelled the prompt");
+    assert_eq!(app.state.focus, Focus::Right);
+
+    // The same through Settings: start a prompt in the sidebar, then use the
+    // settings' Cancel button. The stream comes back without a prompt
+    // swallowing its keys.
+    app.open_settings();
+    app.handle_key(Key::Ctrl(']'));
+    assert_eq!(app.state.focus, Focus::Sidebar);
+    app.handle_key(Key::Char('b'));
+    assert!(app.state.prompt.is_some());
+    let layout = settings_layout(panes(area).right).expect("settings layout");
+    click(&mut app, area, layout.cancel.x + 1, layout.cancel.y);
+    assert!(app.state.prompt.is_none(), "Cancel leaves no prompt behind");
+    assert_eq!(app.state.view, View::Stream);
+    assert_eq!(app.state.focus, Focus::Right);
+
+    app.shutdown();
+}
+
+#[test]
+fn a_baud_prompt_cannot_open_past_an_unsaved_settings_draft() {
+    let (_dir, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let device = SimulatedDevice::new();
+    let mut app = app(&socket);
+    app.state
+        .set_devices(vec![serial_nexus_terminal::state::DeviceEntry::new(
+            &device.path,
+        )]);
+
+    app.open_settings();
+    app.handle_key(Key::Ctrl(']'));
+    app.handle_key(Key::Char('b'));
+    assert!(
+        app.state.prompt.is_some(),
+        "a clean draft may ask for a baud"
+    );
+    // A settings click can make the draft dirty while the prompt is pending.
+    app.state.draft.local_echo = false;
+    app.handle_key(Key::Enter);
+
+    assert!(app.state.prompt.is_none(), "the refused prompt is dropped");
+    assert!(app.state.sessions.is_empty(), "nothing was opened");
+    assert_eq!(app.state.view, View::Settings, "the settings stay open");
+    assert!(app.state.has_unsaved_settings(), "the draft is kept");
+    let notice = app.state.notice.as_ref().expect("the refusal is reported");
+    assert!(notice.text.contains("Save or Cancel"), "{}", notice.text);
 
     app.shutdown();
 }

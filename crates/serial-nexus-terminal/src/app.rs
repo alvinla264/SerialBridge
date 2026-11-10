@@ -18,6 +18,22 @@ use crate::state::{short_holder, AppState, DeviceEntry, Focus, Notice, View, SET
 /// Two clicks on the same cell within this long count as a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
+/// What the first click of a possible double-click landed on. It is kept by
+/// identity, not by cell: the first click can move the sidebar's viewport, so
+/// hit-testing the second click at the same cell would find another row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ClickTarget {
+    Device(String),
+    Settings,
+}
+
+struct LastClick {
+    at: Instant,
+    column: u16,
+    row: u16,
+    target: Option<ClickTarget>,
+}
+
 /// Wire the app to a connected core. The core is started by
 /// [`Client::connect`] (the auto-start seam), not by the TUI.
 pub struct App {
@@ -29,7 +45,7 @@ pub struct App {
     /// Where a changed setting is saved, when this launch has a settings file.
     settings_store: Option<SettingsStore>,
     /// The last click, for recognising a double-click on a device row.
-    last_click: Option<(Instant, u16, u16)>,
+    last_click: Option<LastClick>,
 }
 
 impl App {
@@ -110,6 +126,9 @@ impl App {
     /// only Ctrl+] leaves; in the sidebar, the command keys act on the
     /// highlighted row and Ctrl+Q quits.
     pub fn handle_key(&mut self, key: Key) {
+        // A keyboard action changes the panes under a pending click; the next
+        // click must not complete a double-click on a control that moved.
+        self.last_click = None;
         let action = map_key(&self.state, key);
         match action {
             Action::Quit => self.state.quit = true,
@@ -128,6 +147,10 @@ impl App {
             Action::PromptBackspace => self.state.prompt_backspace(),
             Action::PromptCancel => self.state.prompt = None,
             Action::PromptSubmit => self.submit_baud_prompt(),
+            Action::PromptCancelFocus => {
+                self.state.prompt = None;
+                self.toggle_focus();
+            }
             Action::Write(bytes) => self.write_shown(&bytes, key),
             Action::Scroll(delta) => self.scroll_stream(delta),
             Action::EnterScrollback => self.enter_scrollback(),
@@ -160,10 +183,7 @@ impl App {
     /// `b` gets here; a closed device has none and `b` asks for its baud rate
     /// instead, and with the scrollback setting off there is nothing to show.
     fn enter_scrollback(&mut self) {
-        if self.state.has_unsaved_settings() {
-            self.state.notice = Some(Notice::error(
-                "settings have unsaved changes: Save or Cancel first",
-            ));
+        if self.refuse_if_unsaved_settings() {
             return;
         }
         let Some(session) = self.state.highlighted_session() else {
@@ -205,6 +225,10 @@ impl App {
 
     /// Show one attached session in the right pane and give it the keyboard.
     fn show_session(&mut self, device_id: u64) {
+        // A device opened or joined by mouse or keyboard is the surface the
+        // human now works on; a baud prompt for another row must not keep the
+        // keys.
+        self.state.prompt = None;
         self.state.show_device(device_id);
         self.show_live_stream();
     }
@@ -259,6 +283,9 @@ impl App {
         }
         match hit_test(&self.state, area, column, row) {
             Some(Hit::Device(index)) => {
+                // A click ends a pending baud prompt for another row; opening
+                // still takes an Enter or a double-click.
+                self.state.prompt = None;
                 self.state.focus = Focus::Sidebar;
                 self.select_row_index(index);
                 return;
@@ -275,6 +302,9 @@ impl App {
         // In a narrow terminal the single visible pane must already be the
         // right one; clicking the sidebar does not fall through to it.
         if in_right && (panes.split || self.state.focus == Focus::Right) {
+            // Clicking the visible right pane takes the keys for it, so a baud
+            // prompt must not keep editing a sidebar row in the background.
+            self.state.prompt = None;
             self.state.focus = Focus::Right;
             if self.state.view == View::Settings {
                 match settings_hit_test(&self.state, right, column, row) {
@@ -303,14 +333,26 @@ impl App {
     ) {
         match kind {
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                let double = self.last_click.is_some_and(|(then, x, y)| {
-                    x == column && y == row && at.saturating_duration_since(then) < DOUBLE_CLICK
+                let double = self.last_click.as_ref().is_some_and(|last| {
+                    last.target.is_some()
+                        && last.column == column
+                        && last.row == row
+                        && at.saturating_duration_since(last.at) < DOUBLE_CLICK
                 });
                 if double {
-                    self.last_click = None;
-                    self.handle_double_click(area, column, row);
+                    let target = self.last_click.take().and_then(|last| last.target);
+                    self.activate_target(target);
                 } else {
-                    self.last_click = Some((at, column, row));
+                    // Remember what this click landed on before it moves the
+                    // sidebar's viewport; the second click of a double-click
+                    // must open that same row, not whatever moved under it.
+                    let target = self.click_target(area, column, row);
+                    self.last_click = Some(LastClick {
+                        at,
+                        column,
+                        row,
+                        target,
+                    });
                     self.handle_click(area, column, row);
                 }
             }
@@ -320,17 +362,45 @@ impl App {
         }
     }
 
-    /// A double-click on a device row opens or joins it; on the Settings button
-    /// it opens the settings; anywhere else it behaves like a single click.
-    pub fn handle_double_click(&mut self, area: Rect, column: u16, row: u16) {
+    /// What a click at one cell would open on a double-click.
+    fn click_target(&self, area: Rect, column: u16, row: u16) -> Option<ClickTarget> {
         match hit_test(&self.state, area, column, row) {
-            Some(Hit::Device(index)) => {
+            Some(Hit::Device(index)) => self
+                .state
+                .devices
+                .get(index)
+                .map(|device| ClickTarget::Device(device.path.clone())),
+            Some(Hit::Settings) => Some(ClickTarget::Settings),
+            None => None,
+        }
+    }
+
+    /// A double-click on a device row opens or joins it; on the Settings button
+    /// it opens the settings; anywhere else the first click already did all
+    /// there is to do (the right pane took the focus).
+    pub fn handle_double_click(&mut self, area: Rect, column: u16, row: u16) {
+        let target = self.click_target(area, column, row);
+        self.activate_target(target);
+    }
+
+    fn activate_target(&mut self, target: Option<ClickTarget>) {
+        match target {
+            Some(ClickTarget::Device(path)) => {
+                self.state.prompt = None;
                 self.state.focus = Focus::Sidebar;
-                self.select_row_index(index);
-                self.open_selected();
+                if let Some(index) = self
+                    .state
+                    .devices
+                    .iter()
+                    .position(|device| device.path == path)
+                {
+                    self.state.select_index(index);
+                    self.open_selected();
+                }
             }
-            Some(Hit::Settings) => self.open_settings(),
-            None => self.handle_click(area, column, row),
+            Some(ClickTarget::Settings) => self.open_settings(),
+            // The first click already did all there is to do (focus a pane).
+            None => {}
         }
     }
 
@@ -345,6 +415,18 @@ impl App {
     /// that are already open keeps the draft.
     pub fn open_settings(&mut self) {
         self.state.begin_settings();
+    }
+
+    /// Refuse a device-opening attempt while the settings hold unsaved
+    /// changes, reporting why and keeping the draft. Returns whether it did.
+    fn refuse_if_unsaved_settings(&mut self) -> bool {
+        if self.state.has_unsaved_settings() {
+            self.state.notice = Some(Notice::error(
+                "settings have unsaved changes: Save or Cancel first",
+            ));
+            return true;
+        }
+        false
     }
 
     /// Save the draft settings, then keep the draft and go back to the shown
@@ -378,10 +460,7 @@ impl App {
     /// While the settings hold unsaved changes, opening is refused and the
     /// draft is kept: Save or Cancel is the only way out of the settings.
     pub fn open_selected(&mut self) {
-        if self.state.has_unsaved_settings() {
-            self.state.notice = Some(Notice::error(
-                "settings have unsaved changes: Save or Cancel first",
-            ));
+        if self.refuse_if_unsaved_settings() {
             return;
         }
         let Some(device) = self.state.selected_device() else {
@@ -431,6 +510,12 @@ impl App {
         let Some(prompt) = self.state.prompt.take() else {
             return;
         };
+        // A prompt can outlive a clean settings view that then gained a draft
+        // (a flag click); the opening attempt is refused like any other, and
+        // the draft is kept.
+        if self.refuse_if_unsaved_settings() {
+            return;
+        }
         match prompt.value() {
             Ok(baud) => match self.open_path(&prompt.path, Some(baud)) {
                 Ok(_) => {}
@@ -449,10 +534,7 @@ impl App {
     }
 
     fn start_baud_prompt(&mut self) {
-        if self.state.has_unsaved_settings() {
-            self.state.notice = Some(Notice::error(
-                "settings have unsaved changes: Save or Cancel first",
-            ));
+        if self.refuse_if_unsaved_settings() {
             return;
         }
         if self.state.begin_baud_prompt() {
@@ -540,6 +622,12 @@ impl App {
 
     pub fn resize_stream(&mut self, rows: usize, cols: usize) {
         self.state.resize(rows, cols);
+    }
+
+    /// The terminal was resized: a pending first click must not complete a
+    /// double-click on a control that has moved to another cell.
+    pub fn handle_resize(&mut self) {
+        self.last_click = None;
     }
 }
 

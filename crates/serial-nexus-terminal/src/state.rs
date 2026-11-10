@@ -280,6 +280,9 @@ impl AppState {
     /// Return to the stream of the device the right pane was showing. Save and
     /// Cancel both land here, on the live screen the human was looking at.
     fn leave_settings(&mut self) {
+        // A baud prompt belongs to the sidebar; leaving the settings must not
+        // hand the returned stream's keys back to it.
+        self.prompt = None;
         self.view = View::Stream;
         self.focus = Focus::Right;
         if let Some(session) = self.shown_session_mut() {
@@ -353,13 +356,6 @@ impl AppState {
     pub fn highlighted_session(&self) -> Option<&Session> {
         let path = &self.selected_device()?.path;
         self.sessions.values().find(|session| &session.path == path)
-    }
-
-    pub fn highlighted_session_mut(&mut self) -> Option<&mut Session> {
-        let path = self.selected_device()?.path.clone();
-        self.sessions
-            .values_mut()
-            .find(|session| session.path == path)
     }
 
     /// Show a session in the right pane without changing the highlight.
@@ -521,18 +517,23 @@ impl AppState {
                 .values()
                 .min_by(|left, right| left.path.cmp(&right.path))
                 .map(|session| session.device_id);
-            if self.view == View::Scrollback {
-                // The scrollback of the session that went away is gone, so a
-                // remaining one starts on its own live screen; its kept rows
-                // and scrolled position are untouched.
-                self.view = View::Stream;
-            }
-            if self.view == View::Stream {
+            match self.view {
                 // The stream forwards keys to the device, so it always shows
                 // the live screen of the session that takes over.
-                if let Some(session) = self.shown.and_then(|id| self.sessions.get_mut(&id)) {
-                    session.screen.scroll_to_bottom();
+                View::Stream => {
+                    if let Some(session) = self.shown.and_then(|id| self.sessions.get_mut(&id)) {
+                        session.screen.scroll_to_bottom();
+                    }
+                    // A stream that suddenly belongs to another device must
+                    // not swallow the next queued keys as writes: the human
+                    // opens or joins it again before typing.
+                    self.focus = Focus::Sidebar;
                 }
+                // Scrollback keys only navigate; a remaining session keeps its
+                // own kept rows and scrolled position. With nothing left, the
+                // view falls back to the empty stream.
+                View::Scrollback if self.shown.is_none() => self.view = View::Stream,
+                View::Scrollback | View::Settings => {}
             }
         }
         Some(session)
@@ -718,6 +719,54 @@ mod tests {
         assert!(!state.draft.local_echo, "the draft is kept");
         let notice = state.notice.as_ref().expect("the disconnect is reported");
         assert!(notice.text.contains("unplugged"), "{}", notice.text);
+    }
+
+    #[test]
+    fn a_disconnect_in_the_stream_returns_the_keys_to_the_sidebar() {
+        let mut state = AppState::new(10, 80);
+        state.add_session(7, "/dev/a", 115_200, None);
+        state.add_session(8, "/dev/b", 115_200, None);
+        state.show_device(8);
+        state.view = View::Stream;
+        state.focus = Focus::Right;
+
+        state.remove_session(8);
+
+        assert_eq!(state.shown_session().unwrap().device_id, 7);
+        assert_eq!(
+            state.focus,
+            Focus::Sidebar,
+            "the next keys are commands, not writes to the fallback device"
+        );
+    }
+
+    #[test]
+    fn a_disconnect_in_scrollback_leaves_navigation_on_the_remaining_session() {
+        let mut state = AppState::new(6, 20);
+        state.add_session(7, "/dev/a", 115_200, None);
+        state.add_session(8, "/dev/b", 115_200, None);
+        for index in 0..12 {
+            let line = format!("line{index}\r\n");
+            state.apply_event(&Event::device_output(7, line.as_bytes()));
+        }
+        // B is the shown session; its own screen stays where it was.
+        state.show_device(8);
+        state.sessions.get_mut(&8).unwrap().screen.scroll_back(2);
+        state.view = View::Scrollback;
+        state.focus = Focus::Right;
+
+        state.apply_event(&Event::DeviceClosed {
+            device_id: 8,
+            path: "/dev/b".into(),
+            reason: "removed".into(),
+        });
+
+        assert_eq!(
+            state.view,
+            View::Scrollback,
+            "the arrow keys still navigate, not write to the fallback"
+        );
+        assert_eq!(state.shown_session().unwrap().device_id, 7);
     }
 
     #[test]

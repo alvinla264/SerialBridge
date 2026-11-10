@@ -111,14 +111,22 @@ AI write control.
   or joins an open one at its active rate and shows it. Other attached devices
   stay attached. The row markers tell them apart: `▸` is both highlighted and
   shown, `›` only highlighted, `▹` only shown.
+- If the shown device disconnects, a notice says so, the terminal stays open,
+  and the other attached sessions stay attached: the right pane shows the next
+  one and the keyboard focus returns to the sidebar (scrollback keeps its
+  navigation keys). Opening or joining a device takes typing again.
 - In the sidebar, `↑`/`↓` (or `j`/`k`) highlight, `Enter` (or `o`) opens or
   joins the highlighted device, `b` shows the highlighted attached device's
   scrollback (or, for a closed device that has none, the baud prompt) and `d`
   disconnects the highlighted device. The bottom row is the Settings button:
   highlight it with the arrow keys and open it with `Enter`, or click it with
   the mouse. `Ctrl+Q` quits from here, even while the baud prompt is open. `]`
-  sends a literal `Ctrl+]` to the shown device and `Tab` sends a tab. Opening
-  the settings abandons an open baud prompt.
+  sends a literal `Ctrl+]` to the shown device while that device's stream is in
+  the right pane; it writes nothing while the settings or scrollback are shown,
+  and no other key typed in the sidebar reaches a device. `Ctrl+]` during the
+  baud prompt drops the prompt and moves the focus. Opening the settings
+  abandons an open baud prompt, and clicking the visible right pane takes the
+  keys back from a pending prompt.
 - In the focused stream, keys are sent to the shown device as-is: arrows are
   ANSI sequences, Enter is CR and Backspace is DEL, and `Tab`, `Ctrl+Q` and
   every printable key go to the device. `Ctrl+]` is the only plain key the

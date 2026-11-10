@@ -107,7 +107,7 @@ pub fn panes(area: Rect) -> Panes {
         };
     }
     let room = main.width.saturating_sub(MIN_RIGHT_WIDTH + SEPARATOR_WIDTH);
-    let width = (main.width / 3)
+    let width = (main.width * 2 / 5)
         .clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH)
         .min(room);
     let sidebar = Rect::new(main.x, main.y, width, main.height);
@@ -500,14 +500,14 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u1
             .sessions
             .values()
             .any(|session| session.path == device.path);
+        // The dot already says open or closed, so the status leads with the
+        // baud and then the AI holder and description, most useful first. A
+        // narrow row clips the tail instead of hiding all of it.
         let mut status = if attached {
-            format!(
-                "open {}",
-                device.baud.map(|b| b.to_string()).unwrap_or_default()
-            )
+            device.baud.map(|b| b.to_string()).unwrap_or_default()
         } else if device.open {
             format!(
-                "open by other {}",
+                "other {}",
                 device.baud.map(|b| b.to_string()).unwrap_or_default()
             )
         } else {
@@ -599,7 +599,7 @@ fn draw_settings(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u
             layout.rows.width,
             1,
         );
-        draw_row(
+        draw_value_row(
             buffer,
             line,
             &format!("{} {name}", if selected { "▸" } else { " " }),
@@ -708,12 +708,20 @@ fn draw_stream(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16
         let visible_row = row.min(area.height.saturating_sub(1) as usize);
         let visible_col = col.min(area.width.saturating_sub(1) as usize);
         let cell = session.screen.view_cell(visible_row, visible_col);
+        // Reverse the cell so it stands out; on device reverse video, remove
+        // the reverse instead, or the cursor would be invisible there.
+        let mut style = screen_style(cell.style);
+        style = if cell.style.reverse {
+            style.remove_modifier(Modifier::REVERSED)
+        } else {
+            style.add_modifier(Modifier::REVERSED)
+        };
         put_cell(
             buffer,
             area.x + visible_col as u16,
             area.y + visible_row as u16,
             &cell.ch.to_string(),
-            screen_style(cell.style).add_modifier(Modifier::REVERSED),
+            style,
         );
     }
     Some((
@@ -827,6 +835,14 @@ fn draw_row(buffer: &mut Buffer, area: Rect, label: &str, value: &str, style: RS
     put(buffer, area, 0, &text, style);
 }
 
+fn draw_value_row(buffer: &mut Buffer, area: Rect, label: &str, value: &str, style: RStyle) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let text = row_text_label(label, value, area.width as usize);
+    put(buffer, area, 0, &text, style);
+}
+
 fn row_text(label: &str, value: &str, width: usize) -> String {
     if value.is_empty() {
         return fit(label, width);
@@ -839,10 +855,43 @@ fn row_text(label: &str, value: &str, width: usize) -> String {
         line.push_str(value);
         fit(&line, width)
     } else {
-        // Too narrow for both: the label wins, and the value gives way. A
-        // sidebar this narrow must still name the device in full.
-        fit(label, width)
+        // Too narrow for both: the label wins, and the value is clipped rather
+        // than dropped. A sidebar this narrow must still name the device, and
+        // still show as much of its baud/control status as fits.
+        let keep = width.saturating_sub(label_width + 1);
+        if keep < 3 || label_width >= width {
+            return fit(label, width);
+        }
+        let mut line = label.to_string();
+        line.push(' ');
+        line.push_str(fit(value, keep).trim_end());
+        fit(&line, width)
     }
+}
+
+/// A settings row: the short value must stay visible even when the label has
+/// to give way.
+fn row_text_label(label: &str, value: &str, width: usize) -> String {
+    if value.is_empty() {
+        return fit(label, width);
+    }
+    let label_width = display_width(label) as usize;
+    let value_width = display_width(value) as usize;
+    if label_width + value_width < width {
+        let mut line = label.to_string();
+        line.push_str(&" ".repeat(width - label_width - value_width));
+        line.push_str(value);
+        return fit(&line, width);
+    }
+    let keep = width.saturating_sub(value_width + 1);
+    let mut line = fit(label, keep).trim_end().to_string();
+    while display_width(&line) as usize > keep {
+        line.pop();
+    }
+    line.push_str(&" ".repeat(keep.saturating_sub(display_width(&line) as usize)));
+    line.push(' ');
+    line.push_str(value);
+    fit(&line, width)
 }
 
 fn highlighted(selected: bool) -> RStyle {
@@ -984,10 +1033,22 @@ mod tests {
         let text = screen(&state, 100, 16).join("\n");
         assert!(text.contains("Devices (2)"), "{text}");
         assert!(text.contains("/dev/ttyUSB0"), "{text}");
+        assert!(text.contains("57600"), "the baud stays visible: {text}");
         assert!(text.contains("[ Settings ]"), "{text}");
         assert!(text.contains("ready"), "the stream is beside it: {text}");
         // The stream starts in the right pane, not at the screen edge.
         assert_eq!(buffer[(panes.right.x, panes.right.y)].symbol(), "r");
+    }
+
+    #[test]
+    fn an_eighty_column_sidebar_still_shows_a_devices_status() {
+        let state = demo();
+        let text = screen(&state, 80, 16).join("\n");
+        let row = text
+            .lines()
+            .find(|line| line.contains("● /dev/ttyUSB1"))
+            .expect("shown row");
+        assert!(row.contains("57600"), "the baud is visible: {row:?}");
     }
 
     #[test]
@@ -1079,6 +1140,34 @@ mod tests {
             cell.modifier.contains(Modifier::REVERSED),
             "the live cursor is drawn as a reversed cell: {cell:?}"
         );
+    }
+
+    #[test]
+    fn the_live_cursor_stays_visible_on_device_reverse_video() {
+        let mut state = demo();
+        state.apply_event(&Event::device_output(7, b"\x1b[7mA\x1b[D"));
+        assert_eq!(state.focus, Focus::Sidebar);
+        let area = Rect::new(0, 0, 100, 16);
+        let right = panes(area).right;
+        let mut buffer = Buffer::empty(area);
+        render(&state, &mut buffer, area);
+        let cell = &buffer[(right.x, right.y)];
+        assert_eq!(cell.symbol(), "A");
+        assert!(
+            !cell.modifier.contains(Modifier::REVERSED),
+            "reverse is removed so the cursor is not invisible: {cell:?}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_settings_view_keeps_the_value_visible() {
+        let mut state = demo();
+        state.begin_settings();
+        state.draft.local_echo = false;
+        let area = Rect::new(0, 0, 13, 10);
+        let text = screen(&state, 13, 10).join("\n");
+        assert!(text.contains("off"), "{text}");
+        assert!(settings_layout(panes(area).right).is_some());
     }
 
     #[test]
