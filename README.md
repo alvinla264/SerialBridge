@@ -7,6 +7,10 @@ core. The core owns each device; the MCP server gives AI hosts tool access, and
 an interactive terminal lets a human observe and type without taking AI control.
 Linux is supported; macOS and Windows are not currently supported.
 
+![SerialNexus terminal showing the device sidebar beside a live serial stream](docs/terminal-screenshot.png)
+
+*The terminal connected to an STM32 Nucleo board: devices on the left, live serial output on the right.*
+
 ## Table of contents
 
 - [Quick start](#quick-start)
