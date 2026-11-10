@@ -86,6 +86,27 @@ path as a real serial port and the test drives the master. Covered end to end:
   footer layout are covered by unit tests, and its settings cover defaults, a missing file, round trips,
   invalid and unreadable files left untouched, and save failures.
 
+The real `serial-nexus-terminal` binary is also driven in a pseudo-terminal
+(`crates/serial-nexus-terminal/tests/pty_tui.rs`): a real core, two simulated
+devices, raw mode and mouse capture, and a terminal emulator reading back the
+drawn screen. It checks the sidebar beside the stream at a usable width, two
+devices' independent streams and scrollback, a single click highlighting
+without switching or redirecting input, Enter and double-click switching, keys
+reaching only the shown device, `Ctrl+]` focus switching, SIGWINCH resize to a
+narrow focused pane and back without losing sessions or the scroll position, the
+settings page on the right with mouse and keyboard Save/Cancel, a failed save
+leaving the options unchanged, a dirty draft surviving a resize and refusing
+device opening, explicit disconnect and an unplug leaving the other session
+usable, literal `Ctrl+]`, `Tab`/arrows/`Ctrl+Q` forwarding, an AI client writing
+beside the human, local echo off, scrollback off clearing every session's kept
+rows (also while it is off) without them returning when it is turned back on,
+and `Ctrl+Q` quitting. It joins both devices before resizing, so both sessions
+are shown to survive with their own output and keys.
+
+The PTY fixtures pre-open their devices, so opening a closed device through the
+baud prompt, device discovery, and a hand-edited invalid settings file staying
+untouched are covered at the app and client/core seams, not through this PTY.
+
 `serial-nexus-mcp` additionally has end-to-end tests over real MCP stdio framing:
 handshake and tool listing, protocol errors, default and joined baud, rejected
 conflicts, two independent sessions with read-only takeover, exact writes,
@@ -93,5 +114,7 @@ waited sends, partial lines, timeouts, disconnect releasing control, detached
 and missing devices, an unplugged device, and auto-start.
 
 Not proven here: real hardware and drivers, PTY behaviour that differs from
-USB serial adapters, platforms other than Linux, and `libudev`-based
-enumeration (device discovery reads `/dev/serial/by-id` and `/sys/class/tty`).
+USB serial adapters, platforms other than Linux, terminals other than what the
+`vt100` emulator models in the PTY tests (truecolour, unusual key encodings),
+and `libudev`-based enumeration (device discovery reads `/dev/serial/by-id`
+and `/sys/class/tty`).
