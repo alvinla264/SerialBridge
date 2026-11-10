@@ -98,6 +98,10 @@ struct AuthorizedDevice {
 struct SessionState {
     /// Canonical path to the identity authorized at check time.
     devices: BTreeMap<String, AuthorizedDevice>,
+    /// Paths whose shared device just closed. Only these paths may deliver a
+    /// `DeviceClosed` event to remote clients; a later open clears the mark so
+    /// unrelated device instances at the same path stay invisible.
+    vacated: std::collections::BTreeSet<String>,
     authenticated: usize,
     pending: usize,
 }
@@ -183,6 +187,7 @@ pub fn prepare(
         ai,
         state: Mutex::new(SessionState {
             devices: allowlist,
+            vacated: std::collections::BTreeSet::new(),
             authenticated: 0,
             pending: 0,
         }),
@@ -279,6 +284,15 @@ impl SharingSession {
             ));
         }
         let stored = stored.identity.clone();
+        if !stored.still_valid() {
+            if let Some(entry) = state.devices.get_mut(&canonical) {
+                entry.expired = true;
+            }
+            return Err(ErrorBody::new(
+                ErrorCode::DeviceFailed,
+                format!("{canonical} changed since it was checked; check it again"),
+            ));
+        }
         let current = DeviceIdentity::capture(&canonical).ok();
         match current {
             Some(current) if current == stored => Ok(current),
@@ -349,7 +363,8 @@ impl SharingSession {
             entry.expired = true;
         }
         if let Ok(canonical) = std::fs::canonicalize(path) {
-            if let Some(entry) = state.devices.get_mut(canonical.to_string_lossy().as_ref()) {
+            let canonical = canonical.to_string_lossy().into_owned();
+            if let Some(entry) = state.devices.get_mut(&canonical) {
                 entry.expired = true;
             }
         }
@@ -365,14 +380,32 @@ impl SharingSession {
             .is_some_and(|entry| !entry.expired)
     }
 
-    /// True when the path was checked in this session, even if it has since
-    /// expired; used only to filter events for attached remote clients.
-    pub fn names_path(&self, path: &str) -> bool {
+    /// Mark that a shared device just closed, so its `DeviceClosed` event may
+    /// reach remote clients. A later open of the path clears it.
+    pub fn mark_vacated(&self, path: &str) {
+        let mut state = self.state.lock().expect("share state lock");
+        if state.devices.get(path).is_some_and(|entry| !entry.expired) {
+            state.vacated.insert(path.to_string());
+        }
+    }
+
+    /// True only for a path whose shared device just closed.
+    pub fn is_vacated(&self, path: &str) -> bool {
         self.state
             .lock()
             .expect("share state lock")
-            .devices
-            .contains_key(path)
+            .vacated
+            .contains(path)
+    }
+
+    /// A device instance opened at this path: later closure events for it are
+    /// its own, not the previous instance's.
+    pub fn clear_vacated(&self, path: &str) {
+        self.state
+            .lock()
+            .expect("share state lock")
+            .vacated
+            .remove(path);
     }
 
     pub fn snapshot(&self) -> SharingSnapshot {

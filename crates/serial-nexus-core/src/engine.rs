@@ -460,6 +460,9 @@ impl Engine {
         session: Option<&Arc<SharingSession>>,
     ) -> Result<ResponseData, ErrorBody> {
         let (kind, name) = self.identity(client_id);
+        // A local open also clears a previous instance's closure mark; the
+        // session is needed for that even when no identity check is involved.
+        let session = session.cloned().or_else(|| self.sharing_session());
         // Resolve aliases (symlinks, `..`) so two paths to one device join the
         // same open device instead of colliding at the OS level.
         let port = identity_path(&params.port);
@@ -517,7 +520,7 @@ impl Engine {
                 // Re-check that the authorization still exists after the open,
                 // while the engine state lock keeps a concurrent close/revoke
                 // from racing this device into service.
-                if let (Some(session), Some(expected)) = (session, expected) {
+                if let (Some(session), Some(expected)) = (session.as_ref(), expected) {
                     let still_shared = session
                         .authorize(&port)
                         .map(|current| current == *expected)
@@ -528,6 +531,9 @@ impl Engine {
                             format!("{port} is no longer shared; check it again"),
                         ));
                     }
+                }
+                if let Some(session) = session.as_ref() {
+                    session.clear_vacated(&port);
                 }
                 let write_port = read_port.try_clone().map_err(|error| {
                     ErrorBody::new(
@@ -797,7 +803,6 @@ impl Engine {
             .get(&client_id)
             .copied()
             .unwrap_or(0);
-        record_written_lines(device, source, &data);
         device
             .write_tx
             .as_ref()
@@ -826,6 +831,7 @@ impl Engine {
                     format!("device {} was closed", params.device_id),
                 ),
             })?;
+        record_written_lines(device, source, &data);
 
         let pending = params.wait.and_then(|spec| {
             if spec.lines == 0 {
@@ -1067,13 +1073,17 @@ impl Engine {
                 session.as_deref(),
             )
         };
+        let path = removed.as_ref().map(|device| device.path.clone());
         if let Some(device) = removed {
             join_devices(vec![device]);
         }
-        // Tell clients (including remote ones) first: the allowlist still
+        // Tell clients (including remote ones) first: the vacated mark still
         // names the path, so a shared device's failure is reported rather than
         // silently disappearing.
         self.emit(events);
+        if let (Some(session), Some(path)) = (session.as_ref(), path) {
+            session.revoke_path(&path);
+        }
     }
 
     fn remove_waiter(&self, device_id: u64, waiter_id: u64) -> Vec<HistoryLine> {
@@ -1304,9 +1314,41 @@ impl Engine {
     /// Stop sharing: close the listener, disconnect every remote client and
     /// revoke the session's credentials.
     pub fn stop_sharing(&self) {
+        // Queued, not-yet-started remote writes must not run after sharing
+        // stops; bump every remote client's generation before disconnecting.
+        self.revoke_remote_writes();
         let session = self.sharing.lock().expect("sharing lock").take();
         if let Some(session) = session {
             session.stop();
+        }
+    }
+
+    fn revoke_remote_writes(&self) {
+        let remote_ids: HashSet<u64> = self
+            .clients
+            .lock()
+            .expect("clients lock")
+            .iter()
+            .filter(|(_, record)| record.remote.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        if remote_ids.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock().expect("state lock");
+        for device in state.devices.values_mut() {
+            for client in device
+                .clients
+                .keys()
+                .filter(|client| remote_ids.contains(client))
+            {
+                *device
+                    .write_epochs
+                    .lock()
+                    .expect("write epochs lock")
+                    .entry(*client)
+                    .or_insert(0) += 1;
+            }
         }
     }
 
@@ -1690,7 +1732,7 @@ impl Engine {
     /// matched by its path, because its engine entry is already gone.
     fn remote_may_see(&self, session: &SharingSession, event: &Event) -> bool {
         if let Event::DeviceClosed { path, .. } = event {
-            return session.names_path(path);
+            return session.is_vacated(path);
         }
         match event.device_id() {
             Some(device_id) => {
@@ -1837,10 +1879,10 @@ fn take_device_locked(
     session: Option<&SharingSession>,
 ) -> Option<Device> {
     let mut device = state.devices.remove(&device_id)?;
-    // A closed device can no longer prove its identity (a replacement can
-    // reuse its path), so its authorization ends here and must be rechecked.
+    // The shared authorization survives an ordinary close (and its identity
+    // pins the node), but remote clients may learn that this instance closed.
     if let Some(session) = session {
-        session.revoke_path(&device.path);
+        session.mark_vacated(&device.path);
     }
     device.stop.store(true, Ordering::SeqCst);
     // End the writer thread. The caller joins both I/O threads after the

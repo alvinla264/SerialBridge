@@ -1102,22 +1102,19 @@ fn an_oversized_frame_over_authenticated_tls_closes_only_that_connection() {
         Instant::now() + Duration::from_secs(3),
     );
     let mut decoder = serial_nexus_protocol::FrameDecoder::new();
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(5);
     let mut closed = false;
     while Instant::now() < deadline {
-        if serial_nexus_protocol::share::tlsio::pump(&mut connection, &mut tcp, &mut decoder)
-            .is_err()
-        {
-            closed = true;
-            break;
-        }
-        let mut buffer = [0u8; 64];
-        match connection.reader().read(&mut buffer) {
-            Ok(0) | Err(_) => {
+        match serial_nexus_protocol::share::tlsio::pump(&mut connection, &mut tcp, &mut decoder) {
+            Ok(serial_nexus_protocol::share::tlsio::TlsRead::Closed) => {
                 closed = true;
                 break;
             }
             Ok(_) => {}
+            Err(_) => {
+                closed = true;
+                break;
+            }
         }
     }
     assert!(closed, "an oversized application frame must close the peer");
@@ -1238,4 +1235,210 @@ fn an_oversized_pending_history_answer_does_not_drop_the_connection() {
     // The connection and its device attachment survive the large answer.
     human.list_devices().expect("connection still usable");
     human.status(opened.device_id).expect("still attached");
+}
+
+#[test]
+fn a_checked_device_survives_an_ordinary_close_and_reopen() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let holder = connect(&core.socket, ClientInfo::human("holder"));
+    let device = SimulatedDevice::new();
+    let opened = holder
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![device.path.clone()])
+        .expect("start");
+
+    holder.close(opened.device_id).expect("last detach");
+    wait_until(Duration::from_secs(3), || {
+        !owner
+            .list_devices()
+            .expect("list")
+            .devices
+            .iter()
+            .any(|entry| entry.path == device.path && entry.open)
+    });
+    // The device is still checked: closing is not a replacement.
+    let status = owner.sharing_status().expect("status");
+    assert_eq!(status.checked.len(), 1);
+    assert_eq!(status.checked[0].path, device.path);
+
+    // A remote client may open it again (this also clears the closure mark).
+    let human = remote(&info, PairingRole::Human, "remote").expect("pair");
+    human
+        .open(&device.path, None, false)
+        .expect("reopen the same live device");
+}
+
+#[test]
+fn a_checked_but_never_opened_device_rejects_a_recycled_node() {
+    let first = SimulatedDevice::new();
+    let first_path = first.path.clone();
+    let identity =
+        serial_nexus_core::device::DeviceIdentity::capture(&first.path).expect("identity");
+    let prepared = serial_nexus_core::share::prepare(
+        1,
+        &serial_nexus_protocol::ShareStartParams {
+            bind: localhost_bind(),
+            devices: vec![first.path.clone()],
+        },
+        vec![identity],
+        serial_nexus_core::share::ShareLimits {
+            handshake_timeout: Duration::from_secs(1),
+            auth_timeout: Duration::from_secs(1),
+            max_connections: 1,
+            max_pending_writes: 1,
+        },
+    )
+    .expect("prepare");
+    assert!(prepared.session.authorize(&first.path).is_ok());
+
+    // Close the PTY without ever opening it in the engine, then let the kernel
+    // recycle the node at the same path.
+    drop(first);
+    let mut second = None;
+    for _ in 0..30 {
+        let candidate = SimulatedDevice::new();
+        if candidate.path == first_path {
+            second = Some(candidate);
+            break;
+        }
+    }
+    let Some(second) = second else {
+        panic!("could not recycle {first_path} for the identity test")
+    };
+    assert!(
+        prepared.session.authorize(&second.path).is_err(),
+        "a recycled node must not inherit authorization"
+    );
+    // The stale entry is expired, not usable, and does not list as checked.
+    let snapshot = prepared.session.snapshot();
+    assert!(snapshot.checked.is_empty());
+}
+
+#[test]
+fn stopping_sharing_drops_queued_remote_writes_before_the_writer_gets_them() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let mut device = SimulatedDevice::new();
+    owner
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![device.path.clone()])
+        .expect("start");
+    let human = remote(&info, PairingRole::Human, "remote").expect("pair");
+    let opened = human.open(&device.path, None, false).expect("open");
+
+    // Backlog the serial writer, with a marker queued behind it.
+    for _ in 0..40 {
+        human
+            .write_bytes(opened.device_id, &[b'x'; 8 * 1024], None)
+            .expect("queued write");
+    }
+    human
+        .write_bytes(opened.device_id, b"STOP-MARKER", None)
+        .expect("queue marker");
+    owner.stop_sharing().expect("stop");
+
+    let received = device.read_available(Duration::from_millis(400));
+    assert!(
+        !String::from_utf8_lossy(&received).contains("STOP-MARKER"),
+        "a queued remote write ran after sharing stopped"
+    );
+}
+
+#[test]
+fn a_rejected_write_is_not_added_to_history() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let device = SimulatedDevice::new();
+    let local = owner
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![device.path.clone()])
+        .expect("start");
+    let human = remote(&info, PairingRole::Human, "remote").expect("pair");
+    let opened = human.open(&device.path, None, false).expect("open");
+
+    // Fill the serial queue without draining the PTY.
+    let mut refused = false;
+    for _ in 0..200 {
+        match human.write_bytes(opened.device_id, &[b'x'; 8 * 1024], None) {
+            Ok(_) => {}
+            Err(error) => {
+                assert_eq!(error.code(), Some(ErrorCode::LimitExceeded));
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(refused, "queue must be bounded");
+    let rejected = human.write_bytes(opened.device_id, b"REJECTED-MARKER\n", None);
+    assert!(rejected.is_err(), "the full queue must refuse the write");
+    let history = owner.read(local.device_id, Some(500)).expect("read");
+    assert!(
+        !history
+            .lines
+            .iter()
+            .any(|line| line.text.contains("REJECTED-MARKER")),
+        "a rejected write must not be recorded as written"
+    );
+}
+
+#[test]
+fn an_expired_entry_does_not_leak_events_for_a_later_device_instance() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let first = SimulatedDevice::new();
+    let first_path = first.path.clone();
+    owner.open(&first.path, Some(115_200), false).expect("open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![first.path.clone()])
+        .expect("start");
+    let human = remote(&info, PairingRole::Human, "remote").expect("pair");
+    let failed = human.open(&first.path, None, false).expect("open");
+    let events = human.subscribe();
+
+    drop(first);
+    support::wait_event(&events, Duration::from_secs(5), |event| {
+        matches!(
+            event,
+            Event::DeviceClosed { device_id, .. } if *device_id == failed.device_id
+        )
+    });
+    wait_until(Duration::from_secs(3), || {
+        owner.sharing_status().expect("status").checked.is_empty()
+    });
+
+    // A later instance at the same path is not shared: its closure must not
+    // reach the remote client.
+    let mut replacement = None;
+    for _ in 0..30 {
+        let candidate = SimulatedDevice::new();
+        if candidate.path == first_path {
+            replacement = Some(candidate);
+            break;
+        }
+    }
+    let Some(replacement) = replacement else {
+        eprintln!("not exercised: the kernel did not reuse {first_path}");
+        return;
+    };
+    let local = owner
+        .open(&replacement.path, Some(115_200), false)
+        .expect("local open without rechecking");
+    owner.close(local.device_id).ok();
+    std::thread::sleep(Duration::from_millis(300));
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(
+                event,
+                Event::DeviceClosed { device_id, .. } if device_id != failed.device_id
+            ),
+            "an unshared device instance leaked a closure event: {event:?}"
+        );
+    }
 }

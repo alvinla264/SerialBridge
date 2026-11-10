@@ -34,6 +34,9 @@ pub struct DeviceIdentity {
     dev: u64,
     ino: u64,
     rdev: u64,
+    /// Link count when captured. A node that has been unlinked (`nlink == 0`)
+    /// is no longer the device at its path, even if the numbers are recycled.
+    links: u64,
     /// An `O_PATH` descriptor opened when the identity was captured. Holding
     /// it pins the device node, so the kernel cannot hand the same inode to a
     /// replacement at the same path while this authorization exists.
@@ -48,6 +51,7 @@ impl std::fmt::Debug for DeviceIdentity {
             .field("dev", &self.dev)
             .field("ino", &self.ino)
             .field("rdev", &self.rdev)
+            .field("links", &self.links)
             .finish_non_exhaustive()
     }
 }
@@ -92,12 +96,16 @@ impl DeviceIdentity {
             dev: stat.st_dev,
             ino: stat.st_ino,
             rdev: stat.st_rdev,
+            links: stat.st_nlink,
             holder: Arc::new(holder),
         }
     }
 
     fn same_node(&self, other: &Self) -> bool {
-        self.dev == other.dev && self.ino == other.ino && self.rdev == other.rdev
+        self.dev == other.dev
+            && self.ino == other.ino
+            && self.rdev == other.rdev
+            && self.links == other.links
     }
 
     /// True when the node behind the canonical path is still the same one.
@@ -106,7 +114,9 @@ impl DeviceIdentity {
             Ok(stat)
                 if self.dev == stat.st_dev
                     && self.ino == stat.st_ino
-                    && self.rdev == stat.st_rdev => {}
+                    && self.rdev == stat.st_rdev
+                    && stat.st_nlink == self.links
+                    && stat.st_nlink > 0 => {}
             _ => return false,
         }
         match Self::capture(&self.canonical) {

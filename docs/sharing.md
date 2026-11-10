@@ -84,11 +84,14 @@ type:
   plus an `O_PATH` descriptor that pins the node, captured when checked. It is
   revalidated on `Open`, `Read`, `Write`, `Status`, `Close` and on the open
   itself: the serial descriptor's `fstat` and the canonical path must both
-  still be that node. A changed node, an unplug, or the device closing for any
-  reason expires the entry: access stops at once and the path stays only long
-  enough for attached remote clients to receive `DeviceClosed`. Expired
-  entries are not "checked", are not listed, and never grant access; an
-  explicit `ShareCheck` with a live identity is required again.
+  still be that node, and the pinned node must still be linked (`nlink > 0`).
+  A changed node or an unplug expires the entry: access stops at once and the
+  path stays only long enough for attached remote clients to receive
+  `DeviceClosed`. An ordinary last-detach close keeps the checked entry (the
+  pinned node proves it is the same device), so reopening the same device does
+  not need a recheck. Expired entries are not "checked", are not listed, and
+  never grant access; an explicit `ShareCheck` with a live identity is required
+  again.
 - **Every operation.** `ListDevices` is filtered to checked devices. Remote
   requests for other device ids or paths fail with `PermissionDenied`,
   `NotFound` or `NotAttached`; they are not merely hidden from a UI. Events are
@@ -103,10 +106,12 @@ type:
   yet started commands are dropped by the writer. Local clients and other
   shared devices are untouched. A write already in progress can still finish or
   partially reach the device; there is no rollback and no automatic replay.
-- **Owner loss / stop.** The listener is closed and every remote socket is shut
-  down; remote waits fail and the client sees the connection end. Late writes
-  that were already queued are reported as uncertain
-  (`may_have_reached_device: true`) and are never retried.
+- **Owner loss / stop.** The listener is closed, every remote socket is shut
+  down and every remote client's write generation is bumped, so queued but not
+  yet started remote writes are dropped (a write already in progress may
+  finish). Remote waits fail and the client reports uncertainty
+  (`ClientError::WriteUncertain` / `may_have_reached_device: true`); nothing is
+  retried.
 
 ## Bound resources
 
