@@ -1604,12 +1604,20 @@ impl Engine {
                 event: event.clone(),
             };
             for (tx, remote) in &clients {
-                if let Some(session) = remote {
-                    if !self.remote_may_see(session, &event) {
-                        continue;
+                match remote {
+                    Some(session) => {
+                        if !self.remote_may_see(session, &event) {
+                            continue;
+                        }
+                        // A slow remote peer loses events (it can re-read
+                        // history); it must never grow core memory or block
+                        // local clients.
+                        let _ = tx.try_send(message.clone());
+                    }
+                    None => {
+                        let _ = tx.send(message.clone());
                     }
                 }
-                let _ = tx.send(message.clone());
             }
         }
     }

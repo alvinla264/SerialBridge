@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{bounded, unbounded};
 use ring::rand::SecureRandom;
 use serial_nexus_protocol::share::tlsio;
 use serial_nexus_protocol::{
@@ -522,7 +522,11 @@ fn run_connection(
         .map(|name| name.chars().take(64).collect::<String>())
         .or_else(|| Some("remote".to_string()));
 
-    let (events_tx, events_rx) = unbounded::<ServerMessage>();
+    // Events are droppable for a slow remote peer (it can re-read history);
+    // responses and waited-write answers use their own unbounded-by-limit path
+    // so they are never dropped.
+    let (events_tx, events_rx) = bounded::<ServerMessage>(1024);
+    let (responses_tx, responses_rx) = unbounded::<ServerMessage>();
     let id = engine.register_remote_client(events_tx.clone(), Arc::clone(session), kind, name);
     *client_id = Some(id);
     session.mark_authenticated();
@@ -544,7 +548,12 @@ fn run_connection(
     loop {
         while let Some(body) = decoder.next_frame().map_err(|_| ())? {
             let message = RemoteRequestMessage::decode(&body).map_err(|_| ())?;
-            handle_remote_request(engine, session, id, message, &events_tx, &pending_writes);
+            handle_remote_request(engine, session, id, message, &responses_tx, &pending_writes);
+        }
+        while let Ok(message) = responses_rx.try_recv() {
+            let frame = encode_frame(&message).map_err(|_| ())?;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            tlsio::write_frame(&mut connection, &mut tcp, &frame, deadline).map_err(|_| ())?;
         }
         while let Ok(message) = events_rx.try_recv() {
             let frame = encode_frame(&message).map_err(|_| ())?;

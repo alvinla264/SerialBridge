@@ -117,6 +117,9 @@ type:
 - At most `MAX_SHARED_DEVICES` checked devices per session.
 - The engine's existing `read_max_lines` and `write_max_timeout` still bound
   result sizes and waits.
+- Each remote connection has a bounded event queue (1024 messages). A peer
+  that falls behind loses events rather than growing core memory or blocking
+  local clients; it can re-read history through `Read`.
 
 ## Local compatibility
 
