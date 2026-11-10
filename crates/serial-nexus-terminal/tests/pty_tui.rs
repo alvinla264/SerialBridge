@@ -757,8 +757,9 @@ fn stream_keys_ai_output_local_echo_and_scrollback_off_are_visible() {
     tui.wait_for_text("device-echo");
 }
 
-/// A quitting terminal restores the alternate screen: this runs the real
-/// binary and checks the process exits through its own cleanup path.
+/// A quitting terminal leaves the alternate screen and restores cooked
+/// input: `quit` fails on a non-zero exit, a screen left in alt mode, or a
+/// PTY still in raw mode.
 #[test]
 fn ctrl_q_from_the_sidebar_quits_and_restores_the_terminal() {
     let fixture = Fixture::new();

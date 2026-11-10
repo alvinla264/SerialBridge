@@ -18,6 +18,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use nix::pty::{openpty, Winsize};
 use vt100::Parser;
 
@@ -61,6 +62,18 @@ impl TuiSession {
         .expect("openpty");
         let master = File::from(pty.master);
         let slave = File::from(pty.slave);
+        // Parallel tests spawn several terminals: without close-on-exec, one
+        // child would inherit another fixture's PTY ends and keep its reader
+        // from finishing. The stdio dups made by `Command` still reach the
+        // child on fds 0..2, where close-on-exec is cleared.
+        for file in [&master, &slave] {
+            let flags = fcntl(file.as_raw_fd(), FcntlArg::F_GETFD).expect("get fd flags");
+            fcntl(
+                file.as_raw_fd(),
+                FcntlArg::F_SETFD(FdFlag::from_bits_truncate(flags) | FdFlag::FD_CLOEXEC),
+            )
+            .expect("close-on-exec");
+        }
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_serial-nexus-terminal"));
         command
@@ -221,21 +234,63 @@ impl TuiSession {
         }
     }
 
+    /// Whether the emulator is on the alternate screen the TUI entered.
+    pub fn alternate_screen(&self) -> bool {
+        self.parser
+            .lock()
+            .expect("screen lock")
+            .screen()
+            .alternate_screen()
+    }
+
+    /// Whether the terminal's settings are back to cooked line input with
+    /// echo, which raw mode turns off while the TUI runs.
+    pub fn terminal_restored(&self) -> bool {
+        nix::sys::termios::tcgetattr(&self.master)
+            .map(|termios| {
+                termios.local_flags.contains(
+                    nix::sys::termios::LocalFlags::ECHO | nix::sys::termios::LocalFlags::ICANON,
+                )
+            })
+            .unwrap_or(false)
+    }
+
     /// Quit the terminal the way a human would: make sure the sidebar has the
-    /// keys, then `Ctrl+Q`. The process exit is part of the check.
+    /// keys, then `Ctrl+Q`. A zero exit status, the alternate screen left and
+    /// the PTY's termios restored are all part of the check, so a killed or
+    /// crashed process cannot pass.
     pub fn quit(mut self) {
         // Ctrl+] twice returns the focus to the sidebar whatever pane has it.
         self.send(KEY_CTRL_BRACKET);
         self.send(KEY_CTRL_BRACKET);
         self.send(KEY_CTRL_Q);
         let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            if self.child.try_wait().expect("try_wait").is_some() {
-                return;
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("try_wait") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                panic!("the terminal did not quit on Ctrl+Q");
             }
             std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            status.success(),
+            "the terminal exited with {status}, not through its cleanup path"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while self.alternate_screen() {
+            assert!(
+                Instant::now() < deadline,
+                "the terminal never left the alternate screen"
+            );
+            std::thread::sleep(Duration::from_millis(20));
         }
-        panic!("the terminal did not quit on Ctrl+Q");
+        assert!(
+            self.terminal_restored(),
+            "the terminal's raw mode was not restored"
+        );
     }
 }
 
