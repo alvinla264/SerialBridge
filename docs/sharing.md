@@ -151,6 +151,14 @@ performs the TLS trust and pin checks, authenticates, then exposes
 `subscribe`. The terminal and MCP remote clients should use it (or the same
 `serial_nexus_protocol` types) rather than re-implementing TLS.
 
+## Board gate
+
+`docs/board-gate.md` is the coordinator's real-hardware, real-LAN acceptance
+procedure (no flashing). It runs the ignored `board_gate` integration test
+against a real STM32 and one concrete LAN address: local open, sharing start,
+remote pair/list/join/read, optional probe and echo, uncheck revocation, and
+local access after stop.
+
 ## Not covered here
 
 - The terminal UI for choosing an address/devices and showing pairing
