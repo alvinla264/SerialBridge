@@ -143,6 +143,55 @@ directory and one-core-per-user lock are unchanged. Sharing is layered on top
 and never changes local request or event shapes; the only addition is the five
 owner control requests and their answers.
 
+## Test seams
+
+Two `#[doc(hidden)]` process-wide hooks exist so automated tests can exercise
+real authorization paths deterministically. Production code never installs
+them; they only replace discovery or the I/O implementation:
+
+- `enumerate::install_port_lister`: makes an existing real device node appear
+  in detection, so a checked-but-never-opened device can be shared and opened
+  remotely. Authorization still captures and validates the real node, the
+  real open, and the same allowlist/identity checks.
+- `device::install_serial_factory`: after the real device is opened and its
+  identity validated, replaces only the read/write implementation. Tests use
+  it to fail after a known prefix and prove uncertainty reporting and no
+  replay.
+
+`crates/serial-nexus-core/tests/seams.rs` runs both seams and holds a lock while
+installing them. They are test infrastructure, not a configuration surface.
+
+## Final-round security fixes and tests
+
+The last independent review (head `c587b01`) confirmed three majors, all fixed
+after that round. Their tests are on the final branch but the fixes themselves
+have **not had another independent review**; the coordinator must assess them
+before merge.
+
+- **Remote list/event visibility of a replacement.** Discovery and event
+  filtering now require the exact open device instance to have been authorized
+  for sharing (`Device.shared`, set at open, at check, and when sharing
+  starts), not merely a path present in the allowlist. Tests:
+  `an_expired_entry_does_not_leak_events_for_a_later_device_instance`,
+  `a_replacement_at_the_same_path_does_not_inherit_authorization`,
+  `a_checked_device_survives_an_ordinary_close_and_reopen`,
+  `a_checked_but_never_opened_device_rejects_a_recycled_node`.
+- **Queued remote writes from detached clients.** Each device has a remote-write
+  generation; uncheck, stop and owner loss bump it, and the writer drops any
+  queued remote command with an old generation, independent of whether its
+  client is still attached. Local queued writes are unaffected. Tests:
+  `queued_writes_from_a_detached_remote_client_are_revoked`,
+  `stopping_sharing_drops_queued_remote_writes_before_the_writer_gets_them`,
+  `a_slow_remote_peer_hits_bounded_pending_writes_and_queued_work_is_revoked`.
+- **Oversized waited-write answer.** A successful waited write is trimmed to a
+  frame-safe budget and stays a successful `WriteResult` (never downgraded to
+  an error), preserving write-outcome semantics. Test:
+  `an_oversized_waited_write_answer_stays_a_successful_write`.
+- Minor fixes from that round: glossary wording now matches the close
+  contract; the incremental frame decoder buffers two complete frames so two
+  valid pipelined frames are not mistaken for an oversized one (protocol unit
+  test `two_pipelined_frames_are_not_mistaken_for_one_oversized_frame`).
+
 ## Test-only adapters
 
 `serial_nexus_client::RemoteClient` is the client-facing remote adapter: it
@@ -166,6 +215,7 @@ local access after stop.
 - Remote terminal and MCP client tasks, and any relay/discovery beyond a
   concrete address the owner enters.
 - mDNS, NAT traversal, non-Linux platforms and hardware behaviour.
-- PTY fixtures are not enumerated by `enumerate::list_ports`, so tests that
-  share a PTY open it in the core first; enumerated real devices do not need
-  that. The production rule (enumerated **or** open) is unchanged.
+- PTY fixtures are not enumerated by the real `enumerate::list_ports`, so most
+  sharing tests open a PTY in the core first. The injected-lister test covers
+  the checked-but-never-opened enumerated path; the production rule
+  (enumerated **or** open) is unchanged.

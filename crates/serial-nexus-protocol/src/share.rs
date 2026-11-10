@@ -382,6 +382,23 @@ mod tests {
     }
 
     #[test]
+    fn two_pipelined_frames_are_not_mistaken_for_one_oversized_frame() {
+        let first = encode_frame(&"a".repeat(MAX_REMOTE_FRAME_BYTES - 8)).unwrap();
+        let second = encode_frame(&"b").unwrap();
+        let mut decoder = FrameDecoder::new();
+        decoder.push(&first).unwrap();
+        decoder.push(&second).unwrap();
+        let body = decoder.next_frame().unwrap().expect("first");
+        assert_eq!(
+            body,
+            serde_json::to_vec(&"a".repeat(MAX_REMOTE_FRAME_BYTES - 8)).unwrap()
+        );
+        let body = decoder.next_frame().unwrap().expect("second");
+        assert_eq!(serde_json::from_slice::<String>(&body).unwrap(), "b");
+        assert!(decoder.next_frame().unwrap().is_none());
+    }
+
+    #[test]
     fn a_partial_frame_waits_for_the_rest() {
         let frame = encode_frame(&"hello").unwrap();
         let mut decoder = FrameDecoder::new();

@@ -1,7 +1,7 @@
 use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -161,6 +161,20 @@ pub fn open_serial(path: &str, baud: u32) -> io::Result<Box<dyn serialport::Seri
     open_serial_checked(path, baud, None)
 }
 
+/// Test-only serial I/O seam. The real device node is still opened and its
+/// identity validated first; only the I/O implementation is replaced.
+#[doc(hidden)]
+pub type SerialFactory =
+    dyn Fn(&str, u32) -> io::Result<Box<dyn serialport::SerialPort>> + Send + Sync;
+
+static SERIAL_FACTORY: Mutex<Option<Arc<SerialFactory>>> = Mutex::new(None);
+
+/// Install or clear the process-wide test serial factory.
+#[doc(hidden)]
+pub fn install_serial_factory(factory: Option<Arc<SerialFactory>>) {
+    *SERIAL_FACTORY.lock().expect("serial factory lock") = factory;
+}
+
 /// Open a serial port and, when `expected` is given, refuse the open unless the
 /// descriptor is that exact device node. The identity is checked on the open
 /// file descriptor, so swapping the path between the check and the open cannot
@@ -188,6 +202,10 @@ pub fn open_serial_checked(
                 format!("{path} changed since it was checked; check it again"),
             ));
         }
+    }
+    if let Some(factory) = SERIAL_FACTORY.lock().expect("serial factory lock").clone() {
+        drop(port);
+        return factory(path, baud);
     }
     Ok(Box::new(port))
 }
