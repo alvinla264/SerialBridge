@@ -484,6 +484,7 @@ impl Engine {
         session: Option<&Arc<SharingSession>>,
     ) -> Result<ResponseData, ErrorBody> {
         let (kind, name) = self.identity(client_id);
+        let remote = self.remote_scope(client_id).is_some();
         // A local open also clears a previous instance's closure mark; the
         // session is needed for that even when no identity check is involved.
         let session = session.cloned().or_else(|| self.sharing_session());
@@ -508,10 +509,7 @@ impl Engine {
                     if device.identity != *expected || !device.identity.still_valid() {
                         return Err(ErrorBody::new(
                             ErrorCode::DeviceFailed,
-                            format!(
-                                "{} changed since it was checked; check it again",
-                                device.path
-                            ),
+                            "device changed since it was checked; check it again",
                         ));
                     }
                 }
@@ -528,10 +526,17 @@ impl Engine {
                     }
                 }
                 if let Some(session) = session.as_ref() {
-                    device.shared = session
+                    let authorized = session
                         .authorize(&device.path)
                         .ok()
                         .filter(|identity| device_matches_identity(device, identity));
+                    if remote && authorized.is_none() {
+                        return Err(ErrorBody::new(
+                            ErrorCode::DeviceFailed,
+                            "device is no longer shared; check it again",
+                        ));
+                    }
+                    device.shared = authorized;
                 }
                 attach(
                     device,
@@ -643,10 +648,17 @@ impl Engine {
                 state.devices.insert(device_id, device);
                 let device = state.devices.get_mut(&device_id).expect("just inserted");
                 if let Some(session) = session.as_ref() {
-                    device.shared = session
+                    let authorized = session
                         .authorize(&device.path)
                         .ok()
                         .filter(|identity| device_matches_identity(device, identity));
+                    if remote && authorized.is_none() {
+                        return Err(ErrorBody::new(
+                            ErrorCode::DeviceFailed,
+                            "device is no longer shared; check it again",
+                        ));
+                    }
+                    device.shared = authorized;
                 }
                 attach(
                     device,
@@ -1689,6 +1701,15 @@ impl Engine {
     /// Revalidate an open instance against the current session and expire it
     /// if its node is no longer the authorized one.
     fn revalidate_shared_instance(&self, device_id: u64, session: &SharingSession) -> bool {
+        // Collect first to preserve the clients -> state lock order.
+        let remote_ids: HashSet<u64> = self
+            .clients
+            .lock()
+            .expect("clients lock")
+            .iter()
+            .filter(|(_, record)| record.remote.is_some())
+            .map(|(id, _)| *id)
+            .collect();
         let mut state = self.state.lock().expect("state lock");
         let Some(device) = state.devices.get_mut(&device_id) else {
             return false;
@@ -1702,6 +1723,20 @@ impl Engine {
             device.shared = None;
             device.write_epoch.fetch_add(1, Ordering::SeqCst);
             session.revoke_path(&device.path);
+            // Expiry cancels pending remote work, matching uncheck.
+            let mut kept = Vec::new();
+            for waiter in std::mem::take(&mut device.waiters) {
+                if remote_ids.contains(&waiter.client_id) {
+                    let _ = waiter.tx.send(WaitOutcome {
+                        lines: waiter.lines,
+                        timed_out: false,
+                        failed: Some("device is no longer shared".into()),
+                    });
+                } else {
+                    kept.push(waiter);
+                }
+            }
+            device.waiters = kept;
         }
         visible
     }

@@ -270,9 +270,10 @@ impl SharingSession {
                 if let Some(entry) = state.devices.get_mut(requested) {
                     entry.expired = true;
                 }
+                let _ = error;
                 return Err(ErrorBody::new(
                     ErrorCode::NotFound,
-                    format!("{requested} is not a usable device: {error}"),
+                    "requested device is not available",
                 ));
             }
         };
@@ -280,13 +281,13 @@ impl SharingSession {
         let Some(stored) = state.devices.get(&canonical) else {
             return Err(ErrorBody::new(
                 ErrorCode::PermissionDenied,
-                format!("{canonical} is not shared"),
+                "device is not shared",
             ));
         };
         if stored.expired {
             return Err(ErrorBody::new(
                 ErrorCode::DeviceFailed,
-                format!("{canonical} is no longer available; check it again"),
+                "device is no longer available; check it again",
             ));
         }
         let stored = stored.identity.clone();
@@ -296,7 +297,7 @@ impl SharingSession {
             }
             return Err(ErrorBody::new(
                 ErrorCode::DeviceFailed,
-                format!("{canonical} changed since it was checked; check it again"),
+                "device changed since it was checked; check it again",
             ));
         }
         let current = DeviceIdentity::capture(&canonical).ok();
@@ -308,7 +309,7 @@ impl SharingSession {
                 }
                 Err(ErrorBody::new(
                     ErrorCode::DeviceFailed,
-                    format!("{canonical} changed since it was checked; check it again"),
+                    "device changed since it was checked; check it again",
                 ))
             }
         }

@@ -1264,9 +1264,14 @@ fn a_checked_but_never_opened_device_rejects_a_recycled_node() {
 
     std::fs::remove_file(&path).expect("unlink pinned node");
     std::fs::write(&path, b"new").expect("replacement node");
+    let denied = prepared
+        .session
+        .authorize(&path_text)
+        .expect_err("recycled");
     assert!(
-        prepared.session.authorize(&path_text).is_err(),
-        "a recycled node must not inherit authorization"
+        !denied.message.contains(&path_text),
+        "authorization errors must not reveal the canonical target: {}",
+        denied.message
     );
     assert!(prepared.session.snapshot().checked.is_empty());
     // An already-expired entry still gets the closure mark, so remotes that

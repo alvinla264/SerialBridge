@@ -18,9 +18,9 @@ use std::net::{IpAddr, Ipv4Addr, TcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use serial_nexus_client::{ClientInfo, ErrorCode, RemoteClient};
+use serial_nexus_client::{ClientInfo, RemoteClient};
 use serial_nexus_core::device::install_serial_factory;
 use serial_nexus_core::enumerate::{install_port_lister, PortInfo};
 use serial_nexus_protocol::{ShareBind, WaitSpec};
@@ -340,7 +340,7 @@ fn a_partial_serial_write_reports_uncertainty_and_is_never_replayed() {
             }),
         )
         .expect_err("the injected partial write must fail");
-    assert_eq!(error.code(), Some(ErrorCode::DeviceFailed), "{error:?}");
+    assert!(error.is_write_uncertain(), "{error:?}");
     assert!(
         error.to_string().contains("may already have reached"),
         "the failure must report uncertainty: {error}"
@@ -599,6 +599,19 @@ fn discovery_and_events_revalidate_a_stale_shared_identity() {
         .open(&path_text, Some(115_200), false)
         .expect("open injected node");
     let events = remote.subscribe();
+    let waiting = remote.clone();
+    let wait_id = opened.device_id;
+    let waiting = std::thread::spawn(move || {
+        waiting.write_bytes(
+            wait_id,
+            b"WAIT-FOR-EXPIRY\n",
+            Some(serial_nexus_protocol::WaitSpec {
+                lines: 1,
+                timeout_ms: Some(3_000),
+            }),
+        )
+    });
+    std::thread::sleep(Duration::from_millis(100));
 
     // Replace the pinned node. Discovery and event delivery must notice.
     std::fs::remove_file(&path).expect("unlink");
@@ -611,6 +624,16 @@ fn discovery_and_events_revalidate_a_stale_shared_identity() {
             .iter()
             .any(|entry| entry.path == path_text),
         "discovery must expire a stale identity"
+    );
+    let started = Instant::now();
+    let wait_result = waiting.join().expect("wait thread");
+    assert!(
+        wait_result.is_err(),
+        "expiry must cancel the pending waiter"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(1_500),
+        "the waiter was not cancelled by expiry: {wait_result:?}"
     );
     state
         .incoming

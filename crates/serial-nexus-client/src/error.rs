@@ -67,6 +67,21 @@ impl ClientError {
         self.code() == Some(ErrorCode::ControlHeld)
     }
 
+    /// True when a write may have reached the device and must not be replayed,
+    /// whether the uncertainty came from the transport or a server answer.
+    pub fn is_write_uncertain(&self) -> bool {
+        match self {
+            Self::WriteUncertain(_) => true,
+            Self::Server(body) => body
+                .details
+                .as_ref()
+                .and_then(|details| details.get("may_have_reached_device"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
     /// True when the device is gone (unplugged, closed, or failed).
     pub fn is_device_gone(&self) -> bool {
         matches!(
@@ -80,8 +95,16 @@ impl ClientError {
 
 impl From<ErrorBody> for ClientError {
     fn from(error: ErrorBody) -> Self {
+        let uncertain = error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("may_have_reached_device"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         if error.code == ErrorCode::Timeout {
             Self::Timeout(error.message)
+        } else if uncertain {
+            Self::WriteUncertain(error.message)
         } else {
             Self::Server(error)
         }

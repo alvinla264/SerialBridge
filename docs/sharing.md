@@ -326,6 +326,25 @@ fixed with tests:
   PTY-recycling replacement test is `#[ignore]`d because path reuse is not
   guaranteed, with deterministic regular-file identity tests in its place.
 
+### Seventh iterative review fixes
+
+- **Expiry cancels pending remote waiters.** Discovery/event revalidation now
+  fails remote waiters when it expires an instance, matching the documented
+  uncheck behavior. The stale-identity seam test holds a waited write across
+  replacement and asserts it is cancelled promptly.
+- **Authorization errors no longer reveal canonical paths.** Remote callers
+  receive fixed "device is not shared" / "not available" messages; the
+  canonical key stays internal. The recycled-node test asserts no path leak.
+- **Open/uncheck race refuses a remote attach.** If an existing device's
+  re-authorization fails for a remote caller, the open is refused instead of
+  attaching it (or granting control) after the uncheck removed it.
+- **Directed broadcast binds are refused.** Validation derives interface
+  broadcasts from address/netmask as well as `IFF_BROADCAST`, covering
+  `127.255.255.255`. Test: `directed_broadcast_addresses_are_refused`.
+- **Write uncertainty has one client check.** `ClientError::is_write_uncertain`
+  covers both transport uncertainty and server answers with
+  `may_have_reached_device`; server answers map to `WriteUncertain`.
+
 ### Sixth iterative review fixes
 
 - **Legacy local pipelining is restored.** Local request queues are unbounded

@@ -71,8 +71,10 @@ impl ShareBind {
         if address.is_multicast() {
             return Err(format!("{address} is a multicast address"));
         }
-        if address.is_ipv4() && address == IpAddr::V4(std::net::Ipv4Addr::BROADCAST) {
-            return Err("255.255.255.255 is a broadcast address".to_string());
+        if let IpAddr::V4(v4) = address {
+            if v4.is_broadcast() || is_interface_broadcast(v4) {
+                return Err(format!("{address} is a broadcast address"));
+            }
         }
         Ok(())
     }
@@ -80,6 +82,49 @@ impl ShareBind {
     pub fn socket_addr(&self) -> SocketAddr {
         SocketAddr::new(self.address, self.port)
     }
+}
+
+/// True when the address is the directed broadcast of one of this host's
+/// interfaces (for example loopback's `127.255.255.255`).
+#[cfg(unix)]
+fn is_interface_broadcast(address: std::net::Ipv4Addr) -> bool {
+    use nix::ifaddrs::getifaddrs;
+    let Ok(interfaces) = getifaddrs() else {
+        return false;
+    };
+    interfaces.into_iter().any(|interface| {
+        if interface
+            .broadcast
+            .as_ref()
+            .and_then(nix::sys::socket::SockaddrStorage::as_sockaddr_in)
+            .is_some_and(|broadcast| broadcast.ip() == address)
+        {
+            return true;
+        }
+        // Loopback and some interfaces do not expose IFF_BROADCAST; derive it
+        // from the interface address and netmask.
+        let Some(local) = interface
+            .address
+            .as_ref()
+            .and_then(nix::sys::socket::SockaddrStorage::as_sockaddr_in)
+        else {
+            return false;
+        };
+        let Some(mask) = interface
+            .netmask
+            .as_ref()
+            .and_then(nix::sys::socket::SockaddrStorage::as_sockaddr_in)
+        else {
+            return false;
+        };
+        let derived = u32::from(local.ip()) | !u32::from(mask.ip());
+        derived == u32::from(address) && mask.ip() != std::net::Ipv4Addr::UNSPECIFIED
+    })
+}
+
+#[cfg(not(unix))]
+fn is_interface_broadcast(_address: std::net::Ipv4Addr) -> bool {
+    false
 }
 
 impl fmt::Display for ShareBind {
@@ -715,5 +760,18 @@ pub mod tlsio {
                 Err(error) => return Err(error),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod broadcast_tests {
+    use super::*;
+
+    #[test]
+    fn directed_broadcast_addresses_are_refused() {
+        let loopback = ShareBind::new("127.255.255.255".parse().unwrap(), 0);
+        assert!(loopback.validate().is_err());
+        let limited = ShareBind::new("255.255.255.255".parse().unwrap(), 0);
+        assert!(limited.validate().is_err());
     }
 }
