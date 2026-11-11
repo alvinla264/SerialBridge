@@ -23,8 +23,9 @@ a local owner starts one.
 
 ## Pairing and roles
 
-`ShareStart` answers with `ShareSessionInfo`, which is the **only** place the
-secrets exist on the wire:
+`ShareStart` answers with `ShareSessionInfo`, the only server response that
+issues pairing secrets; the authenticated client later sends its credential in
+a `RemoteAuth` frame inside TLS:
 
 - `session_id` (random, 128-bit);
 - `bind` (the actual bound `SocketAddr`, including the port when 0 was asked);
@@ -330,6 +331,17 @@ fixed with tests:
   connection slots, and an unchecked later device instance; the engine-level
   PTY-recycling replacement test is `#[ignore]`d because path reuse is not
   guaranteed, with deterministic regular-file identity tests in its place.
+
+### Twenty-first iterative review fixes
+
+- **Discovery expiry of a draining device bumps its live-writes epoch**, so
+  queued remote commands are revoked even when no open instance remains.
+- **Randomness failures return errors** instead of panicking while engine locks
+  are held.
+- **ShareCheck has only the live-entry check it needs**, with no dead
+  make-room retain.
+- **Board-gate and authorize documentation now state only what the gate and
+  tombstone lifetime actually establish.**
 
 ### Twentieth iterative review fixes
 

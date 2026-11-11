@@ -58,19 +58,19 @@ struct Credential {
 }
 
 impl Credential {
-    fn generate(role: PairingRole) -> (Self, String) {
+    fn generate(role: PairingRole) -> Result<(Self, String), String> {
         let mut bytes = [0u8; 32];
         ring::rand::SystemRandom::new()
             .fill(&mut bytes)
-            .expect("system randomness");
+            .map_err(|_| "could not obtain system randomness".to_string())?;
         let credential = encode_bytes(&bytes);
-        (
+        Ok((
             Self {
                 digest: tls::sha256(credential.as_bytes()),
                 role,
             },
             credential,
-        )
+        ))
     }
 
     /// Constant-time check: the role comes from which stored credential
@@ -157,12 +157,12 @@ pub fn prepare(
     let mut session_id_bytes = [0u8; 16];
     ring::rand::SystemRandom::new()
         .fill(&mut session_id_bytes)
-        .expect("system randomness");
+        .map_err(|_| "could not obtain system randomness".to_string())?;
     let session_id = tls::hex(&session_id_bytes);
 
     let tls = tls::build(&session_id, bind.ip())?;
-    let (human, human_credential) = Credential::generate(PairingRole::Human);
-    let (ai, ai_credential) = Credential::generate(PairingRole::Ai);
+    let (human, human_credential) = Credential::generate(PairingRole::Human)?;
+    let (ai, ai_credential) = Credential::generate(PairingRole::Ai)?;
     debug_assert!(!human.matches(&ai_credential));
 
     let mut allowlist = BTreeMap::new();
@@ -259,8 +259,9 @@ impl SharingSession {
     ///
     /// A path that is not checked, or whose node changed since it was checked
     /// (unplugged, replaced, symlink retargeted), is refused. A changed node is
-    /// marked expired and kept only long enough for attached remotes to see
-    /// `DeviceClosed`; it must be checked again explicitly.
+    /// marked expired and its tombstone (including the pinned descriptor) is
+    /// retained until the next check, uncheck, or session end; it must be
+    /// checked again explicitly.
     pub fn authorize(&self, requested: &str) -> Result<DeviceIdentity, ErrorBody> {
         let canonical = match std::fs::canonicalize(requested) {
             Ok(canonical) => canonical.to_string_lossy().into_owned(),
@@ -329,11 +330,7 @@ impl SharingSession {
             }
         }
         state.devices.retain(|_, entry| !entry.expired);
-        let replacing = state
-            .devices
-            .get(&identity.canonical)
-            .is_some_and(|entry| !entry.expired);
-        if !replacing {
+        if !state.devices.contains_key(&identity.canonical) {
             let live = state
                 .devices
                 .values()
@@ -345,8 +342,6 @@ impl SharingSession {
                     format!("at most {MAX_SHARED_DEVICES} devices may be shared"),
                 ));
             }
-            // Drop stale expired entries for other paths when making room.
-            state.devices.retain(|_, entry| !entry.expired);
         }
         state.devices.insert(
             identity.canonical.clone(),

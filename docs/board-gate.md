@@ -9,7 +9,7 @@ and one real LAN address, and never flashes the board or changes firmware.
 1. The core starts beside the normal one on a private socket.
 2. A local terminal client opens the real board (local behaviour intact).
 3. Sharing starts on one concrete LAN IPv4/IPv6 address; the owner gets a
-   session, host pin and fresh human/AI credentials.
+   session, host pin and human pairing credential.
 4. A remote human client pairs over TLS, verifies the host CA and pinned leaf,
    authenticates with the human credential and derives its role from it.
 5. Remote discovery lists the checked board, and the remote client joins it.

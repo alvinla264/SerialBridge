@@ -1913,12 +1913,23 @@ impl Engine {
             Request::Ping => Ok(ResponseData::Pong),
             Request::ListDevices => {
                 let mut devices = self.list_devices();
+                let mut expired_paths = Vec::new();
                 devices.devices.retain(|device| match device.device_id {
                     // An open instance is visible only if it was authorized
                     // for sharing when it opened.
                     Some(device_id) => self.revalidate_shared_instance(device_id, &session),
-                    None => session.authorize(&device.path).is_ok(),
+                    None => {
+                        if session.authorize(&device.path).is_ok() {
+                            true
+                        } else {
+                            expired_paths.push(device.path.clone());
+                            false
+                        }
+                    }
                 });
+                for path in expired_paths {
+                    self.revoke_path_everywhere(&path, &session);
+                }
                 Ok(ResponseData::Devices(devices))
             }
             Request::Open(params) => {
