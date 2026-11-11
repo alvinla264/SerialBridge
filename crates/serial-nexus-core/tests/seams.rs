@@ -12,6 +12,7 @@
 
 mod support;
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener};
 use std::path::PathBuf;
@@ -141,6 +142,7 @@ fn an_enumerated_device_can_be_shared_and_opened_remotely_without_a_host_open() 
 }
 
 struct FakeState {
+    incoming: Mutex<VecDeque<u8>>,
     written: Mutex<Vec<u8>>,
     /// Every buffer passed to `write`, including calls that then fail, so a
     /// replay attempt is visible even when it writes nothing.
@@ -161,9 +163,18 @@ impl FakePort {
 }
 
 impl Read for FakePort {
-    fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
-        std::thread::sleep(Duration::from_millis(10));
-        Err(io::Error::from(io::ErrorKind::TimedOut))
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let mut incoming = self.state.incoming.lock().expect("incoming lock");
+        if incoming.is_empty() {
+            drop(incoming);
+            std::thread::sleep(Duration::from_millis(10));
+            return Err(io::Error::from(io::ErrorKind::TimedOut));
+        }
+        let take = buffer.len().min(incoming.len());
+        for slot in &mut buffer[..take] {
+            *slot = incoming.pop_front().expect("queued byte");
+        }
+        Ok(take)
     }
 }
 
@@ -275,6 +286,7 @@ fn a_partial_serial_write_reports_uncertainty_and_is_never_replayed() {
     let device = SimulatedDevice::new();
     let owner = connect(&core.socket, ClientInfo::human("owner"));
     let state = Arc::new(FakeState {
+        incoming: Mutex::new(VecDeque::new()),
         written: Mutex::new(Vec::new()),
         attempts: Mutex::new(Vec::new()),
         writes: AtomicUsize::new(0),
@@ -521,4 +533,86 @@ fn a_remote_write_cannot_be_admitted_after_stop_begins() {
         "a revoked remote write reached the device"
     );
     install_serial_factory(None);
+}
+
+#[test]
+fn discovery_and_events_revalidate_a_stale_shared_identity() {
+    let _guard = seam_lock().lock().expect("seam lock");
+    let core = core();
+    let directory = TempDir::new().expect("tempdir");
+    let path = directory.path().join("device-node");
+    std::fs::write(&path, b"").expect("node");
+    let path_text = path.to_string_lossy().into_owned();
+    let lister_path = path_text.clone();
+    let lister: Arc<serial_nexus_core::enumerate::PortLister> = Arc::new(move || {
+        vec![PortInfo {
+            path: lister_path.clone(),
+            description: Some("injected file node".into()),
+        }]
+    });
+    install_port_lister(Some(lister));
+    let state = Arc::new(FakeState {
+        incoming: Mutex::new(VecDeque::new()),
+        written: Mutex::new(Vec::new()),
+        attempts: Mutex::new(Vec::new()),
+        writes: AtomicUsize::new(0),
+        fail_after: usize::MAX,
+        baud: 115_200,
+    });
+    let factory_state = Arc::clone(&state);
+    let factory: Arc<serial_nexus_core::device::SerialFactory> = Arc::new(move |_path, baud| {
+        let _ = baud;
+        Ok(FakePort::boxed(Arc::clone(&factory_state)))
+    });
+    install_serial_factory(Some(factory));
+
+    let owner = connect(&core.socket, ClientInfo::human("owner"));
+    let info = owner
+        .start_sharing(bind(), vec![path_text.clone()])
+        .expect("share injected node");
+    let remote = RemoteClient::connect(
+        &info.host,
+        &info.human,
+        Some("stale-identity".into()),
+        Duration::from_secs(5),
+    )
+    .expect("pair");
+    assert!(remote
+        .list_devices()
+        .expect("list")
+        .devices
+        .iter()
+        .any(|entry| entry.path == path_text));
+    let opened = remote
+        .open(&path_text, Some(115_200), false)
+        .expect("open injected node");
+    let events = remote.subscribe();
+
+    // Replace the pinned node. Discovery and event delivery must notice.
+    std::fs::remove_file(&path).expect("unlink");
+    std::fs::write(&path, b"replacement").expect("replacement");
+    assert!(
+        !remote
+            .list_devices()
+            .expect("list after replacement")
+            .devices
+            .iter()
+            .any(|entry| entry.path == path_text),
+        "discovery must expire a stale identity"
+    );
+    state
+        .incoming
+        .lock()
+        .expect("incoming lock")
+        .extend(b"POST-REPLACEMENT\n");
+    std::thread::sleep(Duration::from_millis(250));
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event, serial_nexus_protocol::Event::DeviceOutput { .. }),
+            "event delivery must not expose data after identity expiry: {event:?}"
+        );
+    }
+    assert!(remote.write_bytes(opened.device_id, b"late", None).is_err());
+    install_serial_factory(None);
+    install_port_lister(None);
 }

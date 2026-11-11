@@ -717,6 +717,16 @@ pub fn open_serial_checked(
             ));
         }
     }
+    // Tests may replace only the I/O implementation; the node above was still
+    // opened and validated, so skip production termios setup for that seam.
+    if let Some(factory) = SERIAL_FACTORY.lock().expect("serial factory lock").clone() {
+        drop(file);
+        let port = factory(path, baud)?;
+        return Ok(OpenedSerial {
+            identity: current,
+            port,
+        });
+    }
     // Take ownership before changing settings: a failed acquisition must not
     // alter another application's termios. flock serializes core instances;
     // TIOCEXCL refuses later opens. A failed configure below clears it.
@@ -743,14 +753,6 @@ pub fn open_serial_checked(
         baud,
         timeout: Duration::from_millis(50),
     };
-    if let Some(factory) = SERIAL_FACTORY.lock().expect("serial factory lock").clone() {
-        drop(port);
-        let port = factory(path, baud)?;
-        return Ok(OpenedSerial {
-            port,
-            identity: current,
-        });
-    }
     Ok(OpenedSerial {
         port: Box::new(port),
         identity: current,

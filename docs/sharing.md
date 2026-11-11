@@ -254,17 +254,20 @@ After the first full Standards/Spec/security review sweep, these findings were
 fixed with tests:
 
 - **An open instance is bound to the node it actually opened.** Opening
-  validates the expected identity before `TTYPort::open` configures anything,
-  and the engine stores the identity of the opened descriptor. Joining an
+  validates the expected identity before the descriptor is configured, and the
+  engine stores the identity of the opened descriptor. Joining an
   existing device and marking it shared require that exact live instance, so
   checking a replacement cannot authorize an older open descriptor or its
   history. Tests: `an_open_instance_only_matches_its_own_live_node`,
   `a_mismatched_expected_identity_is_rejected_before_configuration`.
 - **Discovery and events revalidate the instance.** Remote discovery and event
   delivery revalidate the instance identity, expire the allowlist entry and
-  bump its write generation when it no longer matches. Tests:
-  `remote_operations_are_limited_to_checked_devices_by_acl`,
-  `an_unchecked_entry_does_not_leak_events_for_a_later_instance`.
+  bump its write generation when it no longer matches. The deterministic
+  seam test `discovery_and_events_revalidate_a_stale_shared_identity` replaces
+  a pinned node and asserts discovery expires it, no device output event leaks,
+  and later writes fail; it fails if `still_valid()` is removed.
+  `remote_operations_are_limited_to_checked_devices_by_acl` covers checked
+  versus unchecked devices.
 - **Detached waiters are cancelled.** `Close` fails that client's waited writes
   immediately, so unchecking cannot leave a detached waiter collecting later
   output. Test:
