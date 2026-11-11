@@ -326,7 +326,7 @@ impl SharingSession {
             let live = state
                 .devices
                 .values()
-                .filter(|entry| !entry.expired)
+                .filter(|entry| !entry.expired && entry.identity.still_valid())
                 .count();
             if live >= MAX_SHARED_DEVICES {
                 return Err(ErrorBody::new(
@@ -424,7 +424,13 @@ impl SharingSession {
     }
 
     pub fn snapshot(&self) -> SharingSnapshot {
-        let state = self.state.lock().expect("share state lock");
+        let mut state = self.state.lock().expect("share state lock");
+        // A checked device that is never opened is not otherwise revalidated.
+        for entry in state.devices.values_mut() {
+            if !entry.expired && !entry.identity.still_valid() {
+                entry.expired = true;
+            }
+        }
         SharingSnapshot {
             active: true,
             session_id: Some(self.id.clone()),

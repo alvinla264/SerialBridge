@@ -723,18 +723,15 @@ impl Engine {
     ) -> Result<ResponseData, ErrorBody> {
         let (events, removed) = self.close_parts(client_id, device_id)?;
         if let Some(device) = removed {
-            let engine = Arc::clone(self);
             let id = device.id;
+            let cleanup = DeviceCleanup {
+                device: Some(device),
+                engine: Arc::clone(self),
+                id,
+            };
             let _ = std::thread::Builder::new()
                 .name(format!("serial-cleanup-{id}"))
-                .spawn(move || {
-                    join_devices(vec![device]);
-                    engine
-                        .live_writes
-                        .lock()
-                        .expect("live writes lock")
-                        .remove(&id);
-                });
+                .spawn(move || drop(cleanup));
         }
         self.emit(events);
         Ok(ResponseData::Closed)
@@ -1262,19 +1259,17 @@ impl Engine {
         }
         if let Some(device) = removed {
             // A failed device's writer may never unblock; join it off the
-            // dispatcher so healthy devices and timers keep running.
-            let engine = Arc::clone(self);
+            // dispatcher so healthy devices and timers keep running. If the
+            // worker cannot spawn, the guard runs cleanup inline.
             let id = device.id;
+            let cleanup = DeviceCleanup {
+                device: Some(device),
+                engine: Arc::clone(self),
+                id,
+            };
             let _ = std::thread::Builder::new()
                 .name(format!("serial-cleanup-{id}"))
-                .spawn(move || {
-                    join_devices(vec![device]);
-                    engine
-                        .live_writes
-                        .lock()
-                        .expect("live writes lock")
-                        .remove(&id);
-                });
+                .spawn(move || drop(cleanup));
         }
         // Tell clients (including remote ones) first: the vacated mark still
         // names the path, so a shared device's failure is reported rather than
@@ -1915,6 +1910,27 @@ impl Engine {
         client_id: u64,
         params: WriteParams,
     ) -> Result<WriteStart, ErrorBody> {
+        // The echo event is slightly larger than the request. Reject a remote
+        // write whose echo cannot fit rather than silently dropping it for
+        // every remote subscriber.
+        let (kind, _) = self.identity(client_id);
+        let source = match kind {
+            ClientKind::Ai => Source::Ai,
+            _ => Source::Human,
+        };
+        let echo = ServerMessage::Event {
+            event: Event::Write {
+                device_id: params.device_id,
+                source,
+                data_b64: params.data_b64.clone(),
+            },
+        };
+        if serial_nexus_protocol::encode_frame(&echo).is_err() {
+            return Err(ErrorBody::new(
+                ErrorCode::BadRequest,
+                "write is too large to echo to remote peers; split it into smaller writes",
+            ));
+        }
         // The sharing gate keeps admission atomic with stop/revocation, but
         // never covers a blocking device drain: a failed authorization drops
         // the gate before detaching.
@@ -2358,6 +2374,27 @@ impl Engine {
         let mut live = self.live_writes.lock().expect("live writes lock");
         for id in ids {
             live.remove(&id);
+        }
+    }
+}
+
+/// Runs device I/O cleanup on a worker, or inline if the worker cannot be
+/// spawned (the closure is dropped in that case).
+struct DeviceCleanup {
+    device: Option<Device>,
+    engine: Arc<Engine>,
+    id: u64,
+}
+
+impl Drop for DeviceCleanup {
+    fn drop(&mut self) {
+        if let Some(device) = self.device.take() {
+            join_devices(vec![device]);
+            self.engine
+                .live_writes
+                .lock()
+                .expect("live writes lock")
+                .remove(&self.id);
         }
     }
 }

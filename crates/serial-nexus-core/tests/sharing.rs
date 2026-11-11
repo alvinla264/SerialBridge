@@ -2161,3 +2161,24 @@ fn a_disconnected_remote_close_releases_its_slot_before_serial_drain() {
     device.read_available(Duration::from_millis(300));
     close_thread.join().expect("close thread").ok();
 }
+
+#[test]
+fn a_remote_write_too_large_to_echo_is_refused() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let device = SimulatedDevice::new();
+    owner
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![device.path.clone()])
+        .expect("start");
+    let human = remote(&info, PairingRole::Human, "remote").expect("pair");
+    let opened = human.open(&device.path, None, false).expect("open");
+
+    // Fits the request frame but not the slightly larger Write echo event.
+    let error = human
+        .write_bytes(opened.device_id, &vec![b'x'; 49_100], None)
+        .expect_err("un-echoable write must be refused");
+    assert_eq!(error.code(), Some(ErrorCode::BadRequest), "{error:?}");
+}
