@@ -3,9 +3,11 @@
 //! This module has no terminal or socket code, so the interesting behaviour
 //! (switching, filtering human writes, unplug notices) is testable on its own.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use serial_nexus_protocol::{Event, Holder, Source, DEFAULT_BAUD};
+use serial_nexus_protocol::{
+    Event, Holder, ShareSessionInfo, SharingSnapshot, Source, DEFAULT_BAUD,
+};
 
 use crate::screen::{Screen, SCROLLBACK_ROWS};
 use crate::settings::TerminalSettings;
@@ -18,6 +20,17 @@ pub enum Focus {
     Right,
 }
 
+/// Which sidebar button the highlight is on, when it is not on a device row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidebarButton {
+    /// Start or stop the opt-in LAN sharing session.
+    Share,
+    /// Pair with a remote host and connect to it.
+    Connect,
+    /// Open the settings in the right pane.
+    Settings,
+}
+
 /// What the right-hand pane shows. The sidebar is beside it, never instead of
 /// it, except in narrow terminals where only the focused pane is drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,12 +38,25 @@ pub enum View {
     Stream,
     Settings,
     Scrollback,
+    /// The owner's pairing information for the running sharing session. The
+    /// secrets in it exist only in memory and are drawn only here.
+    Pairing,
 }
 
-/// The settings rows, in drawing order. Scrollback has a switch before the
-/// stream can scroll: the flag is part of the settings, and the terminal keeps
-/// it for the scrolling interface that follows.
-pub const SETTINGS_ROWS: usize = 2;
+/// The settings rows before the detected-device checklist: local echo,
+/// scrollback, the sharing address and the sharing port.
+pub const SETTINGS_FIXED_ROWS: usize = 4;
+
+/// What one settings row edits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsRow {
+    LocalEcho,
+    Scrollback,
+    ShareAddress,
+    SharePort,
+    /// The checkbox for one detected device, by its index in `devices`.
+    Device(usize),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
@@ -58,6 +84,60 @@ impl Notice {
             text: text.into(),
             severity: Severity::Error,
         }
+    }
+}
+
+/// The local owner's sharing session, as the core reports it.
+///
+/// `pairing` holds the pairing secrets exactly once, in memory only: they are
+/// never written to the settings file, a log or a device. Checking is
+/// session-only, so `pending_checked` starts empty on every launch.
+pub struct SharingState {
+    /// Whether this terminal owns a running session.
+    pub active: bool,
+    /// The owner-visible snapshot (no secrets), when active.
+    pub snapshot: Option<SharingSnapshot>,
+    /// The session's pairing information, including both secrets.
+    pub pairing: Option<ShareSessionInfo>,
+    /// Device paths checked for sharing. While a session is running this
+    /// mirrors the core's authoritative checked list; before it starts it is
+    /// the selection the host made in the settings.
+    pub pending_checked: BTreeSet<String>,
+}
+
+impl SharingState {
+    pub fn new() -> Self {
+        Self {
+            active: false,
+            snapshot: None,
+            pairing: None,
+            pending_checked: BTreeSet::new(),
+        }
+    }
+
+    /// The checked paths, from the core when a session is running.
+    pub fn checked(&self) -> BTreeSet<String> {
+        match &self.snapshot {
+            Some(snapshot) if self.active => snapshot
+                .checked
+                .iter()
+                .map(|device| device.path.clone())
+                .collect(),
+            _ => self.pending_checked.clone(),
+        }
+    }
+
+    /// Drop every secret and every trace of a session.
+    pub fn clear_session(&mut self) {
+        self.active = false;
+        self.snapshot = None;
+        self.pairing = None;
+    }
+}
+
+impl Default for SharingState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -143,8 +223,6 @@ pub struct AppState {
     /// The highlighted sidebar row. It stays on a device while the Settings
     /// button has the focus, so discovery cannot turn the button into a device.
     pub selected: usize,
-    /// Whether the sidebar's Settings button is highlighted.
-    settings_button_selected: bool,
     /// Which pane receives keys.
     pub focus: Focus,
     /// What the right pane shows.
@@ -155,13 +233,25 @@ pub struct AppState {
     pub notice: Option<Notice>,
     pub prompt: Option<BaudPrompt>,
     pub quit: bool,
+    /// The sidebar button that has the highlight, when no device row does.
+    pub selected_button: Option<SidebarButton>,
+    /// Whether the sharing address or port row is taking typed text.
+    pub settings_editing: bool,
+    /// The port as typed, so a half-entered value survives until Save.
+    pub port_text: String,
     /// Selected row of the settings view.
     pub settings_row: usize,
+    /// First line of the pairing information the right pane shows.
+    pub pairing_scroll: usize,
     /// The human's preferences in effect for this launch.
     pub settings: TerminalSettings,
     /// The settings being edited; only Ctrl+S copies them into `settings` and
     /// saves them. Escape throws them away.
     pub draft: TerminalSettings,
+    /// The device checkboxes in the settings draft. Session-only.
+    pub draft_checked: BTreeSet<String>,
+    /// This terminal's sharing session (owner only).
+    pub sharing: SharingState,
     rows: usize,
     cols: usize,
 }
@@ -177,7 +267,7 @@ impl AppState {
         Self {
             devices: Vec::new(),
             selected: 0,
-            settings_button_selected: false,
+            selected_button: None,
             focus: Focus::Sidebar,
             view: View::Stream,
             sessions: BTreeMap::new(),
@@ -185,57 +275,188 @@ impl AppState {
             notice: None,
             prompt: None,
             quit: false,
+            settings_editing: false,
+            port_text: String::new(),
             settings_row: 0,
+            pairing_scroll: 0,
             settings: TerminalSettings::default(),
             draft: TerminalSettings::default(),
+            draft_checked: BTreeSet::new(),
+            sharing: SharingState::new(),
             rows: rows.max(1),
             cols: cols.max(1),
         }
     }
 
-    /// The value of one settings row: local echo first, then scrollback.
-    pub fn settings_value(&self, row: usize) -> Option<bool> {
+    /// What one settings row edits. The first four rows are fixed; the rest
+    /// are one checkbox per detected device.
+    pub fn settings_kind(&self, row: usize) -> Option<SettingsRow> {
         match row {
-            0 => Some(self.settings.local_echo),
-            1 => Some(self.settings.scrollback),
+            0 => Some(SettingsRow::LocalEcho),
+            1 => Some(SettingsRow::Scrollback),
+            2 => Some(SettingsRow::ShareAddress),
+            3 => Some(SettingsRow::SharePort),
+            _ => {
+                let index = row.checked_sub(SETTINGS_FIXED_ROWS)?;
+                (index < self.devices.len()).then_some(SettingsRow::Device(index))
+            }
+        }
+    }
+
+    /// How many settings rows there are, including one per detected device.
+    pub fn settings_row_count(&self) -> usize {
+        SETTINGS_FIXED_ROWS + self.devices.len()
+    }
+
+    /// The name of a fixed settings row. Device rows are labelled by path.
+    pub fn settings_row_name(row: usize) -> Option<&'static str> {
+        match row {
+            0 => Some("Local echo"),
+            1 => Some("Scrollback"),
+            2 => Some("Share address"),
+            3 => Some("Share port"),
             _ => None,
+        }
+    }
+
+    /// The label the settings view draws for one row.
+    pub fn settings_row_label(&self, row: usize) -> String {
+        match self.settings_kind(row) {
+            Some(SettingsRow::LocalEcho) => "Local echo".into(),
+            Some(SettingsRow::Scrollback) => "Scrollback".into(),
+            Some(SettingsRow::ShareAddress) => "Share address".into(),
+            Some(SettingsRow::SharePort) => "Share port".into(),
+            Some(SettingsRow::Device(index)) => self
+                .devices
+                .get(index)
+                .map(|device| device.path.clone())
+                .unwrap_or_default(),
+            None => String::new(),
         }
     }
 
     /// The value of one settings row as the settings view shows it.
-    pub fn draft_value(&self, row: usize) -> Option<bool> {
-        match row {
-            0 => Some(self.draft.local_echo),
-            1 => Some(self.draft.scrollback),
-            _ => None,
+    pub fn draft_value(&self, row: usize) -> Option<String> {
+        match self.settings_kind(row)? {
+            SettingsRow::LocalEcho => Some(on_off(self.draft.local_echo)),
+            SettingsRow::Scrollback => Some(on_off(self.draft.scrollback)),
+            SettingsRow::ShareAddress => Some(self.draft.share_address.clone()),
+            SettingsRow::SharePort => Some(self.port_text.clone()),
+            SettingsRow::Device(index) => {
+                let path = &self.devices.get(index)?.path;
+                Some(if self.draft_checked.contains(path) {
+                    "on".into()
+                } else {
+                    "off".into()
+                })
+            }
         }
+    }
+
+    /// Whether the checkbox of one device row is checked in the draft.
+    pub fn draft_device_checked(&self, row: usize) -> Option<bool> {
+        let SettingsRow::Device(index) = self.settings_kind(row)? else {
+            return None;
+        };
+        let path = &self.devices.get(index)?.path;
+        Some(self.draft_checked.contains(path))
     }
 
     /// Move the settings selection, staying on a real row.
     pub fn move_settings_row(&mut self, delta: i32) {
-        let last = SETTINGS_ROWS - 1;
+        let last = self.settings_row_count().saturating_sub(1);
         self.settings_row = (self.settings_row as i32 + delta).clamp(0, last as i32) as usize;
+        self.settings_editing = false;
     }
 
-    /// Flip the selected setting in the draft, returning its new value.
+    /// Flip the selected flag or device checkbox in the draft. Text rows are
+    /// edited by typing, never toggled, and return `None`.
     pub fn toggle_draft(&mut self) -> Option<bool> {
-        match self.settings_row {
-            0 => {
+        match self.settings_kind(self.settings_row)? {
+            SettingsRow::LocalEcho => {
                 self.draft.local_echo = !self.draft.local_echo;
                 Some(self.draft.local_echo)
             }
-            1 => {
+            SettingsRow::Scrollback => {
                 self.draft.scrollback = !self.draft.scrollback;
                 Some(self.draft.scrollback)
             }
-            _ => None,
+            SettingsRow::Device(index) => {
+                let path = self.devices.get(index)?.path.clone();
+                let checked = if self.draft_checked.remove(&path) {
+                    false
+                } else {
+                    self.draft_checked.insert(path);
+                    true
+                };
+                Some(checked)
+            }
+            SettingsRow::ShareAddress | SettingsRow::SharePort => None,
         }
+    }
+
+    /// Start typing into the selected address or port row.
+    pub fn begin_settings_edit(&mut self) -> bool {
+        match self.settings_kind(self.settings_row) {
+            Some(SettingsRow::ShareAddress) => {
+                // A text field starts empty, so a value is typed rather than
+                // appended to whatever was there.
+                self.draft.share_address.clear();
+                self.settings_editing = true;
+                true
+            }
+            Some(SettingsRow::SharePort) => {
+                self.port_text.clear();
+                self.settings_editing = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Add one typed character to the selected text row.
+    pub fn settings_edit_push(&mut self, ch: char) {
+        if !self.settings_editing || !ch.is_ascii_graphic() {
+            return;
+        }
+        match self.settings_kind(self.settings_row) {
+            Some(SettingsRow::ShareAddress) if self.draft.share_address.len() < 64 => {
+                self.draft.share_address.push(ch);
+            }
+            Some(SettingsRow::SharePort) if self.port_text.len() < 5 => {
+                self.port_text.push(ch);
+            }
+            _ => {}
+        }
+    }
+
+    pub fn settings_edit_backspace(&mut self) {
+        if !self.settings_editing {
+            return;
+        }
+        match self.settings_kind(self.settings_row) {
+            Some(SettingsRow::ShareAddress) => {
+                self.draft.share_address.pop();
+            }
+            Some(SettingsRow::SharePort) => {
+                self.port_text.pop();
+            }
+            _ => {}
+        }
+    }
+
+    /// Stop editing the text row. The draft keeps what was typed.
+    pub fn end_settings_edit(&mut self) {
+        self.settings_editing = false;
     }
 
     /// Whether the settings are open with changes that Save or Cancel would
     /// still keep or throw away.
     pub fn has_unsaved_settings(&self) -> bool {
-        self.view == View::Settings && self.draft != self.settings
+        self.view == View::Settings
+            && (self.draft != self.settings
+                || self.draft_checked != self.sharing.checked()
+                || self.port_text != self.draft.share_port.to_string())
     }
 
     /// Open the settings in the right pane. The draft begins as a copy of what
@@ -250,7 +471,12 @@ impl AppState {
             return;
         }
         self.draft = self.settings.clone();
+        // The checklist starts from what the core currently shares, or from
+        // the session-only selection made before sharing started.
+        self.draft_checked = self.sharing.checked();
+        self.port_text = self.draft.share_port.to_string();
         self.settings_row = 0;
+        self.settings_editing = false;
         self.view = View::Settings;
         self.notice = None;
     }
@@ -258,12 +484,20 @@ impl AppState {
     /// Leave the settings without keeping the draft.
     pub fn cancel_settings(&mut self) {
         self.draft = self.settings.clone();
+        self.draft_checked = self.sharing.checked();
+        self.port_text = self.draft.share_port.to_string();
+        self.settings_editing = false;
         self.leave_settings();
     }
 
-    /// Keep the draft as the settings in effect and leave the view.
+    /// Keep the draft (and its device checks) as the settings in effect and
+    /// leave the view. The app calls this only after the file was written and
+    /// the core accepted the checklist changes.
     pub fn commit_settings(&mut self) {
         self.settings = self.draft.clone();
+        self.port_text = self.settings.share_port.to_string();
+        self.sharing.pending_checked = self.draft_checked.clone();
+        self.settings_editing = false;
         self.apply_scrollback();
         self.leave_settings();
     }
@@ -292,16 +526,12 @@ impl AppState {
 
     /// Whether the sidebar's Settings button is highlighted.
     pub fn settings_button_selected(&self) -> bool {
-        self.settings_button_selected
+        self.selected_button == Some(SidebarButton::Settings)
     }
 
-    /// The name of one settings panel row.
-    pub fn settings_row_name(row: usize) -> Option<&'static str> {
-        match row {
-            0 => Some("Local echo"),
-            1 => Some("Scrollback"),
-            _ => None,
-        }
+    /// The sidebar button with the highlight, if any.
+    pub fn selected_button(&self) -> Option<SidebarButton> {
+        self.selected_button
     }
 
     pub fn rows(&self) -> usize {
@@ -325,9 +555,9 @@ impl AppState {
         }
     }
 
-    /// The highlighted device row, or `None` while the Settings button is.
+    /// The highlighted device row, or `None` while a sidebar button is.
     pub fn selected_device(&self) -> Option<&DeviceEntry> {
-        if self.settings_button_selected {
+        if self.selected_button.is_some() {
             return None;
         }
         self.devices.get(self.selected)
@@ -371,18 +601,30 @@ impl AppState {
     /// never redirects typed device input.
     pub fn select_index(&mut self, index: usize) {
         if index >= self.devices.len() {
-            self.settings_button_selected = true;
+            // The buttons follow the devices, in drawing order.
+            self.selected_button = match index - self.devices.len() {
+                0 => Some(SidebarButton::Share),
+                1 => Some(SidebarButton::Connect),
+                _ => Some(SidebarButton::Settings),
+            };
             return;
         }
-        self.settings_button_selected = false;
+        self.selected_button = None;
         self.selected = index;
     }
 
-    /// Move the sidebar selection over the devices and the Settings button,
-    /// which is the row just past the last device.
+    /// Move the sidebar selection over the devices and the three buttons:
+    /// Share, Connect and Settings, in that drawing order.
     pub fn select_delta(&mut self, delta: i32) {
-        let last = self.devices.len();
-        let next = self.selected as i32 + delta;
+        let buttons = 3;
+        let last = self.devices.len() + buttons - 1;
+        let current = match self.selected_button {
+            Some(SidebarButton::Share) => self.devices.len(),
+            Some(SidebarButton::Connect) => self.devices.len() + 1,
+            Some(SidebarButton::Settings) => self.devices.len() + 2,
+            None => self.selected,
+        };
+        let next = current as i32 + delta;
         self.select_index(next.clamp(0, last as i32) as usize);
     }
 
@@ -390,7 +632,7 @@ impl AppState {
     /// stays where it was, so the button is not a row that discovery can
     /// renumber into a device.
     pub fn select_settings_button(&mut self) {
-        self.settings_button_selected = true;
+        self.selected_button = Some(SidebarButton::Settings);
     }
 
     pub fn select_path(&mut self, path: &str) -> bool {
@@ -434,9 +676,9 @@ impl AppState {
         }
         devices.sort_by(|left, right| left.path.cmp(&right.path));
         self.devices = devices;
-        // The Settings button keeps the highlight; a device row keeps its
-        // device by path when the list was re-sorted or grew.
-        if self.settings_button_selected {
+        // A button keeps the highlight; a device row keeps its device by path
+        // when the list was re-sorted or grew.
+        if self.selected_button.is_some() {
             return;
         }
         let row = selected_path
@@ -533,10 +775,50 @@ impl AppState {
                 // own kept rows and scrolled position. With nothing left, the
                 // view falls back to the empty stream.
                 View::Scrollback if self.shown.is_none() => self.view = View::Stream,
-                View::Scrollback | View::Settings => {}
+                View::Scrollback | View::Settings | View::Pairing => {}
             }
         }
         Some(session)
+    }
+
+    /// Take the core's authoritative sharing snapshot. A device the core no
+    /// longer lists (unplugged, replaced at the same path, or revoked) also
+    /// loses its checkbox: sharing it again needs an explicit check.
+    pub fn apply_sharing_snapshot(&mut self, snapshot: SharingSnapshot) {
+        let previous = self.sharing.checked();
+        let next: BTreeSet<String> = snapshot
+            .checked
+            .iter()
+            .map(|device| device.path.clone())
+            .collect();
+        for path in previous.difference(&next) {
+            self.draft_checked.remove(path);
+        }
+        self.sharing.active = snapshot.active;
+        self.sharing.pending_checked = next;
+        self.sharing.snapshot = snapshot.active.then_some(snapshot);
+        if !self.sharing.active {
+            self.sharing.pairing = None;
+            if self.view == View::Pairing {
+                self.view = View::Stream;
+            }
+        }
+    }
+
+    /// Drop checked devices that are no longer detected. The core revokes
+    /// their authorization; the checkbox must not survive a replacement.
+    pub fn prune_share_checks(&mut self, detected: &BTreeSet<String>) {
+        self.sharing
+            .pending_checked
+            .retain(|path| detected.contains(path));
+        self.draft_checked.retain(|path| detected.contains(path));
+    }
+
+    /// Whether the settings draft checks at least one detected device.
+    pub fn draft_checks_any_device(&self) -> bool {
+        self.devices
+            .iter()
+            .any(|device| self.draft_checked.contains(&device.path))
     }
 
     pub fn all_device_ids(&self) -> Vec<u64> {
@@ -655,6 +937,10 @@ impl AppState {
             prompt.error = None;
         }
     }
+}
+
+fn on_off(value: bool) -> String {
+    if value { "on" } else { "off" }.to_string()
 }
 
 /// How many rows a screen keeps for scrolling, from the settings in effect.
@@ -976,5 +1262,139 @@ mod tests {
         );
         state.resize(8, 50);
         assert_eq!(state.sessions.get(&7).unwrap().screen.scroll(), scroll);
+    }
+}
+
+#[cfg(test)]
+mod sharing_tests {
+    use super::*;
+    use serial_nexus_protocol::{SharedDevice, SharingSnapshot};
+
+    fn state_with_devices() -> AppState {
+        let mut state = AppState::new(10, 80);
+        state.set_devices(vec![
+            DeviceEntry::new("/dev/ttyUSB0"),
+            DeviceEntry::new("/dev/ttyUSB1"),
+        ]);
+        state
+    }
+
+    fn snapshot(checked: &[&str]) -> SharingSnapshot {
+        SharingSnapshot {
+            active: true,
+            session_id: Some("session".into()),
+            bind: Some("127.0.0.1:7331".parse().unwrap()),
+            checked: checked
+                .iter()
+                .map(|path| SharedDevice {
+                    path: (*path).into(),
+                    identity: "dev=1:2 ino=3".into(),
+                })
+                .collect(),
+            remote_clients: 0,
+            pending_connections: 0,
+        }
+    }
+
+    #[test]
+    fn the_sidebar_moves_over_devices_then_share_connect_and_settings() {
+        let mut state = state_with_devices();
+        state.select_index(1);
+        state.select_delta(1);
+        assert_eq!(state.selected_button(), Some(SidebarButton::Share));
+        assert!(
+            state.selected_device().is_none(),
+            "a button holds the highlight"
+        );
+        state.select_delta(1);
+        assert_eq!(state.selected_button(), Some(SidebarButton::Connect));
+        state.select_delta(1);
+        assert_eq!(state.selected_button(), Some(SidebarButton::Settings));
+        state.select_delta(1);
+        assert_eq!(
+            state.selected_button(),
+            Some(SidebarButton::Settings),
+            "the last row is the last button"
+        );
+        state.select_delta(-10);
+        assert_eq!(state.selected_button(), None);
+        assert_eq!(state.selected_device().unwrap().path, "/dev/ttyUSB0");
+    }
+
+    #[test]
+    fn the_checklist_is_session_only_and_a_snapshot_revokes_a_replaced_path() {
+        let mut state = state_with_devices();
+        state.begin_settings();
+        state.settings_row = SETTINGS_FIXED_ROWS;
+        assert_eq!(state.toggle_draft(), Some(true));
+        assert!(state.has_unsaved_settings());
+        state.cancel_settings();
+        assert!(state.draft_checked.is_empty());
+
+        state.begin_settings();
+        state.settings_row = SETTINGS_FIXED_ROWS;
+        assert_eq!(state.toggle_draft(), Some(true));
+        state.commit_settings();
+        assert!(state.sharing.pending_checked.contains("/dev/ttyUSB0"));
+
+        // A running session's snapshot is authoritative: a path it no longer
+        // lists loses its checkbox, and the draft follows.
+        state.sharing.active = true;
+        state.sharing.snapshot = Some(snapshot(&["/dev/ttyUSB0"]));
+        state.begin_settings();
+        assert_eq!(state.draft_device_checked(SETTINGS_FIXED_ROWS), Some(true));
+        state.apply_sharing_snapshot(snapshot(&[]));
+        assert_eq!(
+            state.draft_device_checked(SETTINGS_FIXED_ROWS),
+            Some(false),
+            "a replacement at the path needs an explicit recheck"
+        );
+        assert!(state.sharing.pending_checked.is_empty());
+    }
+
+    #[test]
+    fn an_unplugged_path_is_pruned_from_the_checks() {
+        let mut state = state_with_devices();
+        state.sharing.pending_checked.insert("/dev/ttyUSB0".into());
+        state.draft_checked.insert("/dev/ttyUSB1".into());
+        let detected: BTreeSet<String> = ["/dev/ttyUSB1".to_string()].into_iter().collect();
+        state.prune_share_checks(&detected);
+        assert!(!state.sharing.pending_checked.contains("/dev/ttyUSB0"));
+        assert!(state.draft_checked.contains("/dev/ttyUSB1"));
+    }
+
+    #[test]
+    fn text_rows_are_edited_by_typing_not_toggled() {
+        let mut state = state_with_devices();
+        state.begin_settings();
+        state.settings_row = 2;
+        assert_eq!(state.toggle_draft(), None, "the address is not a flag");
+        assert!(state.begin_settings_edit());
+        state.settings_edit_push('1');
+        state.settings_edit_push('.');
+        assert_eq!(state.draft.share_address, "1.");
+        state.settings_edit_backspace();
+        assert_eq!(state.draft.share_address, "1");
+        state.end_settings_edit();
+
+        state.settings_row = 3;
+        assert_eq!(state.toggle_draft(), None);
+        assert!(state.begin_settings_edit());
+        state.settings_edit_push('9');
+        assert_eq!(state.port_text, "9", "the port is typed as text");
+        state.cancel_settings();
+        assert_eq!(state.port_text, "7331");
+    }
+
+    #[test]
+    fn settings_row_kinds_follow_the_detected_devices() {
+        let mut state = state_with_devices();
+        assert_eq!(state.settings_row_count(), SETTINGS_FIXED_ROWS + 2);
+        assert_eq!(state.settings_kind(0), Some(SettingsRow::LocalEcho));
+        assert_eq!(state.settings_kind(2), Some(SettingsRow::ShareAddress));
+        assert_eq!(state.settings_kind(3), Some(SettingsRow::SharePort));
+        assert_eq!(state.settings_kind(4), Some(SettingsRow::Device(0)));
+        assert_eq!(state.settings_kind(5), Some(SettingsRow::Device(1)));
+        assert_eq!(state.settings_kind(6), None);
     }
 }

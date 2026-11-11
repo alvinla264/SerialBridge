@@ -1,19 +1,22 @@
 //! The event-driven app: client calls behind small state transitions that do
 //! not depend on a real terminal.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use crossterm::event::MouseEventKind;
 use ratatui::layout::Rect;
 use serial_nexus_client::{Client, ClientError};
-use serial_nexus_protocol::{DeviceSummary, Event};
+use serial_nexus_protocol::{DeviceSummary, ErrorCode, Event, ShareBind};
 
 use crate::input::{echo_key, map_key, Action, Key};
 use crate::render::{hit_test, panes, settings_hit_test, Hit, SettingsHit};
 use crate::settings::{SettingsStore, TerminalSettings};
-use crate::state::{short_holder, AppState, DeviceEntry, Focus, Notice, View, SETTINGS_ROWS};
+use crate::state::{
+    short_holder, AppState, DeviceEntry, Focus, Notice, SettingsRow, SidebarButton, View,
+};
 
 /// Two clicks on the same cell within this long count as a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
@@ -24,6 +27,8 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ClickTarget {
     Device(String),
+    Share,
+    Connect,
     Settings,
 }
 
@@ -102,10 +107,21 @@ impl App {
     pub fn refresh_devices(&mut self) {
         match self.client.list_devices() {
             Ok(result) => {
-                let entries = result.devices.into_iter().map(device_entry).collect();
+                let entries: Vec<DeviceEntry> =
+                    result.devices.into_iter().map(device_entry).collect();
                 self.state.set_devices(entries);
+                let detected: BTreeSet<String> = self
+                    .state
+                    .devices
+                    .iter()
+                    .map(|device| device.path.clone())
+                    .collect();
+                self.state.prune_share_checks(&detected);
             }
             Err(error) => self.state.notice = Some(Notice::error(error.to_string())),
+        }
+        if self.state.sharing.active {
+            self.sync_share_status();
         }
     }
 
@@ -116,6 +132,17 @@ impl App {
                 if self.expected_closes.remove(device_id) {
                     self.state.remove_session(*device_id);
                     continue;
+                }
+            }
+            if matches!(
+                &event,
+                Event::TransportClosed { .. } | Event::CoreShutdown { .. }
+            ) {
+                // The core ends a sharing session when its owner connection
+                // goes away; there is no listener or credential left to show.
+                self.state.sharing.clear_session();
+                if self.state.view == View::Pairing {
+                    self.state.view = View::Stream;
                 }
             }
             self.state.apply_event(&event);
@@ -133,13 +160,7 @@ impl App {
         match action {
             Action::Quit => self.state.quit = true,
             Action::Select(delta) => self.select_row(delta),
-            Action::OpenSelected => {
-                if self.state.settings_button_selected() {
-                    self.open_settings();
-                } else {
-                    self.open_selected();
-                }
-            }
+            Action::OpenSelected => self.activate_selected(),
             Action::DisconnectSelected => self.disconnect_selected(),
             Action::StartBaudPrompt => self.start_baud_prompt(),
             Action::ToggleFocus => self.toggle_focus(),
@@ -160,8 +181,19 @@ impl App {
             Action::SettingsToggle => {
                 self.state.toggle_draft();
             }
+            Action::SettingsBeginEdit => {
+                self.state.begin_settings_edit();
+            }
+            Action::SettingsEditChar(ch) => self.state.settings_edit_push(ch),
+            Action::SettingsEditBackspace => self.state.settings_edit_backspace(),
+            Action::SettingsEditDone => self.state.end_settings_edit(),
             Action::SettingsSave => self.save_settings(),
             Action::SettingsCancel => self.state.cancel_settings(),
+            Action::ShareToggle => self.toggle_sharing(),
+            Action::OpenPairing => self.open_pairing(),
+            Action::ConnectRemote => self.start_connect(),
+            Action::LeavePairing => self.leave_pairing(),
+            Action::PairingScroll(delta) => self.scroll_pairing(delta),
             Action::Ignore => {}
         }
     }
@@ -290,6 +322,17 @@ impl App {
                 self.select_row_index(index);
                 return;
             }
+            Some(Hit::Share) => {
+                self.state.select_index(self.state.devices.len());
+                self.toggle_sharing();
+                return;
+            }
+            Some(Hit::Connect) => {
+                self.state
+                    .select_index(self.state.devices.len().saturating_add(1));
+                self.start_connect();
+                return;
+            }
             Some(Hit::Settings) => {
                 self.open_settings();
                 return;
@@ -309,8 +352,21 @@ impl App {
             if self.state.view == View::Settings {
                 match settings_hit_test(&self.state, right, column, row) {
                     Some(SettingsHit::Flag(index)) => {
-                        self.state.settings_row = index.min(SETTINGS_ROWS - 1);
-                        self.state.toggle_draft();
+                        if index < self.state.settings_row_count() {
+                            self.state.settings_row = index;
+                            self.state.end_settings_edit();
+                            match self.state.settings_kind(index) {
+                                Some(SettingsRow::Device(_))
+                                | Some(SettingsRow::LocalEcho)
+                                | Some(SettingsRow::Scrollback) => {
+                                    self.state.toggle_draft();
+                                }
+                                Some(SettingsRow::ShareAddress | SettingsRow::SharePort) => {
+                                    self.state.begin_settings_edit();
+                                }
+                                None => {}
+                            }
+                        }
                     }
                     Some(SettingsHit::Save) => self.save_settings(),
                     Some(SettingsHit::Cancel) => self.state.cancel_settings(),
@@ -370,6 +426,8 @@ impl App {
                 .devices
                 .get(index)
                 .map(|device| ClickTarget::Device(device.path.clone())),
+            Some(Hit::Share) => Some(ClickTarget::Share),
+            Some(Hit::Connect) => Some(ClickTarget::Connect),
             Some(Hit::Settings) => Some(ClickTarget::Settings),
             None => None,
         }
@@ -399,6 +457,8 @@ impl App {
                 }
             }
             Some(ClickTarget::Settings) => self.open_settings(),
+            Some(ClickTarget::Share) => self.toggle_sharing(),
+            Some(ClickTarget::Connect) => self.start_connect(),
             // The first click already did all there is to do (focus a pane).
             None => {}
         }
@@ -429,26 +489,301 @@ impl App {
         false
     }
 
-    /// Save the draft settings, then keep the draft and go back to the shown
-    /// device's live stream.
+    /// Activate the highlighted sidebar row: a device opens or joins, a button
+    /// does what it says.
+    fn activate_selected(&mut self) {
+        match self.state.selected_button() {
+            Some(SidebarButton::Share) => self.toggle_sharing(),
+            Some(SidebarButton::Connect) => self.start_connect(),
+            Some(SidebarButton::Settings) => self.open_settings(),
+            None => self.open_selected(),
+        }
+    }
+
+    /// Save the draft settings and checklist, then keep the draft and go back
+    /// to the shown device's live stream.
     ///
-    /// The draft becomes the settings in effect only after the file was
-    /// written: a failed save, or no settings file to write, leaves the
-    /// options as they were and stays in the settings so the draft is not
-    /// lost. The terminal never claims a save it did not make.
+    /// The draft becomes the settings in effect only after both the core
+    /// accepted the checklist and the file was written. A refused checklist
+    /// change or a failed write leaves the options as they were and stays in
+    /// the settings, so nothing is claimed that did not happen.
     fn save_settings(&mut self) {
+        self.state.end_settings_edit();
+        let address = self.state.draft.share_address.trim().to_string();
+        let address: IpAddr = match address.parse() {
+            Ok(address) => address,
+            Err(_) => {
+                self.state.notice = Some(Notice::error(
+                    "settings not saved: the share address is not an IPv4 or IPv6 address",
+                ));
+                return;
+            }
+        };
+        let port: u16 = match self.state.port_text.trim().parse() {
+            Ok(port) => port,
+            Err(_) => {
+                self.state.notice = Some(Notice::error(
+                    "settings not saved: the share port is not a number from 0 to 65535",
+                ));
+                return;
+            }
+        };
+        if let Err(message) = ShareBind::new(address, port).validate() {
+            self.state.notice = Some(Notice::error(format!("settings not saved: {message}")));
+            return;
+        }
+        self.state.draft.share_address = address.to_string();
+        self.state.draft.share_port = port;
+
         let draft = self.state.draft.clone();
-        let Some(store) = &self.settings_store else {
+        let draft_checked = self.state.draft_checked.clone();
+        let Some(store) = self.settings_store.clone() else {
             self.state.notice = Some(Notice::error("settings not saved: no settings file"));
             return;
         };
+
+        // A running session follows the checklist at once: unchecking revokes
+        // remote access, checking grants it. The core's snapshot, not the UI,
+        // says what is really shared.
+        let mut rollback: Option<(Vec<String>, Vec<String>)> = None;
+        if self.state.sharing.active {
+            let core_checked = self.state.sharing.checked();
+            let to_check: Vec<String> = draft_checked.difference(&core_checked).cloned().collect();
+            let to_uncheck: Vec<String> =
+                core_checked.difference(&draft_checked).cloned().collect();
+            match self.apply_checklist(&to_check, &to_uncheck) {
+                Ok(()) => rollback = Some((to_uncheck, to_check)),
+                Err(error) => {
+                    self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
+                    self.sync_share_status();
+                    return;
+                }
+            }
+        }
+
         match store.save(&draft) {
             Ok(()) => {
                 self.state.commit_settings();
                 self.state.notice = Some(Notice::info("settings saved"));
             }
             Err(error) => {
+                // The file is the settings' only home: a failed write must not
+                // leave a checklist applied that Save never completed.
+                if let Some((to_check, to_uncheck)) = rollback {
+                    let _ = self.apply_checklist(&to_check, &to_uncheck);
+                }
+                self.state.draft_checked = draft_checked;
                 self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
+                self.sync_share_status();
+            }
+        }
+    }
+
+    /// Check and uncheck devices in the running session, taking the core's
+    /// snapshot after each call. Unchecking first revokes remote access before
+    /// any new grant.
+    fn apply_checklist(
+        &mut self,
+        to_check: &[String],
+        to_uncheck: &[String],
+    ) -> Result<(), ClientError> {
+        if !to_uncheck.is_empty() {
+            let snapshot = self.client.uncheck_shared_devices(to_uncheck.to_vec())?;
+            self.state.apply_sharing_snapshot(snapshot);
+        }
+        if !to_check.is_empty() {
+            let snapshot = self.client.check_shared_devices(to_check.to_vec())?;
+            self.state.apply_sharing_snapshot(snapshot);
+        }
+        Ok(())
+    }
+
+    /// Start or stop the local sharing session from the sidebar's Share button
+    /// or the `s` key.
+    pub fn toggle_sharing(&mut self) {
+        if self.state.sharing.active {
+            self.stop_sharing();
+        } else {
+            self.start_sharing();
+        }
+    }
+
+    /// Turn sharing on deliberately. At least one device must be checked and
+    /// the saved bind address must be one concrete IPv4 or IPv6 address; a
+    /// bind failure is shown and leaves sharing off.
+    pub fn start_sharing(&mut self) {
+        if self.state.sharing.active {
+            self.state.notice = Some(Notice::info("sharing is already on"));
+            return;
+        }
+        if self.refuse_if_unsaved_settings() {
+            return;
+        }
+        let detected: BTreeSet<&str> = self
+            .state
+            .devices
+            .iter()
+            .map(|device| device.path.as_str())
+            .collect();
+        let devices: Vec<String> = self
+            .state
+            .sharing
+            .pending_checked
+            .iter()
+            .filter(|path| detected.contains(path.as_str()))
+            .cloned()
+            .collect();
+        if devices.is_empty() {
+            self.state.notice = Some(Notice::error(
+                "check at least one device in Settings before starting to share",
+            ));
+            return;
+        }
+        let bind = match self.share_bind() {
+            Ok(bind) => bind,
+            Err(message) => {
+                self.state.notice = Some(Notice::error(format!("sharing not started: {message}")));
+                return;
+            }
+        };
+        match self.client.start_sharing(bind, devices) {
+            Ok(info) => {
+                self.state.sharing.active = true;
+                self.state.sharing.pairing = Some(info);
+                self.sync_share_status();
+                self.state.view = View::Pairing;
+                self.state.focus = Focus::Right;
+                self.state.prompt = None;
+                self.state.pairing_scroll = 0;
+                self.state.notice = Some(Notice::info(
+                    "sharing on — the pairing view shows the credentials",
+                ));
+            }
+            Err(error) => {
+                self.state.sharing.clear_session();
+                self.state.notice = Some(Notice::error(format!("sharing not started: {error}")));
+            }
+        }
+    }
+
+    /// The saved sharing endpoint, validated as one concrete address.
+    fn share_bind(&self) -> Result<ShareBind, String> {
+        let address: IpAddr = self
+            .state
+            .settings
+            .share_address
+            .trim()
+            .parse()
+            .map_err(|_| {
+                "the share address is not an IPv4 or IPv6 address (set it in Settings)".to_string()
+            })?;
+        let bind = ShareBind::new(address, self.state.settings.share_port);
+        bind.validate()?;
+        Ok(bind)
+    }
+
+    /// Stop sharing, which revokes both credentials and disconnects every
+    /// remote client. The checked selection stays for this launch only.
+    pub fn stop_sharing(&mut self) {
+        if !self.state.sharing.active {
+            self.state.notice = Some(Notice::info("sharing is already off"));
+            return;
+        }
+        match self.client.stop_sharing() {
+            Ok(()) => {
+                self.state.sharing.clear_session();
+                if self.state.view == View::Pairing {
+                    self.state.view = View::Stream;
+                    self.state.focus = Focus::Right;
+                }
+                self.state.notice = Some(Notice::info("sharing stopped"));
+            }
+            Err(error) => {
+                self.state.notice = Some(Notice::error(format!("sharing not stopped: {error}")));
+                self.sync_share_status();
+            }
+        }
+    }
+
+    /// Show the owner's pairing information. Only the terminal that started
+    /// the session may see it, and only while the session is running.
+    pub fn open_pairing(&mut self) {
+        if !self.state.sharing.active {
+            self.state.notice = Some(Notice::error(
+                "sharing is off: press s or use the Share button to start it",
+            ));
+            return;
+        }
+        if self.refuse_if_unsaved_settings() {
+            return;
+        }
+        self.state.prompt = None;
+        self.state.view = View::Pairing;
+        self.state.focus = Focus::Right;
+        self.state.pairing_scroll = 0;
+    }
+
+    fn leave_pairing(&mut self) {
+        self.state.view = View::Stream;
+        self.state.focus = Focus::Right;
+        if let Some(session) = self.state.shown_session_mut() {
+            session.screen.scroll_to_bottom();
+        }
+    }
+
+    fn scroll_pairing(&mut self, delta: i32) {
+        let next = self.state.pairing_scroll as i32 + delta;
+        self.state.pairing_scroll = next.max(0) as usize;
+    }
+
+    /// Ask for a remote host and its pairing information. Implemented by the
+    /// remote-client slice; until then it says so instead of pretending.
+    pub fn start_connect(&mut self) {
+        self.state.notice = Some(Notice::error(
+            "remote connect is not available in this build",
+        ));
+    }
+
+    /// Ask the core for the running session's state and take its answer as
+    /// authoritative. A checked device the core no longer lists (unplugged,
+    /// replaced at the same path, or revoked) loses its checkbox.
+    fn sync_share_status(&mut self) {
+        match self.client.sharing_status() {
+            Ok(snapshot) => {
+                let before = self.state.sharing.checked();
+                let after: BTreeSet<String> = snapshot
+                    .checked
+                    .iter()
+                    .map(|device| device.path.clone())
+                    .collect();
+                let lost: Vec<String> = before.difference(&after).cloned().collect();
+                self.state.apply_sharing_snapshot(snapshot);
+                if !lost.is_empty() {
+                    self.state.notice = Some(Notice::error(format!(
+                        "no longer shared: {} — check it again in Settings",
+                        lost.join(", ")
+                    )));
+                }
+            }
+            Err(error) => {
+                let ended = matches!(
+                    error,
+                    ClientError::Disconnected(_)
+                        | ClientError::Timeout(_)
+                        | ClientError::WriteUncertain(_)
+                ) || matches!(
+                    error.code(),
+                    Some(
+                        ErrorCode::NotFound | ErrorCode::PermissionDenied | ErrorCode::ShuttingDown
+                    )
+                );
+                if ended {
+                    self.state.sharing.clear_session();
+                    if self.state.view == View::Pairing {
+                        self.state.view = View::Stream;
+                    }
+                    self.state.notice = Some(Notice::error(format!("sharing stopped: {error}")));
+                }
             }
         }
     }
@@ -609,8 +944,13 @@ impl App {
         }
     }
 
-    /// Detach every device. Called on exit and after an event-loop error.
+    /// Detach every device and stop sharing. Called on exit and after an
+    /// event-loop error, so this terminal never leaves a listener behind.
     pub fn shutdown(&mut self) {
+        if self.state.sharing.active {
+            let _ = self.client.stop_sharing();
+            self.state.sharing.clear_session();
+        }
         let device_ids = self.state.all_device_ids();
         self.expected_closes.extend(device_ids.iter().copied());
         for device_id in device_ids {

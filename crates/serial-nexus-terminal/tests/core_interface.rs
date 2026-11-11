@@ -202,6 +202,7 @@ fn with_local_echo_off_typing_is_not_echoed_but_device_echo_and_ai_writes_are_vi
     let settings = serial_nexus_terminal::settings::TerminalSettings {
         local_echo: false,
         scrollback: true,
+        ..Default::default()
     };
     let client = Client::connect_to_socket(&socket, ClientInfo::human("terminal-no-echo"))
         .expect("terminal connects");
@@ -444,6 +445,7 @@ fn launch_settings_are_loaded_into_the_app_and_do_not_change_baud_behavior() {
     let settings = serial_nexus_terminal::settings::TerminalSettings {
         local_echo: false,
         scrollback: false,
+        ..Default::default()
     };
     let client = Client::connect_to_socket(&socket, ClientInfo::human("terminal-settings"))
         .expect("terminal connects");
@@ -627,6 +629,7 @@ fn a_failed_settings_save_neither_applies_nor_claims_the_change() {
         .save(&serial_nexus_terminal::settings::TerminalSettings {
             local_echo: true,
             scrollback: true,
+            ..Default::default()
         })
         .expect("a settings file to keep");
     let before = std::fs::read_to_string(&path).expect("the file");
@@ -1266,6 +1269,7 @@ fn a_mouse_save_that_fails_changes_nothing_and_stays_on_the_page() {
         .save(&serial_nexus_terminal::settings::TerminalSettings {
             local_echo: true,
             scrollback: true,
+            ..Default::default()
         })
         .expect("a settings file to keep");
     let before = std::fs::read_to_string(&path).expect("the file");
@@ -1418,6 +1422,7 @@ fn without_scrollback_output_is_not_kept_and_the_keys_do_nothing() {
     let settings = serial_nexus_terminal::settings::TerminalSettings {
         local_echo: true,
         scrollback: false,
+        ..Default::default()
     };
     let mut app = App::with_settings(client, 40, 120, settings);
     app.open_path(&device.path, Some(115_200)).expect("open");
@@ -1516,7 +1521,7 @@ fn a_double_click_opens_the_row_it_started_on_after_the_list_scrolls() {
     // highlighted.
     app.state.select_index(11);
 
-    let area = Rect::new(0, 0, 80, 16);
+    let area = Rect::new(0, 0, 80, 18);
     let list = sidebar(panes(area).sidebar).unwrap().list;
     assert_eq!(list.height, 11);
     let at = Instant::now();

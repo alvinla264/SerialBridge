@@ -16,7 +16,7 @@ use ratatui::style::{Color as RColor, Modifier, Style as RStyle};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::screen::{Color, Style};
-use crate::state::{AppState, Focus, Severity, View, SETTINGS_ROWS};
+use crate::state::{AppState, Focus, SettingsRow, Severity, SidebarButton, View};
 
 /// The sidebar's preferred narrowest width when both panes are shown.
 pub const MIN_SIDEBAR_WIDTH: u16 = 20;
@@ -133,27 +133,36 @@ pub fn stream_body_area(area: Rect) -> Option<Rect> {
     (right.width > 0 && right.height > 0).then_some(right)
 }
 
-/// The sidebar's rows: a title, the device list, and the Settings button.
+/// The sidebar's rows: a title, the device list, and the Share, Connect and
+/// Settings buttons, top to bottom.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sidebar {
     pub title: Rect,
     pub list: Rect,
+    pub share: Rect,
+    pub connect: Rect,
     pub button: Rect,
 }
 
 /// Where the sidebar puts its parts inside `rect`, or `None` when there is no
 /// room.
 pub fn sidebar(rect: Rect) -> Option<Sidebar> {
-    if rect.height < 2 || rect.width < 8 {
+    // A title and three buttons; the list may give way to the buttons, so a
+    // very short sidebar still shows every control.
+    if rect.height < 4 || rect.width < 8 {
         return None;
     }
     let title = Rect::new(rect.x, rect.y, rect.width, 1);
     let button = Rect::new(rect.x, rect.y + rect.height - 1, rect.width, 1);
-    let list_height = rect.height - 2;
+    let connect = Rect::new(rect.x, rect.y + rect.height - 2, rect.width, 1);
+    let share = Rect::new(rect.x, rect.y + rect.height - 3, rect.width, 1);
+    let list_height = rect.height - 4;
     let list = Rect::new(rect.x, rect.y + 1, rect.width, list_height);
     Some(Sidebar {
         title,
         list,
+        share,
+        connect,
         button,
     })
 }
@@ -251,18 +260,19 @@ pub fn settings_hit_test(
     }
     if in_rect(layout.rows, column, row) {
         let index = (row - layout.rows.y) as usize + settings_first_row(state, layout);
-        return (index < SETTINGS_ROWS).then_some(SettingsHit::Flag(index));
+        return (index < state.settings_row_count()).then_some(SettingsHit::Flag(index));
     }
     None
 }
 
 /// The first flag the rows show, so the selected one stays in view.
 fn settings_first_row(state: &AppState, layout: SettingsLayout) -> usize {
+    let rows = state.settings_row_count().max(1);
     let visible = layout.rows.height.max(1) as usize;
-    let last_first = SETTINGS_ROWS.saturating_sub(visible);
+    let last_first = rows.saturating_sub(visible);
     state
         .settings_row
-        .min(SETTINGS_ROWS - 1)
+        .min(rows - 1)
         .saturating_sub(visible.saturating_sub(1))
         .min(last_first)
 }
@@ -271,6 +281,8 @@ fn settings_first_row(state: &AppState, layout: SettingsLayout) -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
     Device(usize),
+    Share,
+    Connect,
     Settings,
 }
 
@@ -285,6 +297,12 @@ pub fn hit_test(state: &AppState, area: Rect, column: u16, row: u16) -> Option<H
     let sidebar = sidebar(panes.sidebar)?;
     if in_rect(sidebar.button, column, row) {
         return Some(Hit::Settings);
+    }
+    if in_rect(sidebar.share, column, row) {
+        return Some(Hit::Share);
+    }
+    if in_rect(sidebar.connect, column, row) {
+        return Some(Hit::Connect);
     }
     let list = sidebar.list;
     if list.height == 0 || !in_rect(list, column, row) {
@@ -343,6 +361,7 @@ fn draw_right(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16,
         View::Stream => draw_stream(state, buffer, area),
         View::Scrollback => draw_stream(state, buffer, area),
         View::Settings => draw_settings(state, buffer, area),
+        View::Pairing => draw_pairing(state, buffer, area),
     }
 }
 
@@ -389,6 +408,7 @@ fn draw_header(state: &AppState, buffer: &mut Buffer, area: Rect) {
         (Focus::Right, View::Stream) => "focus: stream",
         (Focus::Right, View::Settings) => "focus: settings",
         (Focus::Right, View::Scrollback) => "focus: scrollback",
+        (Focus::Right, View::Pairing) => "focus: pairing",
     };
 
     let brand = " SerialNexus ";
@@ -448,7 +468,7 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u1
     // With no room for a device row, the title row carries the highlighted
     // device instead, so the cursor never points at the Settings button while
     // a device owns the keys.
-    let title = if list.height == 0 && !state.settings_button_selected() {
+    let title = if list.height == 0 && state.selected_device().is_some() {
         match state.selected_device() {
             Some(device) => format!("› {} ", device.path),
             None => " Devices ".to_string(),
@@ -532,10 +552,53 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u1
         draw_row(buffer, row, &label, &status, style);
     }
 
-    // The Settings button is a real row: selected with the arrow keys and
+    // The three buttons are real rows: selected with the arrow keys and
     // clickable with the mouse.
+    let mut cursor = None;
+    let share_selected = state.selected_button() == Some(SidebarButton::Share);
+    let share_style = if share_selected {
+        highlighted(true)
+    } else {
+        RStyle::default().fg(RColor::Cyan)
+    };
+    let share_label = if state.sharing.active {
+        "[ Share: on ]"
+    } else {
+        "[ Share: off ]"
+    };
+    draw_row(
+        buffer,
+        sidebar.share,
+        &format!("{} {share_label}", if share_selected { "›" } else { " " }),
+        if state.sharing.active {
+            "p pairing · s stops"
+        } else {
+            "Enter starts · s"
+        },
+        share_style,
+    );
+    if share_selected {
+        cursor = Some((sidebar.share.x + 1, sidebar.share.y));
+    }
+
+    let connect_selected = state.selected_button() == Some(SidebarButton::Connect);
+    let connect_style = if connect_selected {
+        highlighted(true)
+    } else {
+        RStyle::default().fg(RColor::Cyan)
+    };
+    draw_row(
+        buffer,
+        sidebar.connect,
+        &format!("{} [ Connect ]", if connect_selected { "›" } else { " " }),
+        "Enter · c",
+        connect_style,
+    );
+    if connect_selected {
+        cursor = Some((sidebar.connect.x + 1, sidebar.connect.y));
+    }
+
     let selected = state.settings_button_selected();
-    let button = sidebar.button;
     let style = if selected {
         highlighted(true)
     } else {
@@ -543,14 +606,17 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u1
     };
     draw_row(
         buffer,
-        button,
+        sidebar.button,
         &format!("{} [ Settings ]", if selected { "›" } else { " " }),
         "Enter opens",
         style,
     );
+    if selected {
+        cursor = Some((sidebar.button.x + 1, sidebar.button.y));
+    }
 
-    if state.settings_button_selected() {
-        Some((button.x + 1, button.y))
+    if let Some(cursor) = cursor {
+        Some(cursor)
     } else if list.height == 0 {
         // The device is shown on the title row when no device row fits.
         Some((sidebar.title.x + 1, sidebar.title.y))
@@ -561,7 +627,8 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u1
     }
 }
 
-/// The settings view in the right pane: the two flags, edited as a draft.
+/// The settings view in the right pane: two flags, the sharing address and
+/// port, and one checkbox per detected device, all edited as a draft.
 fn draw_settings(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16, u16)> {
     let Some(layout) = settings_layout(area) else {
         // No room for buttons: still say how to save and leave by keyboard.
@@ -583,29 +650,37 @@ fn draw_settings(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u
     }
     let first = settings_first_row(state, layout);
     let visible = layout.rows.height.max(1) as usize;
-    for row in first..SETTINGS_ROWS {
+    let rows = state.settings_row_count();
+    for row in first..rows {
         if row - first >= visible {
             break;
         }
-        let name = AppState::settings_row_name(row).unwrap_or_default();
-        let value = match state.draft_value(row) {
-            Some(true) => "on",
-            _ => "off",
-        };
+        let label = state.settings_row_label(row);
+        let value = state.draft_value(row).unwrap_or_default();
         let selected = row == state.settings_row;
+        let marker = if selected { "▸" } else { " " };
+        let (label, value) = match state.settings_kind(row) {
+            Some(SettingsRow::Device(_)) => {
+                let checkbox = if value == "on" { "[x]" } else { "[ ]" };
+                (format!("{marker} {checkbox} {label}"), String::new())
+            }
+            Some(SettingsRow::ShareAddress | SettingsRow::SharePort) => {
+                let value = if state.settings_editing && selected {
+                    format!("{value}│")
+                } else {
+                    value
+                };
+                (format!("{marker} {label}"), value)
+            }
+            _ => (format!("{marker} {label}"), value),
+        };
         let line = Rect::new(
             layout.rows.x,
             layout.rows.y + (row - first) as u16,
             layout.rows.width,
             1,
         );
-        draw_value_row(
-            buffer,
-            line,
-            &format!("{} {name}", if selected { "▸" } else { " " }),
-            value,
-            highlighted(selected),
-        );
+        draw_value_row(buffer, line, &label, &value, highlighted(selected));
     }
 
     // The obvious way to keep a change: a real button row, clickable and
@@ -639,7 +714,7 @@ fn draw_settings(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u
                 1,
             ),
             0,
-            "Click a flag to toggle it · Ctrl+S saves · Esc cancels",
+            "Space/Enter toggles · Enter edits the address or port · Ctrl+S saves · Esc cancels",
             dim(),
         );
     }
@@ -648,23 +723,123 @@ fn draw_settings(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u
             buffer,
             layout.hints,
             0,
-            " Local echo and scrollback · saved only when the file is written ",
+            " Saved only when the file is written · device checks are session-only ",
             dim(),
         );
     }
 
-    let row = state.settings_row.min(SETTINGS_ROWS - 1);
-    let value = match state.draft_value(row) {
-        Some(true) => "on",
-        _ => "off",
+    let row = state.settings_row.min(rows.saturating_sub(1));
+    let value = state.draft_value(row).unwrap_or_default();
+    let value_column = layout.rows.width.saturating_sub(display_width(&value));
+    let column = match state.settings_kind(row) {
+        Some(SettingsRow::Device(_)) => layout.rows.x + 4,
+        _ => layout.rows.x + value_column,
     };
-    // The cursor sits where the value is drawn, right-aligned at the edge, on
-    // the row the list actually scrolled to.
-    let value_column = layout.rows.width.saturating_sub(display_width(value));
-    Some((
-        layout.rows.x + value_column,
-        layout.rows.y + (row - first) as u16,
-    ))
+    Some((column, layout.rows.y + (row - first) as u16))
+}
+
+/// The owner's pairing view: the reachable address, what authenticates the
+/// host, and the two separate pairing credentials. The secrets exist only in
+/// this session's memory and are drawn only here.
+fn draw_pairing(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16, u16)> {
+    let Some(pairing) = &state.sharing.pairing else {
+        put(
+            buffer,
+            area,
+            1,
+            "Sharing is off: press s or use the Share button to start it.",
+            dim(),
+        );
+        return Some((area.x + 1, area.y));
+    };
+    let snapshot = state.sharing.snapshot.as_ref();
+    let checked: Vec<String> = state.sharing.checked().into_iter().collect();
+    let remote = snapshot
+        .map(|snapshot| snapshot.remote_clients)
+        .unwrap_or(0);
+    let pending = snapshot
+        .map(|snapshot| snapshot.pending_connections)
+        .unwrap_or(0);
+    let mut lines = vec![
+        format!(
+            "Sharing on {} · {remote} remote client(s) · {pending} connecting",
+            pairing.bind
+        ),
+        "Firewall and router settings decide who can reach this address; this terminal only listens on it.".to_string(),
+        String::new(),
+        "Host authentication (enter this on the remote terminal):".to_string(),
+        format!("  host name: {}", pairing.host.host_name),
+        format!(
+            "  certificate SHA-256: {}",
+            pairing.host.host_cert_fingerprint_sha256
+        ),
+        "  CA certificate (base64 DER):".to_string(),
+    ];
+    for chunk in pairing.host.ca_cert_der_b64.as_bytes().chunks(72) {
+        lines.push(format!("    {}", String::from_utf8_lossy(chunk)));
+    }
+    lines.push(String::new());
+    lines.push("Human terminal pairing:".to_string());
+    lines.push(format!("  credential: {}", pairing.human.credential));
+    lines.push(String::new());
+    lines.push("MCP (AI) pairing:".to_string());
+    lines.push(format!("  credential: {}", pairing.ai.credential));
+    lines.push(String::new());
+    if checked.is_empty() {
+        lines.push("Shared devices: none".to_string());
+    } else {
+        lines.push("Shared devices:".to_string());
+        for path in &checked {
+            lines.push(format!("  {path}"));
+        }
+    }
+    lines.push(String::new());
+    lines.push("Secrets are shown only here and are never saved or sent to a device.".to_string());
+    lines.push("Esc back · s stops sharing · ↑/↓ scroll".to_string());
+
+    let width = area.width.max(1) as usize;
+    let wrapped: Vec<String> = lines
+        .iter()
+        .flat_map(|line| wrap_line(line, width))
+        .collect();
+    let height = area.height.max(1) as usize;
+    let max_first = wrapped.len().saturating_sub(height);
+    let first = state.pairing_scroll.min(max_first);
+    for row in 0..height {
+        let Some(text) = wrapped.get(first + row) else {
+            break;
+        };
+        put(
+            buffer,
+            Rect::new(area.x, area.y + row as u16, area.width, 1),
+            0,
+            text,
+            RStyle::default(),
+        );
+    }
+    Some((area.x, area.y))
+}
+
+/// Split one line into display-width-bounded pieces, never in the middle of a
+/// wide character.
+fn wrap_line(line: &str, width: usize) -> Vec<String> {
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+    let mut pieces = Vec::new();
+    let mut current = String::new();
+    let mut used = 0usize;
+    for ch in line.chars() {
+        let ch_width = ch.width().unwrap_or(0);
+        if used + ch_width > width && !current.is_empty() {
+            pieces.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        current.push(ch);
+        used += ch_width;
+    }
+    pieces.push(current);
+    pieces
 }
 
 fn draw_stream(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16, u16)> {
@@ -819,7 +994,10 @@ fn draw_hints(state: &AppState, buffer: &mut Buffer, area: Rect) {
             " ↑/↓ line · PageUp/PageDown page · Esc back to live · Ctrl+] sidebar ".to_string()
         }
         (Focus::Right, View::Settings) => {
-            " Ctrl+S save · Esc cancel · Tab/↑↓ move · Space toggle ".to_string()
+            " Ctrl+S save · Esc cancel · Tab/↑↓ move · Space/Enter toggle or edit ".to_string()
+        }
+        (Focus::Right, View::Pairing) => {
+            " ↑/↓ scroll · s stop sharing · Esc back to the stream ".to_string()
         }
     };
     put(buffer, area, 0, &hints, dim());
@@ -1245,7 +1423,7 @@ mod tests {
             .find(|line| line.contains("Scrollback"))
             .expect("scrollback row");
         assert!(scrollback.contains("on"), "{scrollback}");
-        assert!(text.contains("Ctrl+S saves"), "{text}");
+        assert!(text.contains("Ctrl+S save"), "{text}");
         assert!(
             text.contains("[ Save ]"),
             "a clickable save is drawn: {text}"
@@ -1301,11 +1479,11 @@ mod tests {
         let mut state = demo();
         state.begin_settings();
         state.settings_row = 1;
-        let lines = screen(&state, 80, 6);
+        let lines = screen(&state, 80, 7);
         let text = lines.join("\n");
         assert!(text.contains("Local echo"), "{text}");
         assert!(text.contains("Scrollback"), "{text}");
-        let area = Rect::new(0, 0, 80, 6);
+        let area = Rect::new(0, 0, 80, 7);
         let mut buffer = Buffer::empty(area);
         let cursor = render(&state, &mut buffer, area).expect("cursor");
         let rows = settings_layout(panes(area).right).unwrap().rows;
@@ -1321,9 +1499,9 @@ mod tests {
     }
 
     #[test]
-    fn a_four_row_sidebar_shows_the_highlighted_device_under_the_cursor() {
+    fn a_short_sidebar_shows_the_highlighted_device_under_the_cursor() {
         let state = demo();
-        let area = Rect::new(0, 0, 80, 4);
+        let area = Rect::new(0, 0, 80, 7);
         let mut buffer = Buffer::empty(area);
         let cursor = render(&state, &mut buffer, area).expect("cursor");
         let row: String = (0..area.width)
@@ -1369,7 +1547,7 @@ mod tests {
         assert!(live.contains("line7"), "{live}");
         assert!(live.contains("At the live screen"), "{live}");
         assert!(
-            live.contains("Devices (2)"),
+            live.contains("[ Share: off ]"),
             "the sidebar is still beside the scrollback: {live}"
         );
 

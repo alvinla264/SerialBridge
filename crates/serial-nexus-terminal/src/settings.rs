@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 pub const SETTINGS_FILE: &str = "terminal.json";
 
 /// Preferences the terminal keeps between launches.
+///
+/// The sharing address and port are preferences; the list of shared devices
+/// is deliberately not here: checking a device is session-only and defaults to
+/// none.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TerminalSettings {
@@ -20,6 +24,10 @@ pub struct TerminalSettings {
     pub local_echo: bool,
     /// Keep device output around for scrolling back.
     pub scrollback: bool,
+    /// The concrete IPv4 or IPv6 address the host shares on. Not a secret.
+    pub share_address: String,
+    /// The port the host shares on; 0 asks the operating system for one.
+    pub share_port: u16,
 }
 
 impl Default for TerminalSettings {
@@ -27,6 +35,10 @@ impl Default for TerminalSettings {
         Self {
             local_echo: true,
             scrollback: true,
+            // Loopback is the safe default: reaching it from another machine
+            // takes a deliberate change of address.
+            share_address: "127.0.0.1".to_string(),
+            share_port: 7331,
         }
     }
 }
@@ -198,6 +210,7 @@ mod tests {
         TerminalSettings {
             local_echo: false,
             scrollback: false,
+            ..TerminalSettings::default()
         }
     }
 
@@ -240,6 +253,38 @@ mod tests {
             .expect("load")
             .expect("file");
         assert_eq!(loaded, both_off());
+    }
+
+    #[test]
+    fn an_older_settings_file_keeps_the_sharing_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal.json");
+        std::fs::write(&path, "{\"local_echo\":false,\"scrollback\":false}").unwrap();
+        let settings = SettingsStore::at(&path)
+            .load()
+            .expect("load")
+            .expect("file");
+        assert_eq!(settings.share_address, "127.0.0.1");
+        assert_eq!(settings.share_port, 7331);
+    }
+
+    #[test]
+    fn sharing_preferences_round_trip_and_hold_no_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal.json");
+        let settings = TerminalSettings {
+            share_address: "::1".into(),
+            share_port: 9123,
+            ..TerminalSettings::default()
+        };
+        SettingsStore::at(&path).save(&settings).expect("save");
+        assert_eq!(
+            SettingsStore::at(&path).load().unwrap(),
+            Some(settings.clone())
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("9123"));
+        assert!(!text.contains("credential"));
     }
 
     #[test]
