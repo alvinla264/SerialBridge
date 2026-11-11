@@ -577,6 +577,9 @@ fn serve_connection(
 ) {
     let mut client_id = None;
     let _ = run_connection(&engine, &session, &tcp, &mut client_id);
+    // Close the transport before any blocking device cleanup, so stop can
+    // always tear this peer down even if unregistering drains a writer.
+    let _ = tcp.shutdown(Shutdown::Both);
     let authenticated = client_id.is_some();
     // Release the connection slot before unregistering: unregistering the last
     // attachment may drain a stalled serial writer.

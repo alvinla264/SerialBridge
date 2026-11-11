@@ -84,7 +84,8 @@ type:
   plus an `O_PATH` descriptor that pins the node, captured when checked. It is
   revalidated on `Open`, `Read`, `Write`, `Status`, `Close` and on the open
   itself: the serial descriptor's `fstat` and the canonical path must both
-  still be that node, and the pinned node must still be linked (`nlink > 0`).
+  still be that node, and the pinned node's link count must still equal the
+  captured value (so an added hard link also expires it).
   A changed node or an unplug expires the entry: access stops at once and the
   path stays only long enough for attached remote clients to receive
   `DeviceClosed`. An ordinary last-detach close keeps the checked entry (the
@@ -324,6 +325,20 @@ fixed with tests:
   connection slots, and an unchecked later device instance; the engine-level
   PTY-recycling replacement test is `#[ignore]`d because path reuse is not
   guaranteed, with deterministic regular-file identity tests in its place.
+
+### Eleventh iterative review fixes
+
+- **Expiry discovered by discovery/events now detaches remotes and announces
+  `DeviceClosed`** (or lets normal last-detach cleanup do so), releasing stale
+  control; the stale-identity test covers this.
+- **A host-only `/32` interface address is no longer mistaken for a
+  broadcast**, while directed broadcasts still derive from wider masks.
+- **Local writes are also refused while sharing if their `Write` echo cannot
+  fit a remote frame**, so remote subscribers never silently miss an accepted
+  local write.
+- **Rejected/failed remote connections shut their TCP transport before
+  blocking device cleanup**, so stop always closes the socket.
+- Documentation now states the exact link-count identity predicate.
 
 ### Tenth iterative review fixes
 

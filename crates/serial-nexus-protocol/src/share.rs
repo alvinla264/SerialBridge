@@ -84,6 +84,19 @@ impl ShareBind {
     }
 }
 
+fn derived_broadcast(
+    local: std::net::Ipv4Addr,
+    mask: std::net::Ipv4Addr,
+) -> Option<std::net::Ipv4Addr> {
+    let mask = u32::from(mask);
+    // A host-only prefix or a zero mask has no distinct directed broadcast.
+    if mask == 0 || mask == u32::MAX {
+        return None;
+    }
+    let derived = std::net::Ipv4Addr::from(u32::from(local) | !mask);
+    (derived != local).then_some(derived)
+}
+
 /// True when the address is the directed broadcast of one of this host's
 /// interfaces (for example loopback's `127.255.255.255`).
 #[cfg(unix)]
@@ -117,8 +130,7 @@ fn is_interface_broadcast(address: std::net::Ipv4Addr) -> bool {
         else {
             return false;
         };
-        let derived = u32::from(local.ip()) | !u32::from(mask.ip());
-        derived == u32::from(address) && mask.ip() != std::net::Ipv4Addr::UNSPECIFIED
+        derived_broadcast(local.ip(), mask.ip()) == Some(address)
     })
 }
 
@@ -766,5 +778,13 @@ mod broadcast_tests {
         assert!(loopback.validate().is_err());
         let limited = ShareBind::new("255.255.255.255".parse().unwrap(), 0);
         assert!(limited.validate().is_err());
+        // A host-only /32 has no distinct broadcast.
+        assert_eq!(
+            derived_broadcast(
+                "10.77.0.3".parse().unwrap(),
+                "255.255.255.255".parse().unwrap()
+            ),
+            None
+        );
     }
 }

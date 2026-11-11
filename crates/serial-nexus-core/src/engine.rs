@@ -882,6 +882,7 @@ impl Engine {
         params: WriteParams,
     ) -> Result<WriteStart, ErrorBody> {
         let (kind, _name) = self.identity(client_id);
+        let sharing_active = self.sharing_session().is_some();
         let data = decode_bytes(&params.data_b64)
             .map_err(|error| ErrorBody::new(ErrorCode::BadRequest, error.to_string()))?;
         let bytes_written = data.len();
@@ -909,6 +910,24 @@ impl Engine {
                 ))
             }
         };
+        if sharing_active {
+            // Remote subscribers receive a Write echo slightly larger than the
+            // request; reject writes whose echo cannot fit instead of silently
+            // dropping it. Local-only operation keeps its 1 MiB budget.
+            let echo = ServerMessage::Event {
+                event: Event::Write {
+                    device_id: params.device_id,
+                    source,
+                    data_b64: params.data_b64.clone(),
+                },
+            };
+            if serial_nexus_protocol::encode_frame(&echo).is_err() {
+                return Err(ErrorBody::new(
+                    ErrorCode::BadRequest,
+                    "write is too large to echo to remote peers; split it into smaller writes",
+                ));
+            }
+        }
         if kind == ClientKind::Ai
             && device
                 .control
@@ -1775,42 +1794,68 @@ impl Engine {
             .filter(|(_, record)| record.remote.is_some())
             .map(|(id, _)| *id)
             .collect();
-        let mut state = self.state.lock().expect("state lock");
-        let Some(device) = state.devices.get_mut(&device_id) else {
-            return false;
-        };
-        let Some(shared) = device.shared.clone() else {
-            return false;
-        };
-        let visible =
-            shared == device.identity && shared.still_valid() && session.allows_path(&device.path);
-        if !visible {
-            let had_remote = device
-                .clients
-                .keys()
-                .any(|client| remote_ids.contains(client));
-            if had_remote {
-                session.mark_vacated(&device.path);
-            }
-            device.shared = None;
-            device.write_epoch.fetch_add(1, Ordering::SeqCst);
-            session.revoke_path(&device.path);
-            // Expiry cancels pending remote work, matching uncheck.
-            let mut kept = Vec::new();
-            for waiter in std::mem::take(&mut device.waiters) {
-                if remote_ids.contains(&waiter.client_id) {
-                    let _ = waiter.tx.send(WaitOutcome {
-                        lines: waiter.lines,
-                        timed_out: false,
-                        failed: Some("device is no longer shared".into()),
-                    });
-                } else {
-                    kept.push(waiter);
+        let expired = {
+            let mut state = self.state.lock().expect("state lock");
+            let Some(device) = state.devices.get_mut(&device_id) else {
+                return false;
+            };
+            let Some(shared) = device.shared.clone() else {
+                return false;
+            };
+            let visible = shared == device.identity
+                && shared.still_valid()
+                && session.allows_path(&device.path);
+            if visible {
+                None
+            } else {
+                let had_remote = device
+                    .clients
+                    .keys()
+                    .any(|client| remote_ids.contains(client));
+                let path = device.path.clone();
+                if had_remote {
+                    session.mark_vacated(&path);
                 }
+                device.shared = None;
+                device.write_epoch.fetch_add(1, Ordering::SeqCst);
+                session.revoke_path(&path);
+                // Expiry cancels pending remote work, matching uncheck.
+                let mut kept = Vec::new();
+                for waiter in std::mem::take(&mut device.waiters) {
+                    if remote_ids.contains(&waiter.client_id) {
+                        let _ = waiter.tx.send(WaitOutcome {
+                            lines: waiter.lines,
+                            timed_out: false,
+                            failed: Some("device is no longer shared".into()),
+                        });
+                    } else {
+                        kept.push(waiter);
+                    }
+                }
+                device.waiters = kept;
+                Some((path, had_remote))
             }
-            device.waiters = kept;
+        };
+        let Some((path, had_remote)) = expired else {
+            return true;
+        };
+        if had_remote {
+            // Detach remotes and release their control before announcing the
+            // expired instance, so no stale controller remains attached.
+            let removed =
+                self.begin_detach_remote_clients(&[device_id], "device is no longer shared");
+            let removed_device = !removed.is_empty();
+            self.finish_devices(removed);
+            if !removed_device {
+                self.emit(vec![Event::DeviceClosed {
+                    device_id,
+                    path: path.clone(),
+                    reason: "device is no longer shared".into(),
+                }]);
+            }
+            session.clear_vacated(&path);
         }
-        visible
+        false
     }
 
     fn remote_scope(&self, client_id: u64) -> Option<Arc<SharingSession>> {

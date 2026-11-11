@@ -1942,9 +1942,11 @@ fn owner_loss_revokes_sharing_even_while_a_device_close_is_draining() {
         .expect("start");
 
     // Fill the PTY so the owner handler blocks joining the writer on close.
-    owner
-        .write_bytes(1, &vec![b'x'; 128 * 1024], None)
-        .expect("queue stalled local write");
+    for _ in 0..40 {
+        owner
+            .write_bytes(1, &[b'x'; 8 * 1024], None)
+            .expect("queue stalled local write");
+    }
     let close_owner = owner.clone();
     let close_thread = std::thread::spawn(move || close_owner.close(1));
     std::thread::sleep(Duration::from_millis(300));
@@ -2181,4 +2183,25 @@ fn a_remote_write_too_large_to_echo_is_refused() {
         .write_bytes(opened.device_id, &vec![b'x'; 49_100], None)
         .expect_err("un-echoable write must be refused");
     assert_eq!(error.code(), Some(ErrorCode::BadRequest), "{error:?}");
+}
+
+#[test]
+fn a_local_write_too_large_to_echo_is_refused_while_sharing() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let mut device = SimulatedDevice::new();
+    owner
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    owner
+        .start_sharing(localhost_bind(), vec![device.path.clone()])
+        .expect("start");
+    let error = owner
+        .write_bytes(1, &vec![b'x'; 100 * 1024], None)
+        .expect_err("un-echoable local write must be refused while sharing");
+    assert_eq!(error.code(), Some(ErrorCode::BadRequest), "{error:?}");
+    assert!(
+        device.read_available(Duration::from_millis(100)).is_empty(),
+        "refused write must not reach the device"
+    );
 }

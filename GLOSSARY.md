@@ -99,8 +99,9 @@ these words in their tool names and user-facing text.
   `(st_dev, st_ino, st_rdev)` and an `O_PATH` descriptor that pins the node,
   captured when the device is checked. It is revalidated at authorization,
   open time and before a checked device is listed to remote clients; an
-  unplugged or replaced device loses its authorization (the entry expires and
-  must be checked again) instead of letting a replacement inherit it. An
+  unplugged, replaced, or relinked device (link count changed) loses its
+  authorization (the entry expires and must be checked again) instead of
+  letting a replacement inherit it. An
   ordinary last-detach close keeps the entry while the pinned node is still
   the same live device.
 - **Unchecked**: a device removed from the allowlist. Remote access to it is

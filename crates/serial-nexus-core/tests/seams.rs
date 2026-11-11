@@ -635,12 +635,17 @@ fn discovery_and_events_revalidate_a_stale_shared_identity() {
         .expect("incoming lock")
         .extend(b"POST-REPLACEMENT\n");
     std::thread::sleep(Duration::from_millis(250));
+    let mut saw_closed = false;
     while let Ok(event) = events.try_recv() {
+        if matches!(event, serial_nexus_protocol::Event::DeviceClosed { .. }) {
+            saw_closed = true;
+        }
         assert!(
             !matches!(event, serial_nexus_protocol::Event::DeviceOutput { .. }),
             "event delivery must not expose data after identity expiry: {event:?}"
         );
     }
+    assert!(saw_closed, "expiry must announce DeviceClosed");
     assert!(
         !remote
             .list_devices()
