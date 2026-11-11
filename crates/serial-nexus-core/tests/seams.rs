@@ -795,3 +795,74 @@ fn a_failed_devices_stalled_writer_does_not_block_healthy_output() {
     install_serial_factory(None);
     install_port_lister(None);
 }
+
+#[test]
+fn discovery_revalidation_expires_without_any_event() {
+    let _guard = seam_lock().lock().expect("seam lock");
+    let core = core();
+    let directory = TempDir::new().expect("tempdir");
+    let path = directory.path().join("device-node");
+    std::fs::write(&path, b"").expect("node");
+    let path_text = path.to_string_lossy().into_owned();
+    let lister_path = path_text.clone();
+    let lister: Arc<serial_nexus_core::enumerate::PortLister> = Arc::new(move || {
+        vec![PortInfo {
+            path: lister_path.clone(),
+            description: Some("injected discovery node".into()),
+        }]
+    });
+    install_port_lister(Some(lister));
+    let state = Arc::new(FakeState {
+        live_ports: AtomicUsize::new(0),
+        incoming: Mutex::new(VecDeque::new()),
+        fail_reads: AtomicBool::new(false),
+        block_writes: AtomicBool::new(false),
+        written: Mutex::new(Vec::new()),
+        attempts: Mutex::new(Vec::new()),
+        writes: AtomicUsize::new(0),
+        fail_after: usize::MAX,
+        baud: 115_200,
+    });
+    let factory_state = Arc::clone(&state);
+    let factory: Arc<serial_nexus_core::device::SerialFactory> = Arc::new(move |_path, baud| {
+        let _ = baud;
+        Ok(FakePort::boxed(Arc::clone(&factory_state)))
+    });
+    install_serial_factory(Some(factory));
+
+    let owner = connect(&core.socket, ClientInfo::human("owner"));
+    let info = owner
+        .start_sharing(bind(), vec![path_text.clone()])
+        .expect("share injected node");
+    let remote = RemoteClient::connect(
+        &info.host,
+        &info.human,
+        Some("discovery-only".into()),
+        Duration::from_secs(5),
+    )
+    .expect("pair");
+    remote
+        .open(&path_text, Some(115_200), false)
+        .expect("open injected node");
+    assert!(remote
+        .list_devices()
+        .expect("before")
+        .devices
+        .iter()
+        .any(|entry| entry.path == path_text));
+
+    std::fs::remove_file(&path).expect("unlink");
+    std::fs::write(&path, b"replacement").expect("replacement");
+    // No device output or event is delivered before this discovery call.
+    assert!(
+        !remote
+            .list_devices()
+            .expect("after")
+            .devices
+            .iter()
+            .any(|entry| entry.path == path_text),
+        "discovery itself must expire the stale identity"
+    );
+    install_serial_factory(None);
+    install_port_lister(None);
+}

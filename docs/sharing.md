@@ -264,12 +264,13 @@ fixed with tests:
   `a_mismatched_expected_identity_is_rejected_before_configuration`.
 - **Discovery and events revalidate the instance.** Remote discovery and event
   delivery revalidate the instance identity, expire the allowlist entry and
-  bump its write generation when it no longer matches. The deterministic
-  seam test `discovery_and_events_revalidate_a_stale_shared_identity` replaces
-  a pinned node and asserts discovery expires it, no device output event leaks,
-  and later writes fail; it fails if `still_valid()` is removed.
-  `remote_operations_are_limited_to_checked_devices_by_acl` covers checked
-  versus unchecked devices.
+  bump its write generation when it no longer matches. Two deterministic seam
+  tests split the paths: `discovery_and_events_revalidate_a_stale_shared_identity`
+  delivers output before discovery and checks event suppression, expiry,
+  `DeviceClosed`, waiter cancellation and later write denial;
+  `discovery_revalidation_expires_without_any_event` replaces a pinned node and
+  calls discovery first. `remote_operations_are_limited_to_checked_devices_by_acl`
+  covers checked versus unchecked devices.
 - **Detached waiters are cancelled.** `Close` fails that client's waited writes
   immediately, so unchecking cannot leave a detached waiter collecting later
   output. Test:
@@ -325,6 +326,16 @@ fixed with tests:
   connection slots, and an unchecked later device instance; the engine-level
   PTY-recycling replacement test is `#[ignore]`d because path reuse is not
   guaranteed, with deterministic regular-file identity tests in its place.
+
+### Twelfth iterative review fixes
+
+- **Expiry cleanup is asynchronous**, including when identity expiry is
+  discovered from a device event, so a stalled writer no longer freezes the
+  dispatcher or healthy devices.
+- **The remote echo limit applies only to shared devices**, preserving the
+  1 MiB local write budget for unchecked devices while sharing is active.
+- **Discovery expiry has its own event-free regression test**, so removing
+  list revalidation cannot hide behind event-time expiry.
 
 ### Eleventh iterative review fixes
 

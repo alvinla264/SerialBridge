@@ -882,7 +882,6 @@ impl Engine {
         params: WriteParams,
     ) -> Result<WriteStart, ErrorBody> {
         let (kind, _name) = self.identity(client_id);
-        let sharing_active = self.sharing_session().is_some();
         let data = decode_bytes(&params.data_b64)
             .map_err(|error| ErrorBody::new(ErrorCode::BadRequest, error.to_string()))?;
         let bytes_written = data.len();
@@ -910,10 +909,11 @@ impl Engine {
                 ))
             }
         };
-        if sharing_active {
+        if device.shared.is_some() {
             // Remote subscribers receive a Write echo slightly larger than the
-            // request; reject writes whose echo cannot fit instead of silently
-            // dropping it. Local-only operation keeps its 1 MiB budget.
+            // request; reject writes to shared devices whose echo cannot fit
+            // instead of silently dropping it. Unchecked local devices keep
+            // their 1 MiB budget.
             let echo = ServerMessage::Event {
                 event: Event::Write {
                     device_id: params.device_id,
@@ -1845,7 +1845,7 @@ impl Engine {
             let removed =
                 self.begin_detach_remote_clients(&[device_id], "device is no longer shared");
             let removed_device = !removed.is_empty();
-            self.finish_devices(removed);
+            self.cleanup_devices_async(removed);
             if !removed_device {
                 self.emit(vec![Event::DeviceClosed {
                     device_id,
@@ -2413,6 +2413,23 @@ fn take_device_locked(
 impl Engine {
     /// Join I/O threads outside the engine lock, then drop their write
     /// generations from the revocation registry.
+    fn cleanup_devices_async(&self, devices: Vec<Device>) {
+        if devices.is_empty() {
+            return;
+        }
+        let ids: Vec<u64> = devices.iter().map(|device| device.id).collect();
+        {
+            let mut live = self.live_writes.lock().expect("live writes lock");
+            for id in ids {
+                live.remove(&id);
+            }
+        }
+        let guard = JoinGuard(Some(devices));
+        let _ = std::thread::Builder::new()
+            .name("serial-expiry-cleanup".into())
+            .spawn(move || drop(guard));
+    }
+
     fn finish_devices(&self, devices: Vec<Device>) {
         let ids: Vec<u64> = devices.iter().map(|device| device.id).collect();
         join_devices(devices);
@@ -2440,6 +2457,17 @@ impl Drop for DeviceCleanup {
                 .lock()
                 .expect("live writes lock")
                 .remove(&self.id);
+        }
+    }
+}
+
+/// Joins moved device I/O threads on a worker, or inline if spawning fails.
+struct JoinGuard(Option<Vec<Device>>);
+
+impl Drop for JoinGuard {
+    fn drop(&mut self) {
+        if let Some(devices) = self.0.take() {
+            join_devices(devices);
         }
     }
 }
