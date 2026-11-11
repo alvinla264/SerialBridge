@@ -438,6 +438,9 @@ pub enum Event {
         device_id: u64,
         source: Source,
         data_b64: String,
+        /// True when the echo was trimmed to fit a remote frame.
+        #[serde(default)]
+        truncated: bool,
     },
     /// A device was closed. It must be opened again to be used.
     DeviceClosed {
@@ -502,6 +505,7 @@ impl Event {
             device_id,
             source,
             data_b64: encode_bytes(data),
+            truncated: false,
         }
     }
 

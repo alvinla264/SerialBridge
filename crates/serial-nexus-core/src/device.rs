@@ -1011,6 +1011,26 @@ mod tests {
     }
 
     #[test]
+    fn break_operations_reach_the_device_ioctl() {
+        use serialport::SerialPort;
+        // TIOCSBRK/TIOCCBRK must fail on a pipe; no-op mutations would return
+        // success and leave the regression undetected.
+        let (read, _write) = nix::unistd::pipe().expect("pipe");
+        let file = File::from(read);
+        let exclusive_file = file.try_clone().expect("clone");
+        let port = PosixSerial {
+            exclusive: Arc::new(ExclusiveToken {
+                file: exclusive_file,
+            }),
+            file: Arc::new(file),
+            baud: 115_200,
+            timeout: Duration::from_millis(50),
+        };
+        assert!(port.set_break().is_err());
+        assert!(port.clear_break().is_err());
+    }
+
+    #[test]
     fn framing_setters_are_reflected_by_getters() {
         use nix::pty::openpty;
         use serialport::StopBits;

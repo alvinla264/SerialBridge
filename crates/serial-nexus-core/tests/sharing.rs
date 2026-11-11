@@ -2165,7 +2165,7 @@ fn a_disconnected_remote_close_releases_its_slot_before_serial_drain() {
 }
 
 #[test]
-fn a_remote_write_too_large_to_echo_is_refused() {
+fn a_remote_write_too_large_to_echo_is_accepted_and_trimmed() {
     let core = shared_core();
     let owner = local_owner(&core);
     let device = SimulatedDevice::new();
@@ -2178,15 +2178,14 @@ fn a_remote_write_too_large_to_echo_is_refused() {
     let human = remote(&info, PairingRole::Human, "remote").expect("pair");
     let opened = human.open(&device.path, None, false).expect("open");
 
-    // Fits the request frame but not the slightly larger Write echo event.
-    let error = human
+    // The write succeeds; the slightly larger remote echo is trimmed.
+    human
         .write_bytes(opened.device_id, &vec![b'x'; 49_100], None)
-        .expect_err("un-echoable write must be refused");
-    assert_eq!(error.code(), Some(ErrorCode::BadRequest), "{error:?}");
+        .expect("write is accepted");
 }
 
 #[test]
-fn a_local_write_too_large_to_echo_is_refused_while_sharing() {
+fn a_large_local_write_still_succeeds_while_sharing() {
     let core = shared_core();
     let owner = local_owner(&core);
     let mut device = SimulatedDevice::new();
@@ -2196,12 +2195,8 @@ fn a_local_write_too_large_to_echo_is_refused_while_sharing() {
     owner
         .start_sharing(localhost_bind(), vec![device.path.clone()])
         .expect("start");
-    let error = owner
+    owner
         .write_bytes(1, &vec![b'x'; 100 * 1024], None)
-        .expect_err("un-echoable local write must be refused while sharing");
-    assert_eq!(error.code(), Some(ErrorCode::BadRequest), "{error:?}");
-    assert!(
-        device.read_available(Duration::from_millis(100)).is_empty(),
-        "refused write must not reach the device"
-    );
+        .expect("local write keeps its 1 MiB budget");
+    assert!(!device.read_available(Duration::from_millis(200)).is_empty());
 }

@@ -327,6 +327,18 @@ fixed with tests:
   PTY-recycling replacement test is `#[ignore]`d because path reuse is not
   guaranteed, with deterministic regular-file identity tests in its place.
 
+### Fifteenth iterative review fixes
+
+- **Writes are never rejected for echo size.** The full write is accepted and
+  executed; a remote `Write` echo that exceeds a frame is trimmed with
+  `truncated: true`. This preserves local compatibility and avoids silent
+  event loss.
+- **ShareStatus expiry revokes draining devices** through `live_writes`, not
+  only devices still in the open map.
+- **A failed wait outcome racing a timeout is uncertainty**, never a
+  successful timed-out write.
+- **Break regression now uses a pipe**, so TIOCSBRK/TIOCCBRK no-ops fail it.
+
 ### Fourteenth iterative review fixes
 
 - **ShareStatus expiry also bumps epochs in the draining-device registry**, so
@@ -351,8 +363,11 @@ fixed with tests:
 - **Expiry cleanup is asynchronous**, including when identity expiry is
   discovered from a device event, so a stalled writer no longer freezes the
   dispatcher or healthy devices.
-- **The remote echo limit applies only to shared devices**, preserving the
-  1 MiB local write budget for unchecked devices while sharing is active.
+- **Write echoes are trimmed, never refused.** Local writes keep their full
+  budget; only a remote `Write` echo that exceeds a frame is trimmed with
+  `truncated: true`, so remote subscribers never silently lose it. Tests:
+  `a_large_local_write_still_succeeds_while_sharing`,
+  `a_remote_write_too_large_to_echo_is_accepted_and_trimmed`.
 - **Discovery expiry has its own event-free regression test**, so removing
   list revalidation cannot hide behind event-time expiry.
 
@@ -363,9 +378,8 @@ fixed with tests:
   control; the stale-identity test covers this.
 - **A host-only `/32` interface address is no longer mistaken for a
   broadcast**, while directed broadcasts still derive from wider masks.
-- **Local writes are also refused while sharing if their `Write` echo cannot
-  fit a remote frame**, so remote subscribers never silently miss an accepted
-  local write.
+- **Remote `Write` echoes that cannot fit a frame are trimmed and marked
+  `truncated`**, while the write itself is accepted.
 - **Rejected/failed remote connections shut their TCP transport before
   blocking device cleanup**, so stop always closes the socket.
 - Documentation now states the exact link-count identity predicate.

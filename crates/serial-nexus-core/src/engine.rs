@@ -909,25 +909,6 @@ impl Engine {
                 ))
             }
         };
-        if device.shared.is_some() {
-            // Remote subscribers receive a Write echo slightly larger than the
-            // request; reject writes to shared devices whose echo cannot fit
-            // instead of silently dropping it. Unchecked local devices keep
-            // their 1 MiB budget.
-            let echo = ServerMessage::Event {
-                event: Event::Write {
-                    device_id: params.device_id,
-                    source,
-                    data_b64: params.data_b64.clone(),
-                },
-            };
-            if serial_nexus_protocol::encode_frame(&echo).is_err() {
-                return Err(ErrorBody::new(
-                    ErrorCode::BadRequest,
-                    "write is too large to echo to remote peers; split it into smaller writes",
-                ));
-            }
-        }
         if kind == ClientKind::Ai
             && device
                 .control
@@ -947,7 +928,6 @@ impl Engine {
                 ),
             ));
         }
-        refresh_control(device, client_id);
         let remote = self.remote_scope(client_id).is_some();
         if remote && device.shared.is_none() {
             return Err(ErrorBody::new(
@@ -1987,27 +1967,6 @@ impl Engine {
         client_id: u64,
         params: WriteParams,
     ) -> Result<WriteStart, ErrorBody> {
-        // The echo event is slightly larger than the request. Reject a remote
-        // write whose echo cannot fit rather than silently dropping it for
-        // every remote subscriber.
-        let (kind, _) = self.identity(client_id);
-        let source = match kind {
-            ClientKind::Ai => Source::Ai,
-            _ => Source::Human,
-        };
-        let echo = ServerMessage::Event {
-            event: Event::Write {
-                device_id: params.device_id,
-                source,
-                data_b64: params.data_b64.clone(),
-            },
-        };
-        if serial_nexus_protocol::encode_frame(&echo).is_err() {
-            return Err(ErrorBody::new(
-                ErrorCode::BadRequest,
-                "write is too large to echo to remote peers; split it into smaller writes",
-            ));
-        }
         // The sharing gate keeps admission atomic with stop/revocation, but
         // never covers a blocking device drain: a failed authorization drops
         // the gate before detaching.

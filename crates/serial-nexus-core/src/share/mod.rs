@@ -22,8 +22,8 @@ use crossbeam_channel::{bounded, unbounded};
 use ring::rand::SecureRandom;
 use serial_nexus_protocol::share::tlsio;
 use serial_nexus_protocol::{
-    encode_bytes, encode_frame, ErrorBody, ErrorCode, FrameDecoder, PairedHost, PairingRole,
-    PairingSecret, RemoteAuth, RemoteAuthResult, RemoteRequestMessage, ServerMessage,
+    decode_bytes, encode_bytes, encode_frame, ErrorBody, ErrorCode, FrameDecoder, PairedHost,
+    PairingRole, PairingSecret, RemoteAuth, RemoteAuthResult, RemoteRequestMessage, ServerMessage,
     ShareSessionInfo, ShareStartParams, SharedDevice, SharingSnapshot, MAX_REMOTE_CONNECTIONS,
     MAX_REMOTE_FRAME_BYTES, MAX_SHARED_DEVICES, SHARE_PROTOCOL_VERSION,
 };
@@ -449,7 +449,6 @@ impl SharingSession {
     }
 
     pub fn snapshot(&self) -> SharingSnapshot {
-        let _ = self.expire_invalid();
         let state = self.state.lock().expect("share state lock");
         SharingSnapshot {
             active: true,
@@ -839,6 +838,34 @@ fn write_server_message(
         Err(serial_nexus_protocol::ProtocolError::TooLarge { .. }) => {
             let id = match message {
                 ServerMessage::Response { id, .. } | ServerMessage::Error { id, .. } => *id,
+                ServerMessage::Event {
+                    event:
+                        serial_nexus_protocol::Event::Write {
+                            device_id,
+                            source,
+                            data_b64,
+                            ..
+                        },
+                } => {
+                    let bytes = decode_bytes(data_b64).unwrap_or_default();
+                    let mut keep = bytes.len();
+                    while keep > 0 {
+                        keep /= 2;
+                        let candidate = ServerMessage::Event {
+                            event: serial_nexus_protocol::Event::Write {
+                                device_id: *device_id,
+                                source: *source,
+                                data_b64: encode_bytes(&bytes[..keep]),
+                                truncated: true,
+                            },
+                        };
+                        if let Ok(frame) = encode_frame(&candidate) {
+                            return tlsio::write_frame(connection, tcp, &frame, deadline)
+                                .map_err(|_| ());
+                        }
+                    }
+                    return Ok(());
+                }
                 ServerMessage::Event { .. } => return Ok(()),
             };
             let fallback = ServerMessage::Error {
