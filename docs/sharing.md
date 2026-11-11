@@ -330,6 +330,12 @@ fixed with tests:
   PTY-recycling replacement test is `#[ignore]`d because path reuse is not
   guaranteed, with deterministic regular-file identity tests in its place.
 
+### Nineteenth iterative review fixes
+
+- **Write-triggered identity expiry runs full revalidation** before detaching,
+  so queued remote commands and waiters are revoked even when the failing
+  remote already closed its attachment.
+
 ### Eighteenth iterative review fixes
 
 - **ShareCheck returns the paths it expires** and the engine revokes each via

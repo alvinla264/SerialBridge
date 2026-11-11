@@ -1991,6 +1991,9 @@ impl Engine {
         }
         if let Err(error) = self.authorize_remote_device_only(&session, params.device_id) {
             drop(gate);
+            // Expiry must revoke queued work even when the failing remote has
+            // already detached; detach alone only bumps attached clients.
+            self.revalidate_shared_instance(params.device_id, &session);
             self.detach_remote_clients(&[params.device_id], "device is no longer shared");
             return Err(error);
         }
