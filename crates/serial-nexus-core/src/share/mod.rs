@@ -397,9 +397,9 @@ impl SharingSession {
     /// reach remote clients. A later open of the path clears it.
     pub fn mark_vacated(&self, path: &str) {
         let mut state = self.state.lock().expect("share state lock");
-        // Expired entries still get the closure mark: remotes attached before
-        // expiry must learn that the instance closed.
-        if state.devices.contains_key(path) {
+        // Only a live shared entry may mark a close; an expired entry that a
+        // local client later opens and closes must not leak an event.
+        if state.devices.get(path).is_some_and(|entry| !entry.expired) {
             state.vacated.insert(path.to_string());
         }
     }
@@ -472,6 +472,8 @@ impl SharingSession {
     fn register_connection(&self, stream: &TcpStream) -> Option<u64> {
         // Clone before reserving a slot: a clone failure must not leak one.
         let cloned = stream.try_clone().ok()?;
+        // Keep the connections -> state lock order used by connection_closed.
+        let mut connections = self.connections.lock().expect("connections lock");
         let mut state = self.state.lock().expect("share state lock");
         if self.is_stopped() {
             return None;
@@ -481,10 +483,7 @@ impl SharingSession {
         }
         state.pending += 1;
         let id = self.next_connection_id.fetch_add(1, Ordering::SeqCst);
-        self.connections
-            .lock()
-            .expect("connections lock")
-            .insert(id, RemoteSocket { stream: cloned });
+        connections.insert(id, RemoteSocket { stream: cloned });
         Some(id)
     }
 

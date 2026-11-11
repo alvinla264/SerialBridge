@@ -60,14 +60,9 @@ fn local_owner(core: &SharedCore) -> Client {
     connect(&core.socket, ClientInfo::human("owner-terminal"))
 }
 
-/// A loopback port that was free a moment ago.
-fn free_port() -> u16 {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("probe port");
-    listener.local_addr().expect("probe address").port()
-}
-
 fn localhost_bind() -> ShareBind {
-    ShareBind::new(IpAddr::V4(Ipv4Addr::LOCALHOST), free_port())
+    // Port 0 lets the core bind atomically and report the chosen port.
+    ShareBind::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
 }
 
 fn remote(
@@ -378,10 +373,7 @@ fn losing_the_owner_connection_stops_the_listener_and_disconnects_remotes() {
         new_owner.open(&device.path, Some(115_200), false).is_ok()
     });
     let fresh = new_owner
-        .start_sharing(
-            ShareBind::new(info.bind.ip(), free_port()),
-            vec![device.path.clone()],
-        )
+        .start_sharing(ShareBind::new(info.bind.ip(), 0), vec![device.path.clone()])
         .expect("restart");
     assert_ne!(fresh.session_id, info.session_id);
     assert_ne!(fresh.human.credential, info.human.credential);
@@ -429,7 +421,7 @@ fn wildcard_binding_is_refused() {
     for address in ["0.0.0.0", "::", "::ffff:0.0.0.0"] {
         let error = owner
             .start_sharing(
-                ShareBind::new(address.parse().unwrap(), free_port()),
+                ShareBind::new(address.parse().unwrap(), 0),
                 vec![device.path.clone()],
             )
             .expect_err("wildcard");
@@ -1274,11 +1266,11 @@ fn a_checked_but_never_opened_device_rejects_a_recycled_node() {
         denied.message
     );
     assert!(prepared.session.snapshot().checked.is_empty());
-    // An already-expired entry still gets the closure mark, so remotes that
-    // were attached before expiry receive DeviceClosed.
+    // An expired entry must not mark a later local close as a shared close;
+    // otherwise a never-shared replacement could leak DeviceClosed.
     prepared.session.revoke_path(&path_text);
     prepared.session.mark_vacated(&path_text);
-    assert!(prepared.session.is_vacated(&path_text));
+    assert!(!prepared.session.is_vacated(&path_text));
 }
 
 #[test]
@@ -1451,7 +1443,7 @@ fn unchecked_and_new_session_devices_are_not_discoverable() {
 
     owner.stop_sharing().expect("stop");
     let fresh = owner
-        .start_sharing(ShareBind::new(info.bind.ip(), free_port()), vec![])
+        .start_sharing(ShareBind::new(info.bind.ip(), 0), vec![])
         .expect("empty session");
     let second = remote(&fresh, PairingRole::Human, "remote-2").expect("pair");
     assert!(

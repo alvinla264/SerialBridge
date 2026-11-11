@@ -79,7 +79,9 @@ these words in their tool names and user-facing text.
   unsaved changes, opening a device is refused and the draft is kept.
 - **Event**: an unsolicited notification from the core (device output, write
   echo, client joined/left, control granted/released/denied, device closed,
-  core shutdown). Clients receive all events from their subscription onward.
+  core shutdown). Local clients receive events from their subscription onward;
+  remote clients receive only authorized device events, from a bounded
+  best-effort queue.
 - **Sharing session**: opt-in LAN access to a set of **checked devices**,
   started by a **local owner** and alive only while that owner's local terminal
   connection is. It has its own TLS certificate authority, host certificate and

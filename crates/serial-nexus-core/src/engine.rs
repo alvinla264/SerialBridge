@@ -535,11 +535,6 @@ impl Engine {
                         .ok()
                         .filter(|identity| device_matches_identity(device, identity));
                     if remote && authorized.is_none() {
-                        let removed = state.devices.remove(&device_id);
-                        drop(state);
-                        if let Some(device) = removed {
-                            self.finish_devices(vec![device]);
-                        }
                         return Err(ErrorBody::new(
                             ErrorCode::DeviceFailed,
                             "device is no longer shared; check it again",
@@ -1744,6 +1739,13 @@ impl Engine {
         let visible =
             shared == device.identity && shared.still_valid() && session.allows_path(&device.path);
         if !visible {
+            let had_remote = device
+                .clients
+                .keys()
+                .any(|client| remote_ids.contains(client));
+            if had_remote {
+                session.mark_vacated(&device.path);
+            }
             device.shared = None;
             device.write_epoch.fetch_add(1, Ordering::SeqCst);
             session.revoke_path(&device.path);

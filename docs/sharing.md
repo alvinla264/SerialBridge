@@ -393,8 +393,9 @@ fixed with tests:
   dedicated cleanup thread, so a stalled writer does not block healthy-device
   data or timers. Test:
   `a_failed_devices_stalled_writer_does_not_block_healthy_output`.
-- **Expired entries still receive a closure mark**, so remotes attached before
-  authorization expiry see `DeviceClosed`; the recycled-node test asserts it.
+- **Expiry marks the path vacated only while remotes are attached and the
+  entry is live**, so those remotes see `DeviceClosed`, while a later local
+  open/close of a replacement at an expired path does not leak an event.
 - **Board-gate echo checks use fresh device-output events**, not a sliding
   history window, so rollover cannot hide a genuine echo.
 
