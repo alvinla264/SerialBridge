@@ -83,6 +83,8 @@ struct Device {
     control: Option<Control>,
     write_tx: Option<Sender<device::WriteCommand>>,
     write_epoch: device::WriteEpoch,
+    /// The node identity of this actual open descriptor.
+    identity: DeviceIdentity,
     /// Identity authorized for sharing when this instance was opened, if any.
     shared: Option<DeviceIdentity>,
     stop: Arc<AtomicBool>,
@@ -484,6 +486,19 @@ impl Engine {
         let device_id = match existing_id {
             Some(device_id) => {
                 let device = state.devices.get_mut(&device_id).expect("device exists");
+                if let Some(expected) = expected {
+                    // The expected checked identity must be this exact open
+                    // instance, not merely a node now at the same path.
+                    if device.identity != *expected || !device.identity.still_valid() {
+                        return Err(ErrorBody::new(
+                            ErrorCode::DeviceFailed,
+                            format!(
+                                "{} changed since it was checked; check it again",
+                                device.path
+                            ),
+                        ));
+                    }
+                }
                 if let Some(requested) = params.baud {
                     if requested != device.baud {
                         return Err(ErrorBody::new(
@@ -497,7 +512,10 @@ impl Engine {
                     }
                 }
                 if let Some(session) = session.as_ref() {
-                    device.shared = session.authorize(&device.path).ok();
+                    device.shared = session
+                        .authorize(&device.path)
+                        .ok()
+                        .filter(|identity| device_matches_identity(device, identity));
                 }
                 attach(
                     device,
@@ -517,7 +535,7 @@ impl Engine {
                         format!("baud rate {baud} is out of range"),
                     ));
                 }
-                let read_port =
+                let opened =
                     device::open_serial_checked(&port, baud, expected).map_err(|error| {
                         let code = match error.kind() {
                             std::io::ErrorKind::NotFound => ErrorCode::NotFound,
@@ -526,6 +544,8 @@ impl Engine {
                         };
                         ErrorBody::new(code, format!("could not open {port}: {error}"))
                     })?;
+                let identity = opened.identity.clone();
+                let read_port = opened.port;
                 // Re-check that the authorization still exists after the open,
                 // while the engine state lock keeps a concurrent close/revoke
                 // from racing this device into service.
@@ -574,10 +594,10 @@ impl Engine {
                     )
                 })?;
                 let shared_identity = match session.as_ref() {
-                    Some(session) => match expected {
-                        Some(identity) => Some(identity.clone()),
-                        None => session.authorize(&port).ok(),
-                    },
+                    Some(session) => session
+                        .authorize(&port)
+                        .ok()
+                        .filter(|allowed| *allowed == identity),
                     None => None,
                 };
                 let device = Device {
@@ -591,6 +611,7 @@ impl Engine {
                     control: None,
                     write_tx: Some(write_tx),
                     write_epoch,
+                    identity,
                     shared: shared_identity,
                     stop,
                     waiters: Vec::new(),
@@ -599,7 +620,10 @@ impl Engine {
                 state.devices.insert(device_id, device);
                 let device = state.devices.get_mut(&device_id).expect("just inserted");
                 if let Some(session) = session.as_ref() {
-                    device.shared = session.authorize(&device.path).ok();
+                    device.shared = session
+                        .authorize(&device.path)
+                        .ok()
+                        .filter(|identity| device_matches_identity(device, identity));
                 }
                 attach(
                     device,
@@ -657,6 +681,22 @@ impl Engine {
                 ));
             }
             device.clients.remove(&client_id);
+            // This client can no longer receive an answer from a waited write,
+            // so fail its waiters now instead of leaving them to observe
+            // device output after the client has detached.
+            let mut kept = Vec::new();
+            for waiter in std::mem::take(&mut device.waiters) {
+                if waiter.client_id == client_id {
+                    let _ = waiter.tx.send(WaitOutcome {
+                        lines: waiter.lines,
+                        timed_out: false,
+                        failed: Some("client detached from the device".into()),
+                    });
+                } else {
+                    kept.push(waiter);
+                }
+            }
+            device.waiters = kept;
             events.push(Event::ClientLeft {
                 device_id,
                 client: Holder {
@@ -1241,7 +1281,14 @@ impl Engine {
             let identity = session.authorize(&path).ok();
             for device in state.devices.values_mut() {
                 if device.path == path {
-                    device.shared = identity.clone();
+                    device.shared = identity
+                        .clone()
+                        .filter(|identity| device_matches_identity(device, identity));
+                    if device.shared.is_none() {
+                        // The open instance is not the checked node; never
+                        // authorize it for sharing.
+                        session.revoke_path(&device.path);
+                    }
                 }
             }
         }
@@ -1416,7 +1463,11 @@ impl Engine {
                 .values_mut()
                 .find(|device| device.path == canonical)
             {
-                device.shared = Some(identity);
+                if device_matches_identity(device, &identity) {
+                    device.shared = Some(identity);
+                } else {
+                    session.revoke_path(&canonical);
+                }
             }
         }
         Ok(ResponseData::Sharing(session.snapshot()))
@@ -1498,6 +1549,26 @@ impl Engine {
         id
     }
 
+    /// Revalidate an open instance against the current session and expire it
+    /// if its node is no longer the authorized one.
+    fn revalidate_shared_instance(&self, device_id: u64, session: &SharingSession) -> bool {
+        let mut state = self.state.lock().expect("state lock");
+        let Some(device) = state.devices.get_mut(&device_id) else {
+            return false;
+        };
+        let Some(shared) = device.shared.clone() else {
+            return false;
+        };
+        let visible =
+            shared == device.identity && shared.still_valid() && session.allows_path(&device.path);
+        if !visible {
+            device.shared = None;
+            device.write_epoch.fetch_add(1, Ordering::SeqCst);
+            session.revoke_path(&device.path);
+        }
+        visible
+    }
+
     fn remote_scope(&self, client_id: u64) -> Option<Arc<SharingSession>> {
         self.clients
             .lock()
@@ -1535,15 +1606,7 @@ impl Engine {
                 devices.devices.retain(|device| match device.device_id {
                     // An open instance is visible only if it was authorized
                     // for sharing when it opened.
-                    Some(device_id) => self
-                        .state
-                        .lock()
-                        .expect("state lock")
-                        .devices
-                        .get(&device_id)
-                        .is_some_and(|open| {
-                            open.shared.is_some() && session.allows_path(&open.path)
-                        }),
+                    Some(device_id) => self.revalidate_shared_instance(device_id, &session),
                     None => session.authorize(&device.path).is_ok(),
                 });
                 Ok(ResponseData::Devices(devices))
@@ -1797,13 +1860,7 @@ impl Engine {
             return session.is_vacated(path);
         }
         match event.device_id() {
-            Some(device_id) => self
-                .state
-                .lock()
-                .expect("state lock")
-                .devices
-                .get(&device_id)
-                .is_some_and(|device| device.shared.is_some() && session.allows_path(&device.path)),
+            Some(device_id) => self.revalidate_shared_instance(device_id, session),
             None => true,
         }
     }
@@ -1915,6 +1972,23 @@ fn holder_of(device: &Device, client_id: u64) -> Holder {
     }
 }
 
+/// True when this open instance is exactly the authorized node.
+fn device_matches_identity(device: &Device, identity: &DeviceIdentity) -> bool {
+    instance_is_expected(&device.path, &device.identity, identity)
+}
+
+/// An open instance matches an authorization only when its path and captured
+/// node identity are the same live node.
+fn instance_is_expected(
+    device_path: &str,
+    device_identity: &DeviceIdentity,
+    expected: &DeviceIdentity,
+) -> bool {
+    device_path == expected.canonical
+        && *device_identity == *expected
+        && device_identity.still_valid()
+}
+
 fn summary(device: &Device) -> DeviceSummary {
     DeviceSummary {
         path: device.path.clone(),
@@ -2015,5 +2089,33 @@ fn record_written_lines(device: &mut Device, source: Source, data: &[u8]) {
         if !line.is_empty() {
             device.history.push(source, line, true);
         }
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn an_open_instance_only_matches_its_own_live_node() {
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let path = directory.path().join("node");
+        std::fs::write(&path, b"a").expect("node");
+        let path_text = path.to_string_lossy().into_owned();
+        let first = DeviceIdentity::capture(&path_text).expect("first");
+        assert!(instance_is_expected(&path_text, &first, &first));
+
+        std::fs::remove_file(&path).expect("unlink old node");
+        std::fs::write(&path, b"b").expect("replacement node");
+        assert!(
+            !instance_is_expected(&path_text, &first, &first),
+            "a replacement at the same path must not match"
+        );
+
+        std::fs::remove_file(&path).expect("unlink");
+        assert!(
+            !instance_is_expected(&path_text, &first, &first),
+            "an unlinked node must not match"
+        );
     }
 }

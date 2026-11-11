@@ -55,6 +55,13 @@ impl ShareBind {
     /// Refuse addresses that would listen on every interface or that are not
     /// usable unicast endpoints.
     pub fn validate(&self) -> Result<(), String> {
+        // An IPv4-mapped IPv6 address is an IPv4 address in disguise; validate
+        // the inner address so `::ffff:0.0.0.0` cannot become a wildcard bind.
+        if let std::net::IpAddr::V6(v6) = self.address {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return ShareBind::new(std::net::IpAddr::V4(v4), self.port).validate();
+            }
+        }
         let address = self.address;
         if address.is_unspecified() {
             return Err(format!(
@@ -77,7 +84,7 @@ impl ShareBind {
 
 impl fmt::Display for ShareBind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}:{}", self.address, self.port)
+        write!(formatter, "{}", self.socket_addr())
     }
 }
 
@@ -335,6 +342,18 @@ impl FrameDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipv4_mapped_wildcards_are_refused_and_ipv6_formats_with_brackets() {
+        let mapped = ShareBind::new("::ffff:0.0.0.0".parse().unwrap(), 9000);
+        assert!(mapped.validate().is_err(), "{mapped}");
+        let concrete = ShareBind::new("::ffff:127.0.0.1".parse().unwrap(), 9000);
+        assert!(concrete.validate().is_ok());
+        assert_eq!(
+            ShareBind::new("::1".parse().unwrap(), 9000).to_string(),
+            "[::1]:9000"
+        );
+    }
 
     #[test]
     fn wildcard_addresses_are_refused() {

@@ -26,6 +26,40 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+/// Device-sourced lines containing `needle`; human writes and AI writes never
+/// count as a firmware echo.
+fn occurrences(lines: &[serial_nexus_protocol::HistoryLine], needle: &str) -> usize {
+    lines
+        .iter()
+        .filter(|line| {
+            line.source == serial_nexus_protocol::Source::Device && line.text.contains(needle)
+        })
+        .count()
+}
+
+#[test]
+fn a_firmware_echo_must_be_new_device_output_not_the_probe_or_old_history() {
+    use serial_nexus_protocol::{HistoryLine, Source};
+    let lines = vec![
+        HistoryLine {
+            source: Source::Human,
+            text: "UNIQUE".into(),
+            partial: false,
+        },
+        HistoryLine {
+            source: Source::Device,
+            text: "OLD UNIQUE".into(),
+            partial: false,
+        },
+    ];
+    assert_eq!(occurrences(&lines, "UNIQUE"), 1, "old device output counts");
+    assert_eq!(
+        occurrences(&lines[..1], "UNIQUE"),
+        0,
+        "a human write is not echo"
+    );
+}
+
 #[test]
 #[ignore = "needs a real STM32 board and one LAN address; see docs/board-gate.md"]
 fn board_gate_over_real_lan() {
@@ -136,16 +170,25 @@ fn board_gate_over_real_lan() {
     );
 
     if let Some(bytes) = &probe {
+        // Count existing device output before the probe: the probe itself is
+        // recorded as a human line, and old history must not satisfy the echo
+        // assertion. Only new device-sourced output counts.
+        let before = expect_echo.as_ref().map(|expected| {
+            human
+                .read(opened.device_id, Some(2_000))
+                .map(|read| occurrences(&read.lines, expected))
+                .unwrap_or(0)
+        });
         let written = human
             .write_bytes(opened.device_id, bytes, None)
             .expect("remote write");
         assert_eq!(written.bytes_written, bytes.len());
         eprintln!("    probe sent: {} bytes", bytes.len());
-        if let Some(expected) = &expect_echo {
+        if let (Some(expected), Some(before)) = (&expect_echo, before) {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {
-                let read = human.read(opened.device_id, Some(200)).expect("re-read");
-                if read.lines.iter().any(|line| line.text.contains(expected)) {
+                let read = human.read(opened.device_id, Some(2_000)).expect("re-read");
+                if occurrences(&read.lines, expected) > before {
                     eprintln!("    firmware echoed {expected:?}");
                     break;
                 }

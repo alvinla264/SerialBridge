@@ -261,15 +261,21 @@ impl SharingSession {
     /// (unplugged, replaced, symlink retargeted), is refused. A changed node is
     /// removed from the allowlist so it has to be checked again explicitly.
     pub fn authorize(&self, requested: &str) -> Result<DeviceIdentity, ErrorBody> {
-        let canonical = std::fs::canonicalize(requested)
-            .map_err(|error| {
-                ErrorBody::new(
+        let canonical = match std::fs::canonicalize(requested) {
+            Ok(canonical) => canonical.to_string_lossy().into_owned(),
+            Err(error) => {
+                // A checked device may have disappeared; expire its stored
+                // entry instead of leaving it usable or listed.
+                let mut state = self.state.lock().expect("share state lock");
+                if let Some(entry) = state.devices.get_mut(requested) {
+                    entry.expired = true;
+                }
+                return Err(ErrorBody::new(
                     ErrorCode::NotFound,
                     format!("{requested} is not a usable device: {error}"),
-                )
-            })?
-            .to_string_lossy()
-            .into_owned();
+                ));
+            }
+        };
         let mut state = self.state.lock().expect("share state lock");
         let Some(stored) = state.devices.get(&canonical) else {
             return Err(ErrorBody::new(
@@ -342,14 +348,20 @@ impl SharingSession {
 
     /// Remove one device from the allowlist and return it when it was checked.
     pub fn uncheck(&self, requested: &str) -> Option<DeviceIdentity> {
-        let canonical = std::fs::canonicalize(requested).ok()?;
-        let canonical = canonical.to_string_lossy().into_owned();
-        self.state
-            .lock()
-            .expect("share state lock")
-            .devices
-            .remove(&canonical)
-            .map(|entry| entry.identity)
+        let mut state = self.state.lock().expect("share state lock");
+        // Stored keys are canonical, and callers normally pass one. Try the
+        // given key first so a vanished node can still be removed, then its
+        // canonical form for aliases.
+        if let Some(entry) = state.devices.remove(requested) {
+            return Some(entry.identity);
+        }
+        if let Ok(canonical) = std::fs::canonicalize(requested) {
+            let canonical = canonical.to_string_lossy().into_owned();
+            if let Some(entry) = state.devices.remove(&canonical) {
+                return Some(entry.identity);
+            }
+        }
+        None
     }
 
     /// Expire an allowlist entry (used when a device closes, fails or is

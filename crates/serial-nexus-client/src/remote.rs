@@ -284,6 +284,13 @@ impl RemoteClient {
         }
     }
 
+    /// Number of requests awaiting an answer. Exposed for tests that assert
+    /// rejected requests do not leak bookkeeping.
+    #[doc(hidden)]
+    pub fn pending_request_count(&self) -> usize {
+        self.inner.pending.lock().expect("pending lock").len()
+    }
+
     pub fn subscribe(&self) -> Receiver<Event> {
         let (tx, rx) = unbounded();
         self.inner
@@ -299,14 +306,15 @@ impl RemoteClient {
             return Err(ClientError::Disconnected("not connected".into()));
         }
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = bounded(1);
         let is_write = matches!(request, Request::Write(_));
+        // Encode first: a rejected request must not leave a pending entry.
+        let frame = encode_frame(&RequestMessage { id, request })?;
+        let (tx, rx) = bounded(1);
         self.inner
             .pending
             .lock()
             .expect("pending lock")
             .insert(id, Pending { tx, is_write });
-        let frame = encode_frame(&RequestMessage { id, request })?;
         if self.inner.outgoing.send(frame).is_err() {
             let pending = self.inner.pending.lock().expect("pending lock").remove(&id);
             if pending.is_some_and(|pending| pending.is_write) {

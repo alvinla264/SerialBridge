@@ -155,9 +155,15 @@ pub struct WriteCommand {
 /// The remote-write generation for one device.
 pub type WriteEpoch = Arc<AtomicU64>;
 
+/// An opened serial port plus the device-node identity it was opened as.
+pub struct OpenedSerial {
+    pub port: Box<dyn serialport::SerialPort>,
+    pub identity: DeviceIdentity,
+}
+
 /// Open a serial port with the first version's fixed framing: 8N1, no flow
 /// control, configurable baud, short read timeout so threads can stop.
-pub fn open_serial(path: &str, baud: u32) -> io::Result<Box<dyn serialport::SerialPort>> {
+pub fn open_serial(path: &str, baud: u32) -> io::Result<OpenedSerial> {
     open_serial_checked(path, baud, None)
 }
 
@@ -183,7 +189,18 @@ pub fn open_serial_checked(
     path: &str,
     baud: u32,
     expected: Option<&DeviceIdentity>,
-) -> io::Result<Box<dyn serialport::SerialPort>> {
+) -> io::Result<OpenedSerial> {
+    // Validate the path's node *before* opening/configuring it, so a rejected
+    // replacement is not even reconfigured.
+    let current = DeviceIdentity::capture(path)?;
+    if let Some(expected) = expected {
+        if current != *expected || !current.still_valid() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{path} changed since it was checked; check it again"),
+            ));
+        }
+    }
     let builder = serialport::new(path, baud)
         .data_bits(DataBits::Eight)
         .parity(Parity::None)
@@ -205,9 +222,16 @@ pub fn open_serial_checked(
     }
     if let Some(factory) = SERIAL_FACTORY.lock().expect("serial factory lock").clone() {
         drop(port);
-        return factory(path, baud);
+        let port = factory(path, baud)?;
+        return Ok(OpenedSerial {
+            port,
+            identity: current,
+        });
     }
-    Ok(Box::new(port))
+    Ok(OpenedSerial {
+        port: Box::new(port),
+        identity: current,
+    })
 }
 
 /// Handles for a device's I/O threads, joined when the device closes so the
@@ -330,5 +354,52 @@ pub fn write_source(ai: bool) -> Source {
         Source::Ai
     } else {
         Source::Human
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+
+    #[test]
+    fn a_mismatched_expected_identity_is_rejected_before_configuration() {
+        use nix::pty::openpty;
+        use nix::sys::termios::{cfgetispeed, tcgetattr, tcsetattr, BaudRate, SetArg};
+
+        let target = openpty(None, None).expect("target pty");
+        let mismatch = openpty(None, None).expect("other pty");
+        let target_slave: std::fs::File = target.slave.into();
+        let target_path = std::fs::read_link(format!("/proc/self/fd/{}", target_slave.as_raw_fd()))
+            .expect("pty path")
+            .to_string_lossy()
+            .into_owned();
+        let other: std::fs::File = mismatch.slave.into();
+        let other_path = std::fs::read_link(format!("/proc/self/fd/{}", other.as_raw_fd()))
+            .expect("pty path")
+            .to_string_lossy()
+            .into_owned();
+        let other_identity = DeviceIdentity::capture(&other_path).expect("identity");
+
+        // Set a distinctive baud on the target, then ask for a different one
+        // with an identity that does not match: the open must be refused
+        // before TTYPort::open configures the target.
+        let mut termios = tcgetattr(&target_slave).expect("termios");
+        nix::sys::termios::cfsetispeed(&mut termios, BaudRate::B38400).expect("ispeed");
+        nix::sys::termios::cfsetospeed(&mut termios, BaudRate::B38400).expect("ospeed");
+        tcsetattr(&target_slave, SetArg::TCSANOW, &termios).expect("set");
+
+        let error = match open_serial_checked(&target_path, 115_200, Some(&other_identity)) {
+            Ok(_) => panic!("mismatched identity must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let after = tcgetattr(&target_slave).expect("termios after");
+        assert_eq!(
+            cfgetispeed(&after),
+            BaudRate::B38400,
+            "a rejected open must not reconfigure the device"
+        );
     }
 }

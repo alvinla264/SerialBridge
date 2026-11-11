@@ -186,7 +186,7 @@ head changes.
   client is still attached. Local queued writes are unaffected. Tests:
   `queued_writes_from_a_detached_remote_client_are_revoked`,
   `stopping_sharing_drops_queued_remote_writes_before_the_writer_gets_them`,
-  `a_slow_remote_peer_hits_bounded_pending_writes_and_queued_work_is_revoked`.
+  `a_slow_remote_peer_hits_the_bounded_serial_queue_and_queued_work_is_revoked`.
 - **Oversized waited-write answer.** A successful waited write is trimmed to a
   frame-safe budget and stays a successful `WriteResult` (never downgraded to
   an error), preserving write-outcome semantics. Test:
@@ -247,3 +247,40 @@ local access after stop.
   sharing tests open a PTY in the core first. The injected-lister test covers
   the checked-but-never-opened enumerated path; the production rule
   (enumerated **or** open) is unchanged.
+
+## Iterative review fixes (all axes)
+
+After the first full Standards/Spec/security review sweep, these findings were
+fixed with tests:
+
+- **An open instance is bound to the node it actually opened.** Opening
+  validates the expected identity before `TTYPort::open` configures anything,
+  and the engine stores the identity of the opened descriptor. Joining an
+  existing device and marking it shared require that exact live instance, so
+  checking a replacement cannot authorize an older open descriptor or its
+  history. Tests: `an_open_instance_only_matches_its_own_live_node`,
+  `a_mismatched_expected_identity_is_rejected_before_configuration`.
+- **Discovery and events revalidate the instance.** Remote discovery and event
+  delivery revalidate the instance identity, expire the allowlist entry and
+  bump its write generation when it no longer matches. Tests:
+  `remote_operations_are_limited_to_checked_devices_by_acl`,
+  `an_expired_entry_does_not_leak_events_for_a_later_device_instance`.
+- **Detached waiters are cancelled.** `Close` fails that client's waited writes
+  immediately, so unchecking cannot leave a detached waiter collecting later
+  output. Test:
+  `a_detached_waited_write_fails_and_never_returns_post_revocation_output`.
+- **Unchecking works for vanished devices** by removing the stored canonical
+  key, freeing the allowlist slot. Test:
+  `a_vanished_checked_device_can_be_unchecked_and_frees_its_slot`.
+- **Mapped IPv4 wildcards are refused** and IPv6 binds format with brackets.
+  Protocol test `ipv4_mapped_wildcards_are_refused_and_ipv6_formats_with_brackets`.
+- **The remote client encodes before registering a pending request**, so a
+  refused oversized request retains nothing. Test:
+  `refused_oversized_remote_requests_do_not_leak_pending_entries`.
+- **The board gate echo check only counts new device-sourced output**, never
+  the probe's human write or old history. Unit test
+  `a_firmware_echo_must_be_new_device_output_not_the_probe_or_old_history`.
+- The serial-queue limit test is named
+  `a_slow_remote_peer_hits_the_bounded_serial_queue_and_queued_work_is_revoked`;
+  the waited-write admission limit is covered by
+  `a_connection_has_a_bounded_number_of_pending_waited_writes`.

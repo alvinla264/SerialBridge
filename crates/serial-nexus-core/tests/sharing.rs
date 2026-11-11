@@ -425,7 +425,7 @@ fn wildcard_binding_is_refused() {
     owner
         .open(&device.path, Some(115_200), false)
         .expect("open");
-    for address in ["0.0.0.0", "::"] {
+    for address in ["0.0.0.0", "::", "::ffff:0.0.0.0"] {
         let error = owner
             .start_sharing(
                 ShareBind::new(address.parse().unwrap(), free_port()),
@@ -1157,7 +1157,7 @@ fn a_tls_peer_that_withholds_authentication_is_dropped_after_the_deadline() {
 }
 
 #[test]
-fn a_slow_remote_peer_hits_bounded_pending_writes_and_queued_work_is_revoked() {
+fn a_slow_remote_peer_hits_the_bounded_serial_queue_and_queued_work_is_revoked() {
     let core = shared_core();
     let owner = local_owner(&core);
     let mut device = SimulatedDevice::new();
@@ -1273,15 +1273,19 @@ fn a_checked_device_survives_an_ordinary_close_and_reopen() {
 
 #[test]
 fn a_checked_but_never_opened_device_rejects_a_recycled_node() {
-    let first = SimulatedDevice::new();
-    let first_path = first.path.clone();
+    // Regular files give a deterministic "the pinned node was unlinked, a new
+    // node appeared at the same path" without relying on kernel PTY recycling.
+    let directory = TempDir::new().expect("tempdir");
+    let path = directory.path().join("device-node");
+    std::fs::write(&path, b"old").expect("old node");
+    let path_text = path.to_string_lossy().into_owned();
     let identity =
-        serial_nexus_core::device::DeviceIdentity::capture(&first.path).expect("identity");
+        serial_nexus_core::device::DeviceIdentity::capture(&path_text).expect("identity");
     let prepared = serial_nexus_core::share::prepare(
         1,
         &serial_nexus_protocol::ShareStartParams {
             bind: localhost_bind(),
-            devices: vec![first.path.clone()],
+            devices: vec![path_text.clone()],
         },
         vec![identity],
         serial_nexus_core::share::ShareLimits {
@@ -1292,29 +1296,15 @@ fn a_checked_but_never_opened_device_rejects_a_recycled_node() {
         },
     )
     .expect("prepare");
-    assert!(prepared.session.authorize(&first.path).is_ok());
+    assert!(prepared.session.authorize(&path_text).is_ok());
 
-    // Close the PTY without ever opening it in the engine, then let the kernel
-    // recycle the node at the same path.
-    drop(first);
-    let mut second = None;
-    for _ in 0..30 {
-        let candidate = SimulatedDevice::new();
-        if candidate.path == first_path {
-            second = Some(candidate);
-            break;
-        }
-    }
-    let Some(second) = second else {
-        panic!("could not recycle {first_path} for the identity test")
-    };
+    std::fs::remove_file(&path).expect("unlink pinned node");
+    std::fs::write(&path, b"new").expect("replacement node");
     assert!(
-        prepared.session.authorize(&second.path).is_err(),
+        prepared.session.authorize(&path_text).is_err(),
         "a recycled node must not inherit authorization"
     );
-    // The stale entry is expired, not usable, and does not list as checked.
-    let snapshot = prepared.session.snapshot();
-    assert!(snapshot.checked.is_empty());
+    assert!(prepared.session.snapshot().checked.is_empty());
 }
 
 #[test]
@@ -1628,4 +1618,178 @@ fn near_limit_waited_write_answers_survive_the_tls_send() {
         assert!(!written.timed_out);
     }
     human.status(opened.device_id).expect("connection survived");
+}
+
+#[test]
+fn a_vanished_checked_device_can_be_unchecked_and_frees_its_slot() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let holder = connect(&core.socket, ClientInfo::human("holder"));
+    let gone = SimulatedDevice::new();
+    let gone_path = gone.path.clone();
+    let opened = holder.open(&gone.path, Some(115_200), false).expect("open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![gone.path.clone()])
+        .expect("start");
+    holder.close(opened.device_id).expect("last detach");
+    wait_until(Duration::from_secs(3), || {
+        !owner
+            .list_devices()
+            .expect("list")
+            .devices
+            .iter()
+            .any(|entry| entry.path == gone.path && entry.open)
+    });
+    drop(gone);
+
+    let snapshot = owner
+        .uncheck_shared_devices(vec![gone_path.clone()])
+        .expect("uncheck a vanished device");
+    assert!(
+        snapshot.checked.is_empty(),
+        "the vanished entry must be removed: {:?}",
+        snapshot.checked
+    );
+
+    // Its allowlist slot is free for a new device.
+    let replacement = SimulatedDevice::new();
+    owner
+        .open(&replacement.path, Some(115_200), false)
+        .expect("open replacement");
+    let snapshot = owner
+        .check_shared_devices(vec![replacement.path.clone()])
+        .expect("check replacement");
+    assert_eq!(snapshot.checked.len(), 1);
+    assert_eq!(snapshot.checked[0].path, replacement.path);
+    assert_ne!(snapshot.session_id, None);
+    drop(info);
+}
+
+#[test]
+fn a_detached_waited_write_fails_and_never_returns_post_revocation_output() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let mut device = SimulatedDevice::new();
+    owner
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![device.path.clone()])
+        .expect("start");
+    let human = remote(&info, PairingRole::Human, "remote").expect("pair");
+    let opened = human.open(&device.path, None, false).expect("open");
+
+    let waiting = human.clone();
+    let device_id = opened.device_id;
+    let pending = std::thread::spawn(move || {
+        waiting.write_bytes(
+            device_id,
+            b"detach-wait",
+            Some(WaitSpec {
+                lines: 1,
+                timeout_ms: Some(5_000),
+            }),
+        )
+    });
+    device.read_until(b"detach-wait", Duration::from_secs(2));
+    human.close(device_id).expect("detach from device");
+    owner
+        .uncheck_shared_devices(vec![device.path.clone()])
+        .expect("uncheck");
+    device.write(b"PRIVATE-AFTER-UNCHECK\n");
+
+    let result = pending.join().expect("thread");
+    assert!(
+        result.is_err(),
+        "a detached waited write must fail, not return post-revocation output: {result:?}"
+    );
+    if let Ok(written) = result {
+        assert!(
+            !written
+                .lines
+                .iter()
+                .any(|line| line.text.contains("PRIVATE-AFTER-UNCHECK")),
+            "post-revocation output leaked to a detached waiter"
+        );
+    }
+}
+
+#[test]
+fn remote_sharing_administration_requests_are_refused_on_the_wire() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let device = SimulatedDevice::new();
+    owner
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![device.path.clone()])
+        .expect("start");
+    let (mut connection, mut tcp) = raw_tls(&info);
+    let mut decoder = serial_nexus_protocol::FrameDecoder::new();
+
+    for (id, request) in [
+        (1, serial_nexus_protocol::Request::ShareStop),
+        (2, serial_nexus_protocol::Request::ShareStatus),
+        (
+            3,
+            serial_nexus_protocol::Request::ShareCheck(serial_nexus_protocol::ShareDevicesParams {
+                devices: vec![device.path.clone()],
+            }),
+        ),
+    ] {
+        let frame = serial_nexus_protocol::encode_frame(&serial_nexus_protocol::RequestMessage {
+            id,
+            request,
+        })
+        .expect("frame");
+        serial_nexus_protocol::share::tlsio::write_frame(
+            &mut connection,
+            &mut tcp,
+            &frame,
+            Instant::now() + Duration::from_secs(3),
+        )
+        .expect("send");
+        let answer = read_response(&mut connection, &mut tcp, &mut decoder, id)
+            .expect("administration answer");
+        match answer {
+            ServerMessage::Error { error, .. } => {
+                assert_eq!(error.code, ErrorCode::PermissionDenied)
+            }
+            other => panic!("remote administration was not refused: {other:?}"),
+        }
+    }
+    // The real owner still controls the session.
+    owner.sharing_status().expect("owner status");
+}
+
+#[test]
+fn refused_oversized_remote_requests_do_not_leak_pending_entries() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let device = SimulatedDevice::new();
+    owner
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![device.path.clone()])
+        .expect("start");
+    let human = remote(&info, PairingRole::Human, "remote").expect("pair");
+    let opened = human.open(&device.path, None, false).expect("open");
+
+    for _ in 0..5 {
+        let error = human
+            .write_bytes(opened.device_id, &vec![b'x'; 60_000], None)
+            .expect_err("too large for one remote frame");
+        assert!(
+            matches!(error, ClientError::Protocol(_) | ClientError::Server(_)),
+            "{error:?}"
+        );
+        assert_eq!(
+            human.pending_request_count(),
+            0,
+            "a refused request must not retain pending bookkeeping"
+        );
+    }
+    human.list_devices().expect("connection still usable");
 }
