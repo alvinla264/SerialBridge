@@ -109,8 +109,11 @@ The credential is **not** a tool argument and never appears in MCP output,
 errors, history or serial writes. The MCP host's human writes one private JSON
 file, readable by its owner only:
 
-1. ask the host terminal for its pairing details (the sharing screen copies
-   them; they are shown once per sharing session);
+1. get the pairing details from the host: its local human terminal issues them
+   once per sharing session with `ShareStart` (see
+   [`docs/sharing.md`](../../docs/sharing.md)); a terminal screen that shows
+   and copies them is part of the sharing controls work, so until it ships use
+   that contract;
 2. create `~/.config/serial-nexus/mcp-peers.json` (`$XDG_CONFIG_HOME` is
    honoured, and `SERIAL_NEXUS_MCP_PEERS` names another file) with mode `600`:
 

@@ -322,11 +322,20 @@ fn open_private(path: &Path) -> Result<File, PeerError> {
 /// Reject anything but a regular file owned by this user with no group or
 /// world permission bits.
 fn check_private(path: &Path, metadata: &std::fs::Metadata) -> Result<(), PeerError> {
+    check_private_as(path, metadata, nix::unistd::geteuid().as_raw())
+}
+
+/// [`check_private`] with the effective uid passed in, so the ownership rule
+/// can be tested without needing a second real user.
+fn check_private_as(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    current: u32,
+) -> Result<(), PeerError> {
     use std::os::unix::fs::MetadataExt;
     if !metadata.file_type().is_file() {
         return Err(PeerError::NotRegular { path: path.into() });
     }
-    let current = nix::unistd::geteuid().as_raw();
     if metadata.uid() != current {
         return Err(PeerError::WrongOwner {
             path: path.into(),
@@ -350,38 +359,20 @@ mod tests {
 
     #[test]
     fn a_foreign_owner_is_refused() {
-        // The current uid always matches itself; any other value must be a
-        // hard failure, checked without needing a second real user.
-        let path = Path::new("/tmp/peers.json");
-        let metadata = std::fs::metadata("Cargo.toml").expect("regular file");
+        // The same function production uses: the current uid matches, and any
+        // other owner is a hard failure (tested without a second real user).
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let path = directory.path().join("peers.json");
+        std::fs::write(&path, "{}").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let metadata = std::fs::metadata(&path).expect("regular file");
         let current = nix::unistd::geteuid().as_raw();
-        let wrong = current.wrapping_add(1);
+        assert!(matches!(check_private(&path, &metadata), Ok(())));
         assert!(matches!(
-            check_private_with(path, &metadata, current),
-            Ok(())
+            check_private_as(&path, &metadata, current.wrapping_add(1)),
+            Err(PeerError::WrongOwner { owner, current: claimed, .. })
+                if owner == current && claimed == current.wrapping_add(1)
         ));
-        assert!(matches!(
-            check_private_with(path, &metadata, wrong),
-            Err(PeerError::WrongOwner { .. })
-        ));
-    }
-
-    fn check_private_with(
-        path: &Path,
-        metadata: &std::fs::Metadata,
-        current: u32,
-    ) -> Result<(), PeerError> {
-        use std::os::unix::fs::MetadataExt;
-        if !metadata.file_type().is_file() {
-            return Err(PeerError::NotRegular { path: path.into() });
-        }
-        if metadata.uid() != current {
-            return Err(PeerError::WrongOwner {
-                path: path.into(),
-                owner: metadata.uid(),
-                current,
-            });
-        }
-        Ok(())
     }
 }
