@@ -228,7 +228,24 @@ impl TuiSession {
         {
             return "[screen redacted: pairing credentials may be visible]".to_string();
         }
-        text.to_string()
+        // A wrapped credential can be scrolled away from its label. Hide any
+        // long base64-like run (credentials and CA chunks) instead.
+        text.lines()
+            .map(|line| {
+                let secret = line.split_whitespace().any(|word| {
+                    word.len() >= 24
+                        && word.chars().all(|ch| {
+                            ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '-' | '_')
+                        })
+                });
+                if secret {
+                    "[redacted]".to_string()
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Wait for a condition on the whole screen, then keep going.

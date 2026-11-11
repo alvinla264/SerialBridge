@@ -10,7 +10,8 @@ use crossterm::event::MouseEventKind;
 use ratatui::layout::Rect;
 use serial_nexus_client::{Client, ClientError, RemoteClient};
 use serial_nexus_protocol::{
-    DeviceSummary, ErrorCode, Event, PairedHost, PairingRole, PairingSecret, ShareBind,
+    DeviceSummary, ErrorCode, Event, OpenResult, PairedHost, PairingRole, PairingSecret, ShareBind,
+    WaitSpec, WriteResult,
 };
 
 use crate::input::{echo_key, map_key, Action, Key};
@@ -23,6 +24,72 @@ use crate::state::{
 
 /// Two clicks on the same cell within this long count as a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
+/// The device operations both transports share, so endpoint policy is chosen
+/// once instead of in every close/write/open site.
+trait EndpointTransport {
+    fn open(
+        &self,
+        path: &str,
+        baud: Option<u32>,
+        request_control: bool,
+    ) -> Result<OpenResult, ClientError>;
+    fn close(&self, device_id: u64) -> Result<(), ClientError>;
+    fn write_bytes(
+        &self,
+        device_id: u64,
+        bytes: &[u8],
+        wait: Option<WaitSpec>,
+    ) -> Result<WriteResult, ClientError>;
+}
+
+impl EndpointTransport for Client {
+    fn open(
+        &self,
+        path: &str,
+        baud: Option<u32>,
+        request_control: bool,
+    ) -> Result<OpenResult, ClientError> {
+        Client::open(self, path, baud, request_control)
+    }
+
+    fn close(&self, device_id: u64) -> Result<(), ClientError> {
+        Client::close(self, device_id)
+    }
+
+    fn write_bytes(
+        &self,
+        device_id: u64,
+        bytes: &[u8],
+        wait: Option<WaitSpec>,
+    ) -> Result<WriteResult, ClientError> {
+        Client::write_bytes(self, device_id, bytes, wait)
+    }
+}
+
+impl EndpointTransport for RemoteClient {
+    fn open(
+        &self,
+        path: &str,
+        baud: Option<u32>,
+        request_control: bool,
+    ) -> Result<OpenResult, ClientError> {
+        RemoteClient::open(self, path, baud, request_control)
+    }
+
+    fn close(&self, device_id: u64) -> Result<(), ClientError> {
+        RemoteClient::close(self, device_id)
+    }
+
+    fn write_bytes(
+        &self,
+        device_id: u64,
+        bytes: &[u8],
+        wait: Option<WaitSpec>,
+    ) -> Result<WriteResult, ClientError> {
+        RemoteClient::write_bytes(self, device_id, bytes, wait)
+    }
+}
 
 /// What the first click of a possible double-click landed on. It is kept by
 /// identity, not by cell: the first click can move the sidebar's viewport, so
@@ -1049,13 +1116,15 @@ impl App {
     /// Resolve one endpoint to its transport. `None` means this machine's
     /// client; an unknown remote endpoint is an error everywhere, never a
     /// silent fallback to the local core.
-    fn endpoint_client(&self, endpoint: EndpointId) -> Result<Option<&RemoteClient>, ClientError> {
+    fn endpoint_client(&self, endpoint: EndpointId) -> Result<&dyn EndpointTransport, ClientError> {
         if endpoint == LOCAL_ENDPOINT {
-            return Ok(None);
+            return Ok(&self.client);
         }
-        self.remote_client(endpoint).map(Some).ok_or_else(|| {
-            ClientError::Disconnected("the remote host is no longer connected".into())
-        })
+        self.remote_client(endpoint)
+            .map(|remote| remote as &dyn EndpointTransport)
+            .ok_or_else(|| {
+                ClientError::Disconnected("the remote host is no longer connected".into())
+            })
     }
 
     fn open_on(
@@ -1064,10 +1133,7 @@ impl App {
         path: &str,
         baud: Option<u32>,
     ) -> Result<serial_nexus_protocol::OpenResult, ClientError> {
-        match self.endpoint_client(endpoint)? {
-            None => self.client.open(path, baud, false),
-            Some(remote) => remote.open(path, baud, false),
-        }
+        self.endpoint_client(endpoint)?.open(path, baud, false)
     }
 
     /// Ask the core for the running session's state and take its answer as
@@ -1258,11 +1324,9 @@ impl App {
         } else if let Some(link) = self.remotes.iter_mut().find(|link| link.id == key.endpoint) {
             link.expected_closes.insert(key.device_id);
         }
-        let closed = match self.endpoint_client(key.endpoint) {
-            Ok(None) => self.client.close(key.device_id),
-            Ok(Some(remote)) => remote.close(key.device_id),
-            Err(error) => Err(error),
-        };
+        let closed = self
+            .endpoint_client(key.endpoint)
+            .and_then(|transport| transport.close(key.device_id));
         match closed {
             Ok(()) => {
                 self.state.remove_session(key);
@@ -1299,11 +1363,9 @@ impl App {
         };
         let path = session.path.clone();
         let endpoint = session.endpoint;
-        let written = match self.endpoint_client(endpoint) {
-            Ok(None) => self.client.write_bytes(session_key.device_id, bytes, None),
-            Ok(Some(remote)) => remote.write_bytes(session_key.device_id, bytes, None),
-            Err(error) => Err(error),
-        };
+        let written = self
+            .endpoint_client(endpoint)
+            .and_then(|transport| transport.write_bytes(session_key.device_id, bytes, None));
         if let Err(error) = written {
             if error.is_device_gone() {
                 self.state.remove_session(session_key);
@@ -1335,14 +1397,8 @@ impl App {
             self.state.sharing.clear_session();
         }
         for key in self.state.all_sessions() {
-            match self.endpoint_client(key.endpoint) {
-                Ok(None) => {
-                    let _ = self.client.close(key.device_id);
-                }
-                Ok(Some(remote)) => {
-                    let _ = remote.close(key.device_id);
-                }
-                Err(_) => {}
+            if let Ok(transport) = self.endpoint_client(key.endpoint) {
+                let _ = transport.close(key.device_id);
             }
             self.state.remove_session(key);
         }

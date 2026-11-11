@@ -120,17 +120,7 @@ fn set_port(tui: &mut TuiSession, port: u16) {
 }
 
 fn set_port_zero(tui: &mut TuiSession) {
-    // A click on a text row starts editing; clear the default and ask the OS
-    // for a free port.
-    click_text(tui, "Share port");
-    tui.send(&[0x7f, 0x7f, 0x7f, 0x7f]);
-    tui.send_text("0");
-    tui.send(KEY_ENTER);
-    tui.wait_until("the port to be 0", |text| {
-        text.lines()
-            .find(|line| line.contains("Share port"))
-            .is_some_and(|line| line.trim_end().ends_with('0'))
-    });
+    set_port(tui, 0);
 }
 
 #[test]
@@ -217,10 +207,7 @@ fn a_bind_failure_is_shown_and_sharing_stays_off() {
 
     open_settings(&mut tui);
     check_device(&mut tui, &path);
-    click_text(&mut tui, "Share port");
-    tui.send(&[0x7f, 0x7f, 0x7f, 0x7f]);
-    tui.send_text(&port.to_string());
-    tui.send(KEY_ENTER);
+    set_port(&mut tui, port);
     tui.send(KEY_CTRL_S);
     tui.wait_for_text("settings saved");
 

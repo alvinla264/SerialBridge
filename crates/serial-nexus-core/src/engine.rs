@@ -1575,6 +1575,9 @@ impl Engine {
         let mut identities = Vec::new();
         let mut seen = HashSet::new();
         for path in paths {
+            // Detection is required even with a cached token: a device that
+            // vanished from enumeration must not be shared from stale state.
+            let detected = self.detected_device(path)?;
             let expected_token = expected.get(path);
             let identity = if expected_token.is_some_and(|token| token.starts_with("snx-")) {
                 // The token names the pinned node from the last discovery. An
@@ -1588,7 +1591,11 @@ impl Engine {
                     .filter(|(token, _)| Some(token) == expected_token)
                     .map(|(_, identity)| identity.clone());
                 match cached {
-                    Some(identity) if identity.still_valid() => identity,
+                    Some(identity)
+                        if identity.still_valid() && identity.canonical == detected.canonical =>
+                    {
+                        identity
+                    }
                     _ => {
                         return Err(ErrorBody::new(
                             ErrorCode::DeviceFailed,
@@ -1597,14 +1604,13 @@ impl Engine {
                     }
                 }
             } else {
-                let identity = self.detected_device(path)?;
-                if !identity_matches_expected(&identity, expected_token) {
+                if !identity_matches_expected(&detected, expected_token) {
                     return Err(ErrorBody::new(
                         ErrorCode::DeviceFailed,
                         format!("the device at {path} changed; check it again"),
                     ));
                 }
-                identity
+                detected
             };
             let canonical = identity.canonical.clone();
             let stale_open = {

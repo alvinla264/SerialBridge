@@ -492,6 +492,9 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u1
     // a device owns the keys.
     let title = if list.height == 0 && state.selected_device().is_some() {
         match state.selected_device() {
+            Some(device) if !state.remote_labels.is_empty() => {
+                format!("› {} {} ", state.endpoint_tag(device.endpoint), device.path)
+            }
             Some(device) => format!("› {} ", device.path),
             None => " Devices ".to_string(),
         }
