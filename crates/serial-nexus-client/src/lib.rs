@@ -65,12 +65,14 @@
 mod autostart;
 mod client;
 mod error;
+mod peers;
 mod remote;
 
 pub use autostart::{find_core_binary, spawn_core, CORE_ENV};
 pub use client::{Client, ClientConfig};
 pub use error::ClientError;
-pub use remote::RemoteClient;
+pub use peers::{PeerError, Peers, RemotePeer, PEERS_ENV};
+pub use remote::{RemoteClient, RemoteEndpoint};
 pub use serial_nexus_protocol::{
     paths, ClientInfo, ClientKind, ControlReleaseReason, ControlState, DeviceStatus, DeviceSummary,
     ErrorBody, ErrorCode, Event, HistoryLine, Holder, Limits, OpenResult, PairedHost, PairingRole,

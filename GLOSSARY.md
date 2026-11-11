@@ -79,6 +79,26 @@ these words in their tool names and user-facing text.
   `scrollback` are edited there and saved with `Ctrl+S` or the Save button.
   Save and Cancel return to the **shown device**'s stream. While the draft has
   unsaved changes, opening a device is refused and the draft is kept.
+- **Sharing session**: the opt-in, owner-controlled listener a local human
+  terminal starts for one concrete address and port. It lives only as long as
+  the owner's connection, and each restart generates a fresh certificate
+  authority, host certificate and pairing credentials.
+- **Remote endpoint**: the exact IP address and TCP port of a **sharing
+  session**'s listener. It, not a device path or a device id, identifies a
+  **remote session**, so two hosts may share the same path without colliding.
+- **Paired host**: the pairing information a remote client needs to
+  authenticate a **sharing session**: the endpoint, the TLS name, the session's
+  certificate authority and the host certificate's SHA-256 fingerprint.
+- **Pairing credential**: the secret half of a **pairing**, one per **role**. The
+  host derives the role from which credential matched; a client cannot ask for
+  another one.
+- **Pairing file**: the MCP host user's private per-endpoint file
+  (`mcp-peers.json`) with one **paired host** and **pairing credential** per
+  **remote endpoint**. Readable by its owner only; never an AI tool argument
+  and never part of a tool result.
+- **Remote session**: one MCP server's connection to one **remote endpoint**,
+  with its own device ids, control and history, separate from the local core
+  and from every other endpoint.
 - **Event**: an unsolicited notification from the core (device output, write
   echo, client joined/left, control granted/released/denied, device closed,
   core shutdown). Local clients receive events from their subscription onward;

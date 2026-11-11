@@ -29,7 +29,7 @@ Call list_devices, then connect (request_control: true) to a path. read returns 
 lines labelled device/ai/human with partial lines marked. send writes the exact text (no newline \
 is added) and waits for the requested device-output lines or a bounded timeout, returning what \
 arrived. One AI may hold write control per device; when another holds it, connect is read-only \
-until it expires or disconnects. There is no continuous stream: each call returns one bounded batch.";
+until it expires or disconnects. There is no continuous stream: each call returns one bounded batch. Give ip and port together to use a device another host shares; omit both for the local core. Pairing credentials come from the host user's private configuration, never from tool arguments.";
 
 /// A JSON-RPC dispatch error.
 struct RpcError {

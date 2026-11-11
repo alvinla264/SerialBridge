@@ -10,6 +10,10 @@ answers.
 AI host  <-- MCP over stdio -->  serial-nexus-mcp  <-- Unix socket -->  serial-nexus-core
 ```
 
+It can also reach devices another host shares on the local network, using a
+[private pairing file](#reach-a-device-shared-by-another-host) that the MCP host's
+human configures. Sharing is never enabled by this client.
+
 `serial-nexus-mcp` never opens a serial port itself and never takes ownership:
 the core still enforces one AI writer per device, baud conflicts, idle expiry,
 the human terminal's writes, and device close/open.
@@ -91,6 +95,95 @@ message that says what to do next. Malformed calls are JSON-RPC errors
 (including `null` for a typed argument) are refused before any device action,
 so a typo cannot open a device at the wrong rate.
 
+## Reach a device shared by another host
+
+LAN sharing is opt-in on the host: its human terminal starts a listener for one
+concrete address and port, checks the devices to share, and shows pairing
+details. This client uses those details to reach the shared devices. It never
+starts or stops sharing, and it never falls back to the local core when a
+remote endpoint fails.
+
+### Pairing file
+
+The credential is **not** a tool argument and never appears in MCP output,
+errors, history or serial writes. The MCP host's human writes one private JSON
+file, readable by its owner only:
+
+1. ask the host terminal for its pairing details (the sharing screen copies
+   them; they are shown once per sharing session);
+2. create `~/.config/serial-nexus/mcp-peers.json` (`$XDG_CONFIG_HOME` is
+   honoured, and `SERIAL_NEXUS_MCP_PEERS` names another file) with mode `600`:
+
+```sh
+install -d -m 700 ~/.config/serial-nexus
+install -m 600 /dev/null ~/.config/serial-nexus/mcp-peers.json
+$EDITOR ~/.config/serial-nexus/mcp-peers.json
+```
+
+```json
+{
+  "version": 1,
+  "peers": [
+    {
+      "endpoint": { "address": "192.0.2.10", "port": 7000 },
+      "paired": {
+        "address": "192.0.2.10:7000",
+        "host_name": "192.0.2.10",
+        "ca_cert_der_b64": "<pairing CA from the host terminal>",
+        "host_cert_fingerprint_sha256": "<64 hex characters from the host terminal>"
+      },
+      "secret": {
+        "role": "ai",
+        "credential": "<the AI pairing credential from the host terminal>"
+      }
+    }
+  ]
+}
+```
+
+- One entry per endpoint; two entries for the same address and port are
+  refused as ambiguous. IPv4 and IPv6 are both accepted
+  (`"address": "::1"`, `"address": "fd00::20"`).
+- Use the **AI** credential (`"role": "ai"`) for this server. A human
+  credential is refused: the role is enforced by the host, not chosen here.
+- The file must be a regular file owned by you with no group or world
+  permission bits; a symbolic link, another owner, or mode `644` is refused
+  with a message that says which rule failed. The file contents are never
+  echoed.
+- Keeping the file outside the repo and out of anything an AI reads is the
+  point: the credential is a bearer secret for every device the host checks.
+
+Pairing details last only as long as the host's sharing session. When the host
+terminal closes, stops sharing, or restarts it (fresh certificate and
+credentials), the next remote call fails with a message saying the pairing is
+stale. Update the file, then call again; no write is replayed and no local
+device is used.
+
+### Tool arguments
+
+Every tool takes the same optional pair:
+
+| Argument | Meaning |
+| --- | --- |
+| `ip` | The sharing host's IPv4 or IPv6 address. |
+| `port` | The sharing listener's TCP port. |
+
+Give both to use that host, or neither for the local core. Giving only one is a
+parameter error. `connect` keeps its local `port` (the device path); with `ip`
+set, `port` is the host's TCP port and `path` is the device path on that host:
+
+```json
+{ "name": "connect", "arguments": { "ip": "192.0.2.10", "port": 7000, "path": "/dev/ttyUSB0", "request_control": true } }
+```
+
+Results from a remote endpoint say so (`on remote 192.0.2.10:7000`) and carry
+`structuredContent.remote_endpoint`; local results are unchanged. Device ids,
+control and history are kept separately per endpoint, so two hosts that both
+share `/dev/ttyUSB0` never collide. Only devices the host checked are visible,
+and an uncheck or owner termination revokes access immediately.
+
+A failed or uncertain write is reported as such and is never sent again.
+
 ## Protocol notes
 
 - Framing: one JSON-RPC message per line. Incoming messages are bounded to
@@ -155,3 +248,12 @@ newline, waited sends returning device lines, partial lines (new and
 pre-existing), timeouts, capped line counts, disconnect releasing control,
 detached-session errors, path aliases, a missing device, an unplugged device,
 and auto-start with an explicit core path.
+
+`tests/remote_mcp.rs` covers the remote path: local calls unchanged with no
+pairing file, a real loopback sharing session reached with `ip` + `port`,
+endpoint and address validation, an unknown endpoint, a human credential
+refused for the AI role, a host that cannot prove the pinned certificate, an
+unreadable pairing file, two hosts with equal device ids kept apart, one AI
+writer across local and remote, concurrent whole writes, unchecking a device,
+owner termination stopping a write without replay, and a rotated credential
+recovered by updating the file. No physical hardware is used.

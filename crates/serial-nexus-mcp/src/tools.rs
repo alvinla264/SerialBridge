@@ -5,18 +5,30 @@
 //! This module only formats arguments, reports outcomes, and remembers which
 //! devices this MCP session connected to so later calls can take a path or an
 //! id.
+//!
+//! A tool call without `ip` and `port` uses the local core exactly as before.
+//! With both, it uses the pairing file's credential for that endpoint and
+//! reaches a device shared by another host. The credential never travels
+//! through tool arguments and is never part of a result.
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use serial_nexus_client::{
-    Client, ClientConfig, ClientError, ClientInfo, ErrorCode, HistoryLine, Role, Source, WaitSpec,
+    Client, ClientConfig, ClientError, ClientInfo, ErrorCode, HistoryLine, Limits, OpenResult,
+    PairingRole, Peers, ReadResult, RemoteClient, RemoteEndpoint, Role, Source, WaitSpec,
+    WriteResult,
 };
+use serial_nexus_protocol::DevicesResult;
 
 /// Client name this server introduces itself with.
 pub const CLIENT_NAME: &str = "serial-nexus-mcp";
+
+/// How long one remote connection attempt may take.
+const REMOTE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A failed tool call, split by whether the caller's arguments were wrong.
 #[derive(Debug)]
@@ -62,16 +74,134 @@ impl ToolOutcome {
     }
 }
 
+/// Which core a tool call talks to: the local one, or one paired endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Target {
+    Local,
+    Remote(RemoteEndpoint),
+}
+
+impl Target {
+    fn endpoint(&self) -> Option<RemoteEndpoint> {
+        match self {
+            Self::Local => None,
+            Self::Remote(endpoint) => Some(*endpoint),
+        }
+    }
+
+    /// Suffix for a sentence about what happened: empty locally.
+    fn suffix(&self) -> String {
+        match self {
+            Self::Local => String::new(),
+            Self::Remote(endpoint) => format!(" on remote {endpoint}"),
+        }
+    }
+
+    /// Add the endpoint to a structured result only when it is remote, so
+    /// local results keep their existing shape.
+    fn attach(&self, value: Value) -> Value {
+        match self {
+            Self::Local => value,
+            Self::Remote(endpoint) => {
+                let mut object = value.as_object().cloned().unwrap_or_default();
+                object.insert(
+                    "remote_endpoint".into(),
+                    json!({ "address": endpoint.address.to_string(), "port": endpoint.port }),
+                );
+                Value::Object(object)
+            }
+        }
+    }
+
+    fn failure(&self, error: &ClientError, device: Option<&str>) -> Failure {
+        Failure::Tool(match self {
+            Self::Local => describe_error(error, device),
+            Self::Remote(endpoint) => describe_remote_error(endpoint, error, device),
+        })
+    }
+}
+
+/// One connected core: local Unix socket or paired remote host.
+enum Link {
+    Local(Client),
+    Remote(RemoteClient),
+}
+
+impl Link {
+    fn list_devices(&self) -> Result<DevicesResult, ClientError> {
+        match self {
+            Self::Local(client) => client.list_devices(),
+            Self::Remote(client) => client.list_devices(),
+        }
+    }
+
+    fn open(
+        &self,
+        port: String,
+        baud: Option<u32>,
+        request_control: bool,
+    ) -> Result<OpenResult, ClientError> {
+        match self {
+            Self::Local(client) => client.open(port, baud, request_control),
+            Self::Remote(client) => client.open(port, baud, request_control),
+        }
+    }
+
+    fn close(&self, device_id: u64) -> Result<(), ClientError> {
+        match self {
+            Self::Local(client) => client.close(device_id),
+            Self::Remote(client) => client.close(device_id),
+        }
+    }
+
+    fn read(&self, device_id: u64, lines: Option<usize>) -> Result<ReadResult, ClientError> {
+        match self {
+            Self::Local(client) => client.read(device_id, lines),
+            Self::Remote(client) => client.read(device_id, lines),
+        }
+    }
+
+    fn write_bytes(
+        &self,
+        device_id: u64,
+        data: &[u8],
+        wait: Option<WaitSpec>,
+    ) -> Result<WriteResult, ClientError> {
+        match self {
+            Self::Local(client) => client.write_bytes(device_id, data, wait),
+            Self::Remote(client) => client.write_bytes(device_id, data, wait),
+        }
+    }
+
+    fn status(&self, device_id: u64) -> Result<serial_nexus_client::DeviceStatus, ClientError> {
+        match self {
+            Self::Local(client) => client.status(device_id),
+            Self::Remote(client) => client.status(device_id),
+        }
+    }
+
+    fn limits(&self) -> Limits {
+        match self {
+            Self::Local(client) => client.hello().limits,
+            Self::Remote(client) => client.limits().clone(),
+        }
+    }
+}
+
 struct Connection {
     port: String,
     baud: u32,
 }
 
-/// One MCP server run: a lazily started core connection plus the devices this
-/// session has connected to.
+type ConnectionKey = (Target, u64);
+
+/// One MCP server run: lazily started core connections (one per endpoint) plus
+/// the devices this session has connected to, kept apart per endpoint so two
+/// hosts sharing the same device path never share ids, control or history.
 pub struct Session {
-    client: Mutex<Option<Client>>,
-    connections: Mutex<BTreeMap<u64, Connection>>,
+    local: Mutex<Option<Client>>,
+    remote: Mutex<BTreeMap<RemoteEndpoint, RemoteClient>>,
+    connections: Mutex<BTreeMap<ConnectionKey, Connection>>,
 }
 
 impl Default for Session {
@@ -83,24 +213,65 @@ impl Default for Session {
 impl Session {
     pub fn new() -> Self {
         Self {
-            client: Mutex::new(None),
+            local: Mutex::new(None),
+            remote: Mutex::new(BTreeMap::new()),
             connections: Mutex::new(BTreeMap::new()),
         }
     }
 
-    /// The core connection, starting the core on the first call and replacing
-    /// a connection that has since closed.
-    fn client(&self) -> Result<Client, Failure> {
-        let mut guard = self.client.lock().expect("client lock");
+    /// The local core connection, starting the core on the first call and
+    /// replacing a connection that has since closed.
+    fn local_client(&self) -> Result<Client, Failure> {
+        let mut guard = self.local.lock().expect("client lock");
         if let Some(client) = guard.as_ref() {
             if client.is_connected() {
                 return Ok(client.clone());
             }
         }
         let client = Client::connect(ClientConfig::new(ClientInfo::ai(CLIENT_NAME)))
-            .map_err(|error| Failure::Tool(describe_error(&error, None)))?;
+            .map_err(|error| Target::Local.failure(&error, None))?;
         *guard = Some(client.clone());
         Ok(client)
+    }
+
+    /// The remote connection for one endpoint, pairing again from the private
+    /// file when the previous connection closed. A failure here never becomes a
+    /// local call.
+    fn remote_client(&self, endpoint: RemoteEndpoint) -> Result<RemoteClient, Failure> {
+        let mut guard = self.remote.lock().expect("remote lock");
+        if let Some(client) = guard.get(&endpoint) {
+            if client.is_connected() {
+                return Ok(client.clone());
+            }
+        }
+        guard.remove(&endpoint);
+        let peers = Peers::load_default().map_err(|error| Failure::Tool(error.to_string()))?;
+        let peer = peers
+            .find(&endpoint)
+            .map_err(|error| Failure::Tool(error.to_string()))?;
+        if peer.secret.role != PairingRole::Ai {
+            return Err(Failure::Tool(format!(
+                "the credential for {endpoint} is a {:?} credential; the MCP host needs the AI credential (role \"ai\")",
+                peer.secret.role
+            )));
+        }
+        let client = RemoteClient::connect_to(
+            endpoint,
+            &peer.paired,
+            &peer.secret,
+            Some(CLIENT_NAME.to_string()),
+            REMOTE_TIMEOUT,
+        )
+        .map_err(|error| Target::Remote(endpoint).failure(&error, None))?;
+        guard.insert(endpoint, client.clone());
+        Ok(client)
+    }
+
+    fn link(&self, target: Target) -> Result<Link, Failure> {
+        match target {
+            Target::Local => Ok(Link::Local(self.local_client()?)),
+            Target::Remote(endpoint) => Ok(Link::Remote(self.remote_client(endpoint)?)),
+        }
     }
 
     /// Drop a device from this session's map once the core says it is gone.
@@ -108,54 +279,55 @@ impl Session {
     /// says is gone so a later reconnect's id is not shadowed.
     fn failure(
         &self,
+        target: Target,
         error: &ClientError,
         device: Option<&str>,
         device_id: Option<u64>,
     ) -> Failure {
         if error.is_device_gone() {
             if let Some(device_id) = device_id {
-                self.forget(device_id);
+                self.forget(target, device_id);
             }
         }
-        Failure::Tool(describe_error(error, device))
+        target.failure(error, device)
     }
 
-    fn forget(&self, device_id: u64) {
+    fn forget(&self, target: Target, device_id: u64) {
         self.connections
             .lock()
             .expect("connections lock")
-            .remove(&device_id);
+            .remove(&(target, device_id));
     }
 
-    fn remember(&self, device_id: u64, port: String, baud: u32) {
+    fn remember(&self, target: Target, device_id: u64, port: String, baud: u32) {
         let mut connections = self.connections.lock().expect("connections lock");
         // A reopened device gets a new id; the old id is dead and must not
         // shadow the path.
-        connections.retain(|_, connection| connection.port != port);
-        connections.insert(device_id, Connection { port, baud });
+        connections.retain(|(known, _), connection| *known != target || connection.port != port);
+        connections.insert((target, device_id), Connection { port, baud });
     }
 
-    fn connection(&self, device_id: u64) -> Option<String> {
+    fn connection(&self, target: Target, device_id: u64) -> Option<String> {
         self.connections
             .lock()
             .expect("connections lock")
-            .get(&device_id)
+            .get(&(target, device_id))
             .map(|connection| connection.port.clone())
     }
 
-    fn connection_baud(&self, device_id: u64) -> Option<u32> {
+    fn connection_baud(&self, target: Target, device_id: u64) -> Option<u32> {
         self.connections
             .lock()
             .expect("connections lock")
-            .get(&device_id)
+            .get(&(target, device_id))
             .map(|connection| connection.baud)
     }
 
     /// Resolve a `device` argument: a numeric device id, or the path of a
-    /// device this session (or the core) has open. Paths are canonicalized the
-    /// way the core canonicalizes them, so a symlink such as a
-    /// `/dev/serial/by-id/...` alias still finds the device it opened.
-    fn resolve_device(&self, device: &str) -> Result<u64, Failure> {
+    /// device this session (or the selected core) has open. Paths are
+    /// canonicalized the way the core canonicalizes them, so a symlink such as
+    /// a `/dev/serial/by-id/...` alias still finds the device it opened.
+    fn resolve_device(&self, target: Target, device: &str) -> Result<u64, Failure> {
         if let Ok(id) = device.parse::<u64>() {
             return Ok(id);
         }
@@ -167,16 +339,16 @@ impl Session {
             let connections = self.connections.lock().expect("connections lock");
             connections
                 .iter()
-                .find(|(_, connection)| matches(&connection.port))
-                .map(|(id, _)| *id)
+                .find(|((known, _), connection)| *known == target && matches(&connection.port))
+                .map(|((_, id), _)| *id)
         };
         if let Some(id) = known {
             return Ok(id);
         }
-        let client = self.client()?;
+        let client = self.link(target)?;
         let devices = client
             .list_devices()
-            .map_err(|error| Failure::Tool(describe_error(&error, None)))?;
+            .map_err(|error| target.failure(&error, None))?;
         devices
             .devices
             .iter()
@@ -184,7 +356,8 @@ impl Session {
             .and_then(|summary| summary.device_id)
             .ok_or_else(|| {
                 Failure::Tool(format!(
-                    "no open serial device at {device}; call connect first"
+                    "no open serial device at {device}{}; call connect first",
+                    target.suffix()
                 ))
             })
     }
@@ -198,24 +371,34 @@ impl Session {
         };
         let outcome = match name {
             "list_devices" => {
-                reject_unknown_arguments(arguments, &[])?;
-                self.list_devices()
+                reject_unknown_arguments(arguments, &["ip", "port"])?;
+                let target = endpoint_argument(arguments)?.map_or(Target::Local, Target::Remote);
+                self.list_devices(target)
             }
             "connect" => {
-                reject_unknown_arguments(arguments, &["port", "baud", "request_control"])?;
+                reject_unknown_arguments(
+                    arguments,
+                    &["port", "path", "baud", "request_control", "ip"],
+                )?;
                 self.connect(arguments)
             }
             "disconnect" => {
-                reject_unknown_arguments(arguments, &["device"])?;
-                self.disconnect(arguments)
+                reject_unknown_arguments(arguments, &["device", "ip", "port"])?;
+                let target = endpoint_argument(arguments)?.map_or(Target::Local, Target::Remote);
+                self.disconnect(target, arguments)
             }
             "read" => {
-                reject_unknown_arguments(arguments, &["device", "lines"])?;
-                self.read(arguments)
+                reject_unknown_arguments(arguments, &["device", "lines", "ip", "port"])?;
+                let target = endpoint_argument(arguments)?.map_or(Target::Local, Target::Remote);
+                self.read(target, arguments)
             }
             "send" => {
-                reject_unknown_arguments(arguments, &["device", "text", "lines", "timeout_ms"])?;
-                self.send(arguments)
+                reject_unknown_arguments(
+                    arguments,
+                    &["device", "text", "lines", "timeout_ms", "ip", "port"],
+                )?;
+                let target = endpoint_argument(arguments)?.map_or(Target::Local, Target::Remote);
+                self.send(target, arguments)
             }
             other => {
                 return Err(Failure::Params(format!(
@@ -231,16 +414,28 @@ impl Session {
         })
     }
 
-    fn list_devices(&self) -> Result<ToolOutcome, Failure> {
-        let client = self.client()?;
+    fn list_devices(&self, target: Target) -> Result<ToolOutcome, Failure> {
+        let client = self.link(target)?;
         let devices = client
             .list_devices()
-            .map_err(|error| Failure::Tool(describe_error(&error, None)))?;
+            .map_err(|error| target.failure(&error, None))?;
         let mut text = String::new();
         if devices.devices.is_empty() {
-            text.push_str("no serial devices found; plug one in and call list_devices again");
+            match target.endpoint() {
+                Some(endpoint) => text.push_str(&format!(
+                    "no serial devices are shared on remote {endpoint}; the host owner has not checked any for sharing"
+                )),
+                None => text.push_str(
+                    "no serial devices found; plug one in and call list_devices again",
+                ),
+            }
         } else {
-            text.push_str("devices (path, state):");
+            match target.endpoint() {
+                Some(endpoint) => {
+                    text.push_str(&format!("devices on remote {endpoint} (path, state):"))
+                }
+                None => text.push_str("devices (path, state):"),
+            }
             for device in &devices.devices {
                 text.push('\n');
                 text.push_str("- ");
@@ -269,11 +464,14 @@ impl Session {
                 }
             }
         }
-        Ok(ToolOutcome::ok(text, json!({ "devices": devices.devices })))
+        Ok(ToolOutcome::ok(
+            text,
+            target.attach(json!({ "devices": devices.devices })),
+        ))
     }
 
     fn connect(&self, arguments: &Value) -> Result<ToolOutcome, Failure> {
-        let port = required_string(arguments, "port")?;
+        let (target, port) = connect_target(arguments)?;
         let baud = match optional_u64(arguments, "baud")? {
             Some(value) => Some(
                 u32::try_from(value)
@@ -282,17 +480,20 @@ impl Session {
             None => None,
         };
         let request_control = optional_bool(arguments, "request_control")?.unwrap_or(false);
-        let client = self.client()?;
+        let client = self.link(target)?;
         let opened = client
             .open(port, baud, request_control)
-            .map_err(|error| Failure::Tool(describe_error(&error, None)))?;
-        self.remember(opened.device_id, opened.port.clone(), opened.baud);
+            .map_err(|error| target.failure(&error, None))?;
+        self.remember(target, opened.device_id, opened.port.clone(), opened.baud);
 
         let holder = opened.control.holder.clone();
         let write_control = opened.role == Role::Controller;
         let mut text = format!(
-            "connected to {} (device {}) at {} baud",
-            opened.port, opened.device_id, opened.baud
+            "connected to {} (device {}) at {} baud{}",
+            opened.port,
+            opened.device_id,
+            opened.baud,
+            target.suffix()
         );
         match opened.role {
             Role::Controller => text.push_str("; write control: granted"),
@@ -323,7 +524,7 @@ impl Session {
         }
         Ok(ToolOutcome::ok(
             text,
-            json!({
+            target.attach(json!({
                 "device_id": opened.device_id,
                 "port": opened.port,
                 "baud": opened.baud,
@@ -332,55 +533,56 @@ impl Session {
                 "requested_control": request_control,
                 "holder": holder,
                 "expires_in_ms": opened.control.expires_in_ms,
-            }),
+            })),
         ))
     }
 
-    fn disconnect(&self, arguments: &Value) -> Result<ToolOutcome, Failure> {
+    fn disconnect(&self, target: Target, arguments: &Value) -> Result<ToolOutcome, Failure> {
         let device = required_device(arguments)?;
-        let device_id = self.resolve_device(&device)?;
-        let client = self.client()?;
+        let device_id = self.resolve_device(target, &device)?;
+        let client = self.link(target)?;
         let status = client.status(device_id).ok();
         let port = status
             .as_ref()
             .map(|status| status.path.clone())
-            .or_else(|| self.connection(device_id))
+            .or_else(|| self.connection(target, device_id))
             .unwrap_or_else(|| device.clone());
         client.close(device_id).map_err(|error| {
-            Failure::Tool(describe_error(
-                &error,
-                Some(&device_label(&device, Some(port.clone()))),
-            ))
+            target.failure(&error, Some(&device_label(&device, Some(port.clone()))))
         })?;
-        self.forget(device_id);
+        self.forget(target, device_id);
         let device_closed = status
             .as_ref()
             .is_none_or(|status| status.client_count <= 1);
         let text = if device_closed {
-            format!("disconnected from {port} (device {device_id}); the device is now closed")
+            format!(
+                "disconnected from {port} (device {device_id}){}; the device is now closed",
+                target.suffix()
+            )
         } else {
             let left = status
                 .as_ref()
                 .map(|status| status.client_count - 1)
                 .unwrap_or(0);
             format!(
-                "disconnected from {port} (device {device_id}); left the device open for {}",
+                "disconnected from {port} (device {device_id}){}; left the device open for {}",
+                target.suffix(),
                 plural(left, "other client", "other clients")
             )
         };
         Ok(ToolOutcome::ok(
             text,
-            json!({
+            target.attach(json!({
                 "device_id": device_id,
                 "port": port,
                 "device_closed": device_closed,
-            }),
+            })),
         ))
     }
 
-    fn read(&self, arguments: &Value) -> Result<ToolOutcome, Failure> {
+    fn read(&self, target: Target, arguments: &Value) -> Result<ToolOutcome, Failure> {
         let device = required_device(arguments)?;
-        let device_id = self.resolve_device(&device)?;
+        let device_id = self.resolve_device(target, &device)?;
         let lines = match optional_u64(arguments, "lines")? {
             Some(0) => {
                 return Err(Failure::Params(
@@ -393,16 +595,17 @@ impl Session {
             ),
             None => None,
         };
-        let client = self.client()?;
+        let client = self.link(target)?;
         let read = client.read(device_id, lines).map_err(|error| {
             self.failure(
+                target,
                 &error,
-                Some(&device_label(&device, self.connection(device_id))),
+                Some(&device_label(&device, self.connection(target, device_id))),
                 Some(device_id),
             )
         })?;
         let port = self
-            .connection(device_id)
+            .connection(target, device_id)
             .unwrap_or_else(|| format!("device {device_id}"));
         let mut counts = (0usize, 0usize, 0usize);
         for line in &read.lines {
@@ -413,11 +616,12 @@ impl Session {
             }
         }
         let baud = self
-            .connection_baud(device_id)
+            .connection_baud(target, device_id)
             .map(|baud| format!(" at {baud} baud"))
             .unwrap_or_default();
         let mut text = format!(
-            "{port} (device {device_id}{baud}): {} (device {}, ai {}, human {}); dropped older lines: {}; truncated: {}",
+            "{port} (device {device_id}{baud}){}: {} (device {}, ai {}, human {}); dropped older lines: {}; truncated: {}",
+            target.suffix(),
             plural(read.lines.len(), "line", "lines"),
             counts.0,
             counts.1,
@@ -433,23 +637,23 @@ impl Session {
         text.push_str(&format_lines(&read.lines));
         Ok(ToolOutcome::ok(
             text,
-            json!({
+            target.attach(json!({
                 "device_id": device_id,
                 "port": port,
                 "lines": read.lines,
                 "dropped_lines": read.dropped_lines,
                 "truncated": read.truncated,
-            }),
+            })),
         ))
     }
 
-    fn send(&self, arguments: &Value) -> Result<ToolOutcome, Failure> {
+    fn send(&self, target: Target, arguments: &Value) -> Result<ToolOutcome, Failure> {
         let device = required_device(arguments)?;
         let text = required_string(arguments, "text")?;
-        let device_id = self.resolve_device(&device)?;
+        let device_id = self.resolve_device(target, &device)?;
         let requested_lines = optional_u64(arguments, "lines")?.unwrap_or(1);
-        let client = self.client()?;
-        let limits = client.hello().limits;
+        let client = self.link(target)?;
+        let limits = client.limits();
         // The core caps its wait target silently; do it here so the reply can
         // say what it actually waited for.
         let lines = requested_lines.min(limits.read_max_lines as u64);
@@ -486,18 +690,20 @@ impl Session {
             .write_bytes(device_id, text.as_bytes(), wait.clone())
             .map_err(|error| {
                 self.failure(
+                    target,
                     &error,
-                    Some(&device_label(&device, self.connection(device_id))),
+                    Some(&device_label(&device, self.connection(target, device_id))),
                     Some(device_id),
                 )
             })?;
         let elapsed = started.elapsed().as_millis() as u64;
         let port = self
-            .connection(device_id)
+            .connection(target, device_id)
             .unwrap_or_else(|| format!("device {device_id}"));
         let mut message = format!(
-            "sent {} to {port} (device {device_id})",
-            plural(written.bytes_written, "byte", "bytes")
+            "sent {} to {port} (device {device_id}){}",
+            plural(written.bytes_written, "byte", "bytes"),
+            target.suffix()
         );
         match &wait {
             None => message.push_str("; no response requested (lines: 0)"),
@@ -554,7 +760,7 @@ impl Session {
         }
         Ok(ToolOutcome::ok(
             message,
-            json!({
+            target.attach(json!({
                 "device_id": device_id,
                 "port": port,
                 "bytes_written": written.bytes_written,
@@ -567,9 +773,71 @@ impl Session {
                 "timeout_ms": timeout,
                 "bounded_timeout": bounded,
                 "elapsed_ms": elapsed,
-            }),
+            })),
         ))
     }
+}
+
+/// Parse the optional `ip` + `port` pair. Both or neither: a lone one is a
+/// mistake, never a guess at what the caller meant.
+fn endpoint_argument(arguments: &Value) -> Result<Option<RemoteEndpoint>, Failure> {
+    match (arguments.get("ip"), arguments.get("port")) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => Err(Failure::Params(
+            "give both ip and port to reach a device shared by another host, or neither for the local core"
+                .into(),
+        )),
+        (Some(ip), Some(port)) => Ok(Some(parse_endpoint(ip, port)?)),
+    }
+}
+
+fn parse_endpoint(ip: &Value, port: &Value) -> Result<RemoteEndpoint, Failure> {
+    let text = ip
+        .as_str()
+        .ok_or_else(|| Failure::Params("ip must be an IPv4 or IPv6 address string".into()))?;
+    let address = text.parse::<IpAddr>().map_err(|_| {
+        Failure::Params(format!(
+            "{text:?} is not an IPv4 or IPv6 address (for example 192.0.2.10 or ::1)"
+        ))
+    })?;
+    let number = as_integral(port)
+        .ok_or_else(|| Failure::Params("port must be a TCP port number".into()))?;
+    let port = u16::try_from(number)
+        .map_err(|_| Failure::Params(format!("port {number} is not between 1 and 65535")))?;
+    let endpoint = RemoteEndpoint::new(address, port);
+    endpoint.validate().map_err(Failure::Params)?;
+    Ok(endpoint)
+}
+
+/// Resolve `connect`'s target and device path. Locally `port` (or `path`) is
+/// the device path; with `ip`, `port` is the TCP port and `path` is the device.
+fn connect_target(arguments: &Value) -> Result<(Target, String), Failure> {
+    let Some(ip) = arguments.get("ip") else {
+        if arguments.get("port").is_some() && arguments.get("path").is_some() {
+            return Err(Failure::Params(
+                "give either port or path for the device, not both".into(),
+            ));
+        }
+        let port = match arguments.get("path") {
+            Some(_) => required_string(arguments, "path")?,
+            None => required_string(arguments, "port")?,
+        };
+        return Ok((Target::Local, port));
+    };
+    let port = arguments.get("port").ok_or_else(|| {
+        Failure::Params(
+            "give both ip and port to reach a device shared by another host, or neither for the local core; the TCP port goes in port and the device path in path"
+                .into(),
+        )
+    })?;
+    let endpoint = parse_endpoint(ip, port)?;
+    let path = required_string(arguments, "path").map_err(|_| {
+        Failure::Params(
+            "when ip is given, path is the shared device path (for example /dev/ttyUSB0) and port is the host's TCP port"
+                .into(),
+        )
+    })?;
+    Ok((Target::Remote(endpoint), path))
 }
 
 /// The MCP `tools/list` answer.
@@ -577,22 +845,37 @@ pub fn definitions() -> Value {
     json!([
         {
             "name": "list_devices",
-            "description": "List every serial device the local SerialNexus core can see, including open ones with their active baud rate, client count and the AI client that holds write control. Use the paths it reports with connect.",
+            "description": "List every serial device the core can see, including open ones with their active baud rate, client count and the AI client that holds write control. Use the paths it reports with connect. With ip and port, list the devices shared by that host instead of the local ones.",
             "inputSchema": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "ip": {
+                        "type": "string",
+                        "description": "IPv4 or IPv6 address of a host sharing devices. Give it together with port; omit both for the local core."
+                    },
+                    "port": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 65535,
+                        "description": "The sharing listener's TCP port on that host."
+                    }
+                },
                 "additionalProperties": false
             }
         },
         {
             "name": "connect",
-            "description": "Connect this session to a serial device, or join one already open, and optionally ask for AI write control. Without baud, an open device keeps its active rate and a closed device opens at 115200. An explicit different baud is rejected. When another AI holds write control, the connection is read-only and this call names the holder; call connect again with request_control true to claim control once it is free. One session can connect to several devices.",
+            "description": "Connect this session to a serial device, or join one already open, and optionally ask for AI write control. Without baud, an open device keeps its active rate and a closed device opens at 115200. An explicit different baud is rejected. When another AI holds write control, the connection is read-only and this call names the holder; call connect again with request_control true to claim control once it is free. One session can connect to several devices. With ip and port, reach a device shared by another host: port is then the host's TCP port and path is the device path.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "port": {
+                        "type": ["string", "integer"],
+                        "description": "Local device path, e.g. /dev/ttyUSB0 or /dev/serial/by-id/...; with ip, the host's TCP port instead."
+                    },
+                    "path": {
                         "type": "string",
-                        "description": "Device path, e.g. /dev/ttyUSB0 or /dev/serial/by-id/..."
+                        "description": "Device path on the shared host; required with ip."
                     },
                     "baud": {
                         "type": "integer",
@@ -603,19 +886,24 @@ pub fn definitions() -> Value {
                         "type": "boolean",
                         "default": false,
                         "description": "Ask for AI write control (required before send)."
+                    },
+                    "ip": {
+                        "type": "string",
+                        "description": "IPv4 or IPv6 address of a host sharing devices. Give it together with port and path; omit it for the local core."
                     }
                 },
-                "required": ["port"],
                 "additionalProperties": false
             }
         },
         {
             "name": "disconnect",
-            "description": "Disconnect this session from a device. The last client leaving closes the device and releases its baud rate and write control.",
+            "description": "Disconnect this session from a device. The last client leaving closes the device and releases its baud rate and write control. With ip and port, act on that host's shared device.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "device": { "type": ["string", "integer"], "description": "Device id from connect, or its path." }
+                    "device": { "type": ["string", "integer"], "description": "Device id from connect, or its path." },
+                    "ip": { "type": "string", "description": "Address of the sharing host; give it together with port." },
+                    "port": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "The sharing listener's TCP port." }
                 },
                 "required": ["device"],
                 "additionalProperties": false
@@ -623,7 +911,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "read",
-            "description": "Read recent buffered history of a device: device output, AI writes and human writes, newest last, each labelled by source. Partial lines (no newline yet) are marked. Reports dropped older lines and truncation.",
+            "description": "Read recent buffered history of a device: device output, AI writes and human writes, newest last, each labelled by source. Partial lines (no newline yet) are marked. Reports dropped older lines and truncation. With ip and port, read from that host's shared device.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -632,7 +920,9 @@ pub fn definitions() -> Value {
                         "type": "integer",
                         "minimum": 1,
                         "description": "How many of the most recent lines to return (default 50, core maximum 2000)."
-                    }
+                    },
+                    "ip": { "type": "string", "description": "Address of the sharing host; give it together with port." },
+                    "port": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "The sharing listener's TCP port." }
                 },
                 "required": ["device"],
                 "additionalProperties": false
@@ -640,7 +930,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "send",
-            "description": "Send exact text to a device (no newline is added) and wait for device-output lines received after the send. Requires AI write control; fails clearly with ControlHeld otherwise. On timeout it returns what arrived, including a marked partial line. lines: 0 sends without waiting. No continuous stream: each call returns one bounded batch.",
+            "description": "Send exact text to a device (no newline is added) and wait for device-output lines received after the send. Requires AI write control; fails clearly with ControlHeld otherwise. On timeout it returns what arrived, including a marked partial line. lines: 0 sends without waiting. No continuous stream: each call returns one bounded batch. With ip and port, send to that host's shared device.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -659,7 +949,9 @@ pub fn definitions() -> Value {
                         "type": "integer",
                         "minimum": 0,
                         "description": "How long to wait for those lines (default 1000 ms, core maximum 30000 ms)."
-                    }
+                    },
+                    "ip": { "type": "string", "description": "Address of the sharing host; give it together with port." },
+                    "port": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "The sharing listener's TCP port." }
                 },
                 "required": ["device", "text"],
                 "additionalProperties": false
@@ -785,34 +1077,10 @@ fn human_duration(millis: u64) -> String {
 
 /// Turn a core error into a message an AI host (and its human) can act on.
 fn describe_error(error: &ClientError, device: Option<&str>) -> String {
-    let target = device.unwrap_or("that device");
+    if let ClientError::Server(body) = error {
+        return describe_server_error(body, device);
+    }
     match error {
-        ClientError::Server(body) => match body.code {
-            ErrorCode::BaudConflict => format!(
-                "{}; omit baud to join at the active rate",
-                body.message
-            ),
-            ErrorCode::ControlHeld => format!(
-                "{}; this session is read-only for {target}, so call connect again with request_control: true once control is free",
-                body.message
-            ),
-            ErrorCode::NotAttached => format!(
-                "this session is not connected to {target}; call connect first"
-            ),
-            ErrorCode::NotFound => format!(
-                "{}; call list_devices to see what is available, then connect",
-                body.message
-            ),
-            ErrorCode::DeviceClosed | ErrorCode::DeviceFailed => format!(
-                "{}; the device is gone, so call connect again after it is back",
-                body.message
-            ),
-            ErrorCode::PermissionDenied | ErrorCode::BadRequest => {
-                format!("{} ({:?})", body.message, body.code)
-            }
-            ErrorCode::Timeout => format!("serial-nexus-core timed out: {}", body.message),
-            _ => body.message.clone(),
-        },
         ClientError::CoreNotFound => {
             "serial-nexus-core was not found; install it next to serial-nexus-mcp or set SERIAL_NEXUS_CORE"
                 .to_string()
@@ -826,6 +1094,81 @@ fn describe_error(error: &ClientError, device: Option<&str>) -> String {
             "serial-nexus-core speaks protocol {core}, this serial-nexus-mcp speaks {client}; upgrade one of them"
         ),
         other => format!("serial-nexus-core error: {other}"),
+    }
+}
+
+/// A remote failure: never the local core's wording, because a network failure
+/// must not look like a local restart, and never the credential.
+fn describe_remote_error(
+    endpoint: &RemoteEndpoint,
+    error: &ClientError,
+    device: Option<&str>,
+) -> String {
+    let lead = format!("remote {endpoint}: ");
+    match error {
+        ClientError::EndpointMismatch(reason) => {
+            format!("{lead}endpoint mismatch: {reason}")
+        }
+        ClientError::HostRejected(reason) => format!(
+            "{lead}the host did not prove the pinned certificate ({reason}); it may be a different host, or the sharing session restarted with a fresh certificate. Nothing was written and the credential was not sent. Pair again from the host terminal and update the pairing file."
+        ),
+        ClientError::Authentication(reason) => format!(
+            "{lead}pairing was refused or did not finish ({reason}); the sharing session may have restarted and rotated its credentials. Ask the host owner for fresh pairing details and update the pairing file."
+        ),
+        ClientError::Tls(reason) => {
+            format!("{lead}the TLS connection failed ({reason}); nothing was written")
+        }
+        ClientError::Io(reason) => format!(
+            "{lead}cannot reach the host ({reason}); check the address and port, and that the owner's terminal is still sharing"
+        ),
+        ClientError::UnsupportedProtocol { core, client } => format!(
+            "{lead}the host speaks protocol {core}, this serial-nexus-mcp speaks {client}; upgrade one of them"
+        ),
+        ClientError::WriteUncertain(reason) => format!(
+            "{lead}write outcome uncertain ({reason}); the text may have reached the device and was not sent again"
+        ),
+        ClientError::Disconnected(reason) => format!(
+            "{lead}lost the connection ({reason}); the owner terminal may have stopped sharing or closed. Nothing was retried and no local device was used"
+        ),
+        ClientError::Timeout(reason) => {
+            format!("{lead}the host did not answer in time ({reason})")
+        }
+        ClientError::Server(body) => {
+            format!("{lead}{}", describe_server_error(body, device))
+        }
+        other => format!("{lead}{other}"),
+    }
+}
+
+fn describe_server_error(body: &serial_nexus_client::ErrorBody, device: Option<&str>) -> String {
+    let target = device.unwrap_or("that device");
+    match body.code {
+        ErrorCode::BaudConflict => format!(
+            "{}; omit baud to join at the active rate",
+            body.message
+        ),
+        ErrorCode::ControlHeld => format!(
+            "{}; this session is read-only for {target}, so call connect again with request_control: true once control is free",
+            body.message
+        ),
+        ErrorCode::NotAttached => format!(
+            "this session is not connected to {target}; call connect first"
+        ),
+        ErrorCode::NotFound => format!(
+            "{}; call list_devices to see what is available, then connect",
+            body.message
+        ),
+        ErrorCode::DeviceClosed | ErrorCode::DeviceFailed => format!(
+            "{}; the device is gone, so call connect again after it is back",
+            body.message
+        ),
+        ErrorCode::PermissionDenied => format!(
+            "{} (PermissionDenied); the host owner has not shared this device, or unchecked it",
+            body.message
+        ),
+        ErrorCode::BadRequest => format!("{} ({:?})", body.message, body.code),
+        ErrorCode::Timeout => format!("serial-nexus-core timed out: {}", body.message),
+        _ => body.message.clone(),
     }
 }
 
@@ -934,6 +1277,64 @@ mod tests {
     }
 
     #[test]
+    fn no_tool_takes_a_credential_argument() {
+        for tool in definitions().as_array().expect("array") {
+            let properties = tool["inputSchema"]["properties"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            for name in properties.keys() {
+                let name = name.to_lowercase();
+                assert!(
+                    !name.contains("credential")
+                        && !name.contains("secret")
+                        && !name.contains("token")
+                        && !name.contains("password"),
+                    "{} must not take a credential argument",
+                    tool["name"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ip_and_port_are_parsed_together() {
+        assert_eq!(endpoint_argument(&json!({})).unwrap(), None);
+        assert!(endpoint_argument(&json!({ "ip": "127.0.0.1" })).is_err());
+        assert!(endpoint_argument(&json!({ "port": 7000 })).is_err());
+        let parsed = endpoint_argument(&json!({ "ip": "::1", "port": 7000 }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.to_string(), "[::1]:7000");
+        assert!(endpoint_argument(&json!({ "ip": "127.0.0.1", "port": 0 })).is_err());
+        assert!(endpoint_argument(&json!({ "ip": "0.0.0.0", "port": 7000 })).is_err());
+        assert!(endpoint_argument(&json!({ "ip": "host.example", "port": 7000 })).is_err());
+        assert!(endpoint_argument(&json!({ "ip": "127.0.0.1", "port": 1.5 })).is_err());
+    }
+
+    #[test]
+    fn connect_separates_the_tcp_port_from_the_device_path() {
+        let (target, path) = connect_target(&json!({ "port": "/dev/ttyUSB0" })).unwrap();
+        assert_eq!(target, Target::Local);
+        assert_eq!(path, "/dev/ttyUSB0");
+        let (target, path) = connect_target(&json!({ "path": "/dev/ttyUSB0" })).unwrap();
+        assert_eq!(target, Target::Local);
+        assert_eq!(path, "/dev/ttyUSB0");
+        assert!(connect_target(&json!({})).is_err());
+        assert!(connect_target(&json!({ "port": "/dev/a", "path": "/dev/a" })).is_err());
+
+        let (target, path) =
+            connect_target(&json!({ "ip": "127.0.0.1", "port": 7443, "path": "/dev/ttyUSB0" }))
+                .unwrap();
+        assert_eq!(
+            target,
+            Target::Remote(RemoteEndpoint::new("127.0.0.1".parse().unwrap(), 7443))
+        );
+        assert_eq!(path, "/dev/ttyUSB0");
+        assert!(connect_target(&json!({ "ip": "127.0.0.1", "port": 7443 })).is_err());
+    }
+
+    #[test]
     fn only_a_device_tail_can_predate_the_send() {
         let device_line = HistoryLine {
             source: Source::Device,
@@ -954,11 +1355,33 @@ mod tests {
     #[test]
     fn reconnect_replaces_a_stale_id_for_the_same_port() {
         let session = Session::new();
-        session.remember(1, "/dev/ttyUSB0".into(), 115_200);
-        session.remember(2, "/dev/ttyUSB0".into(), 9_600);
-        assert_eq!(session.connection(1), None);
-        assert_eq!(session.connection(2).as_deref(), Some("/dev/ttyUSB0"));
-        assert_eq!(session.connection_baud(2), Some(9_600));
+        session.remember(Target::Local, 1, "/dev/ttyUSB0".into(), 115_200);
+        session.remember(Target::Local, 2, "/dev/ttyUSB0".into(), 9_600);
+        assert_eq!(session.connection(Target::Local, 1), None);
+        assert_eq!(
+            session.connection(Target::Local, 2).as_deref(),
+            Some("/dev/ttyUSB0")
+        );
+        assert_eq!(session.connection_baud(Target::Local, 2), Some(9_600));
+    }
+
+    #[test]
+    fn the_same_device_id_at_two_endpoints_is_two_connections() {
+        let session = Session::new();
+        let a = Target::Remote(RemoteEndpoint::new("192.0.2.10".parse().unwrap(), 7000));
+        let b = Target::Remote(RemoteEndpoint::new("192.0.2.11".parse().unwrap(), 7000));
+        session.remember(Target::Local, 1, "/dev/ttyUSB0".into(), 115_200);
+        session.remember(a, 1, "/dev/ttyUSB0".into(), 9_600);
+        session.remember(b, 1, "/dev/ttyUSB0".into(), 57_600);
+        assert_eq!(session.connection_baud(Target::Local, 1), Some(115_200));
+        assert_eq!(session.connection_baud(a, 1), Some(9_600));
+        assert_eq!(session.connection_baud(b, 1), Some(57_600));
+        session.forget(a, 1);
+        assert_eq!(session.connection(b, 1).as_deref(), Some("/dev/ttyUSB0"));
+        assert_eq!(
+            session.connection(Target::Local, 1).as_deref(),
+            Some("/dev/ttyUSB0")
+        );
     }
 
     #[test]

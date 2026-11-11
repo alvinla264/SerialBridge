@@ -39,6 +39,10 @@ pub enum ClientError {
     #[error("TLS error: {0}")]
     Tls(String),
 
+    /// The address/port to dial is not the endpoint the pairing describes.
+    #[error("endpoint does not match the pairing information: {0}")]
+    EndpointMismatch(String),
+
     /// The host's certificate did not match the pairing information.
     #[error("host authentication failed: {0}")]
     HostRejected(String),
