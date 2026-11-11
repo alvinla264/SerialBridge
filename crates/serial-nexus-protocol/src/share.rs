@@ -344,16 +344,9 @@ impl FrameDecoder {
 
     /// Add bytes read from the stream.
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), ProtocolError> {
-        // Two complete frames may be buffered at once (a maximum-sized frame
-        // followed by another read); each individual frame is still bounded by
-        // `next_frame`.
-        let capacity = 2 * (MAX_REMOTE_FRAME_BYTES + 4);
-        if self.buffer.len() + bytes.len() > capacity {
-            return Err(ProtocolError::TooLarge {
-                size: self.buffer.len() + bytes.len(),
-                max: capacity,
-            });
-        }
+        // Individual frames are bounded by `next_frame`. The caller drains
+        // complete frames between reads, so a legal pipeline of several
+        // near-limit frames must not be rejected as one oversized buffer.
         self.buffer.extend_from_slice(bytes);
         Ok(())
     }

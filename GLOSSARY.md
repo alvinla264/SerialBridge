@@ -32,8 +32,10 @@ these words in their tool names and user-facing text.
   started, so an old prompt does not appear newer than later writes.
 - **Grace period**: the 30-second default during which the core stays alive
   after its last client disconnects.
-- **Close**: detaching the last client. Accepted writes are drained first, then
-  the serial handle is released and `DeviceClosed` is announced.
+- **Close**: detaching the last client. A local close drains accepted writes
+  before releasing the handle and announcing `DeviceClosed`; a remote close
+  announces and returns before that asynchronous drain, so `DeviceClosed` is
+  not a release/drain barrier for remotes.
 - **Truncated**: a read or waited-write result trimmed to the IPC frame budget.
   The newest lines are kept; `truncated` says older ones were left out.
 - **MCP session**: one run of `serial-nexus-mcp`, launched by the AI host and

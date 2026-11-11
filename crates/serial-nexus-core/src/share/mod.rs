@@ -892,6 +892,7 @@ fn spawn_write_wait(
     pending_writes: Arc<AtomicUsize>,
 ) {
     let pending_counter = Arc::clone(&pending_writes);
+    let failure_events = events.clone();
     let spawned = thread::Builder::new()
         .name("serial-nexus-share-write-wait".into())
         .spawn(move || {
@@ -915,6 +916,14 @@ fn spawn_write_wait(
         });
     if spawned.is_err() {
         pending_writes.fetch_sub(1, Ordering::SeqCst);
+        let _ = failure_events.send(ServerMessage::Error {
+            id,
+            error: ErrorBody::new(
+                ErrorCode::DeviceFailed,
+                "could not await the write's response lines; the bytes may already have reached the device",
+            )
+            .with_details(serde_json::json!({ "may_have_reached_device": true })),
+        });
     }
 }
 

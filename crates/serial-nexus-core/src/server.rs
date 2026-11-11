@@ -179,9 +179,12 @@ fn handle_connection(engine: Arc<Engine>, stream: UnixStream, uid: u32) {
                                     ServerMessage::Error {
                                         id,
                                         error: ErrorBody::new(
-                                            ErrorCode::Internal,
-                                            "could not await the write's response lines",
-                                        ),
+                                            ErrorCode::DeviceFailed,
+                                            "could not await the write's response lines; the bytes may already have reached the device",
+                                        )
+                                        .with_details(serde_json::json!({
+                                            "may_have_reached_device": true
+                                        })),
                                     }
                                 } else {
                                     // The worker sends the answer.

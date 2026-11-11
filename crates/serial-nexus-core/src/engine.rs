@@ -1536,6 +1536,21 @@ impl Engine {
         let mut seen = HashSet::new();
         for path in &params.devices {
             let identity = self.detected_device(path)?;
+            if let Some(device) = self
+                .state
+                .lock()
+                .expect("state lock")
+                .devices
+                .values()
+                .find(|device| device.path == identity.canonical)
+            {
+                if !device_matches_identity(device, &identity) {
+                    return Err(ErrorBody::new(
+                        ErrorCode::DeviceFailed,
+                        "an open instance at this path is a different device; close it first",
+                    ));
+                }
+            }
             if seen.insert(identity.canonical.clone()) {
                 identities.push(identity);
             }
@@ -1642,23 +1657,27 @@ impl Engine {
         for path in &params.devices {
             let identity = self.detected_device(path)?;
             let canonical = identity.canonical.clone();
-            session.check(identity.clone())?;
-            // A device already open when it is checked is authorized for this
-            // instance without reopening it.
-            if let Some(device) = self
-                .state
-                .lock()
-                .expect("state lock")
-                .devices
-                .values_mut()
-                .find(|device| device.path == canonical)
-            {
-                if device_matches_identity(device, &identity) {
-                    device.shared = Some(identity);
-                } else {
-                    session.revoke_path(&canonical);
-                }
+            let stale_open = {
+                let mut state = self.state.lock().expect("state lock");
+                state
+                    .devices
+                    .values_mut()
+                    .find(|device| device.path == canonical)
+                    .map(|device| {
+                        let matches = device_matches_identity(device, &identity);
+                        if matches {
+                            device.shared = Some(identity.clone());
+                        }
+                        !matches
+                    })
+            };
+            if stale_open == Some(true) {
+                return Err(ErrorBody::new(
+                    ErrorCode::DeviceFailed,
+                    "an open instance at this path is a different device; close it first",
+                ));
             }
+            session.check(identity)?;
         }
         Ok(ResponseData::Sharing(session.snapshot()))
     }
