@@ -708,9 +708,17 @@ pub fn open_serial_checked(
     .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
     // SAFETY: `open` just returned this descriptor and nothing else owns it.
     let file = unsafe { File::from_raw_fd(raw) };
-    // Validate the descriptor that was actually opened, before configuring it.
+    // Validate the descriptor that was actually opened against the node
+    // captured before the open, for every caller (including local-first
+    // opens), before configuring it.
+    if !current.same_open_file(file.as_raw_fd())? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{path} changed while it was opened; check it again"),
+        ));
+    }
     if let Some(expected) = expected {
-        if current.canonical != expected.canonical || !current.same_open_file(file.as_raw_fd())? {
+        if current.canonical != expected.canonical || current != *expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("{path} changed since it was checked; check it again"),

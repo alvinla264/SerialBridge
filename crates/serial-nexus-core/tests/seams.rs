@@ -142,6 +142,8 @@ fn an_enumerated_device_can_be_shared_and_opened_remotely_without_a_host_open() 
 }
 
 struct FakeState {
+    /// FakePort clones still alive; zero means both I/O threads exited.
+    live_ports: AtomicUsize,
     incoming: Mutex<VecDeque<u8>>,
     fail_reads: AtomicBool,
     block_writes: AtomicBool,
@@ -160,7 +162,14 @@ struct FakePort {
 
 impl FakePort {
     fn boxed(state: Arc<FakeState>) -> Box<dyn SerialPort> {
+        state.live_ports.fetch_add(1, Ordering::SeqCst);
         Box::new(FakePort { state })
+    }
+}
+
+impl Drop for FakePort {
+    fn drop(&mut self) {
+        self.state.live_ports.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -294,6 +303,7 @@ fn a_partial_serial_write_reports_uncertainty_and_is_never_replayed() {
     let device = SimulatedDevice::new();
     let owner = connect(&core.socket, ClientInfo::human("owner"));
     let state = Arc::new(FakeState {
+        live_ports: AtomicUsize::new(0),
         incoming: Mutex::new(VecDeque::new()),
         fail_reads: AtomicBool::new(false),
         block_writes: AtomicBool::new(false),
@@ -562,6 +572,7 @@ fn discovery_and_events_revalidate_a_stale_shared_identity() {
     });
     install_port_lister(Some(lister));
     let state = Arc::new(FakeState {
+        live_ports: AtomicUsize::new(0),
         incoming: Mutex::new(VecDeque::new()),
         fail_reads: AtomicBool::new(false),
         block_writes: AtomicBool::new(false),
@@ -677,6 +688,7 @@ fn a_failed_devices_stalled_writer_does_not_block_healthy_output() {
 
     let make_state = || {
         Arc::new(FakeState {
+            live_ports: AtomicUsize::new(0),
             incoming: Mutex::new(VecDeque::new()),
             fail_reads: AtomicBool::new(false),
             block_writes: AtomicBool::new(false),
@@ -764,6 +776,11 @@ fn a_failed_devices_stalled_writer_does_not_block_healthy_output() {
             .unwrap_or(false)
     });
     first_state.block_writes.store(false, Ordering::SeqCst);
+    // Both I/O threads drop their FakePort clones only after the cleanup
+    // thread joins the writer, i.e. after it has processed the whole queue.
+    wait_until(Duration::from_secs(3), || {
+        first_state.live_ports.load(Ordering::SeqCst) == 0
+    });
     let written =
         String::from_utf8_lossy(&first_state.written.lock().expect("written lock")).into_owned();
     assert!(

@@ -535,6 +535,11 @@ impl Engine {
                         .ok()
                         .filter(|identity| device_matches_identity(device, identity));
                     if remote && authorized.is_none() {
+                        let removed = state.devices.remove(&device_id);
+                        drop(state);
+                        if let Some(device) = removed {
+                            self.finish_devices(vec![device]);
+                        }
                         return Err(ErrorBody::new(
                             ErrorCode::DeviceFailed,
                             "device is no longer shared; check it again",
@@ -657,6 +662,11 @@ impl Engine {
                         .ok()
                         .filter(|identity| device_matches_identity(device, identity));
                     if remote && authorized.is_none() {
+                        let removed = state.devices.remove(&device_id);
+                        drop(state);
+                        if let Some(device) = removed {
+                            self.finish_devices(vec![device]);
+                        }
                         return Err(ErrorBody::new(
                             ErrorCode::DeviceFailed,
                             "device is no longer shared; check it again",

@@ -333,6 +333,11 @@ fixed with tests:
 - **A straddling remote write cannot enqueue after `device.shared` is
   cleared.** `begin_write` refuses remote writes when the shared marker is
   gone, closing the authorize-then-enqueue race with identity expiry.
+- **Local-first opens validate the opened descriptor too**, against the node
+  captured before the open, so the documented identity guarantee applies to
+  every open path.
+- **A refused post-insert remote open removes the just-opened device**, so no
+  zero-client instance is left holding the serial port.
 - **The failed-device revocation test waits for the writer to resume** before
   asserting the queued command was dropped.
 - Documentation no longer cites a removed firmware-echo unit test.
