@@ -163,10 +163,14 @@ installing them. They are test infrastructure, not a configuration surface.
 
 ## Final-round security fixes and tests
 
-The last independent review (head `c587b01`) confirmed three majors, all fixed
-after that round. Their tests are on the final branch but the fixes themselves
-have **not had another independent review**; the coordinator must assess them
-before merge.
+The last round-capped review (head `c587b01`) confirmed three majors, all fixed
+after that round. A further human-approved focused security review was run on
+`bda12ac` and confirmed three additional findings, all fixed after that review:
+a stop/enqueue race, unchecked-device discovery, and metadata-only oversized
+waited-write answers. The fixes are covered by the tests below, but the newest
+post-review code has not itself been independently re-reviewed; the
+coordinator must assess it before merge, and must repeat the board gate if the
+head changes.
 
 - **Remote list/event visibility of a replacement.** Discovery and event
   filtering now require the exact open device instance to have been authorized
@@ -191,6 +195,24 @@ before merge.
   contract; the incremental frame decoder buffers two complete frames so two
   valid pipelined frames are not mistaken for an oversized one (protocol unit
   test `two_pipelined_frames_are_not_mistaken_for_one_oversized_frame`).
+
+Findings fixed after the additional focused review:
+
+- **Stop/enqueue race.** `share_gate` (an `RwLock`) serializes stop/revocation
+  with remote write admission; a write admitted concurrently either queued
+  before the epoch bump (and is dropped) or waits and then sees the stopped
+  session. Test: `a_remote_write_cannot_be_admitted_after_stop_begins`.
+- **Unchecked-device discovery.** Open-device discovery now requires the
+  instance's share marker *and* current-session allowlist membership; uncheck
+  and every new/stopped session clear the markers. Tests:
+  `unchecked_and_new_session_devices_are_not_discoverable`.
+- **Metadata-only oversized write answers.** Waited-write trimming now budgets
+  the serialized response (binary-searching kept newest lines), so many empty
+  or short lines cannot turn a successful write into an error. Test:
+  `many_empty_waited_lines_keep_a_successful_write`.
+- **Seam replay observability.** The fake serial port now records every write
+  attempt, including failed ones, and the test asserts the exact
+  `write_all` remainder sequence with no later attempt.
 
 ## Test-only adapters
 

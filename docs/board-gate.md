@@ -92,5 +92,6 @@ remote access`, then `sharing stopped; local history ... lines`, and finally
 ## After the gate
 
 Record: gated SHA, LAN address/port used, board serial path, whether a probe
-was sent and its echo, and the test output. Then the coordinator performs the
-Conventional Commit squash merge. Do not merge before this gate passes.
+was sent and its echo, and the test output. The gate is tied to one exact SHA:
+if the head changes for any reason, repeat it. Then the coordinator performs
+the Conventional Commit squash merge. Do not merge before this gate passes.

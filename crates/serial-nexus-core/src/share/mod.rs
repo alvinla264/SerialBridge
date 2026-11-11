@@ -660,36 +660,38 @@ fn run_connection(
     Ok(())
 }
 
-/// Keep a successful waited-write answer inside one remote frame. Trimming a
-/// result must never turn "the bytes were written" into an error.
+/// Keep a successful waited-write answer inside one remote frame by trimming
+/// whole lines from the oldest end until the serialized response fits. The
+/// write outcome (`bytes_written`, `timed_out`) is never changed.
 fn fit_write_answer(
+    id: u64,
     mut result: serial_nexus_protocol::WriteResult,
 ) -> serial_nexus_protocol::WriteResult {
-    // JSON can escape every byte as six, so 8 KiB of text always fits a
-    // 64 KiB frame with room for the rest of the result.
-    const BUDGET: usize = 8 * 1024;
-    let mut kept = Vec::new();
-    let mut total = 0usize;
-    let mut truncated = false;
-    for mut line in result.lines.into_iter().rev() {
-        if line.text.len() > BUDGET {
-            let mut cut = BUDGET;
-            while cut > 0 && !line.text.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            line.text.truncate(cut);
-            truncated = true;
-        }
-        if !kept.is_empty() && total + line.text.len() > BUDGET {
-            truncated = true;
-            break;
-        }
-        total += line.text.len();
-        kept.push(line);
+    fn fits(id: u64, result: &serial_nexus_protocol::WriteResult) -> bool {
+        encode_frame(&ServerMessage::Response {
+            id,
+            result: ResponseData::Written(result.clone()),
+        })
+        .is_ok()
     }
-    kept.reverse();
-    result.lines = kept;
-    result.truncated |= truncated;
+    if fits(id, &result) {
+        return result;
+    }
+    let total = result.lines.len();
+    let mut low = 0usize;
+    let mut high = total;
+    while low < high {
+        let middle = (low + high).div_ceil(2);
+        let mut candidate = result.clone();
+        candidate.lines = result.lines[total - middle..].to_vec();
+        if fits(id, &candidate) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    result.lines = result.lines[total - low..].to_vec();
+    result.truncated = true;
     result
 }
 
@@ -769,7 +771,7 @@ fn handle_remote_request(
         other => engine.handle_remote(client_id, other),
     };
     let answer = answer.map(|result| match result {
-        ResponseData::Written(result) => ResponseData::Written(fit_write_answer(result)),
+        ResponseData::Written(result) => ResponseData::Written(fit_write_answer(id, result)),
         other => other,
     });
     let message = match answer {
@@ -797,7 +799,7 @@ fn spawn_write_wait(
                     // Trim a large successful write answer so it always fits a
                     // remote frame; the write itself already happened.
                     ResponseData::Written(written) => {
-                        ResponseData::Written(fit_write_answer(written))
+                        ResponseData::Written(fit_write_answer(id, written))
                     }
                     other => other,
                 });

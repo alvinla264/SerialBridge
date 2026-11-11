@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
@@ -153,6 +153,9 @@ pub struct Engine {
     shutdown_tx: Sender<String>,
     shutting_down: AtomicBool,
     sharing: Mutex<Option<Arc<SharingSession>>>,
+    /// Serializes sharing stop/revocation with remote write admission, so no
+    /// remote write can obtain a post-revocation epoch and execute after stop.
+    share_gate: RwLock<()>,
 }
 
 impl Engine {
@@ -176,6 +179,7 @@ impl Engine {
             shutdown_tx,
             shutting_down: AtomicBool::new(false),
             sharing: Mutex::new(None),
+            share_gate: RwLock::new(()),
         })
     }
 
@@ -1214,6 +1218,15 @@ impl Engine {
 
     // ---- LAN sharing ------------------------------------------------------
 
+    /// Forget every share authorization marker; a device must be authorized by
+    /// the current session before remote clients can see or use it.
+    fn clear_shared_instances(&self) {
+        let mut state = self.state.lock().expect("state lock");
+        for device in state.devices.values_mut() {
+            device.shared = None;
+        }
+    }
+
     /// Mark already-open engine devices whose path is checked, so their events
     /// and discovery entries are visible to remote clients.
     fn refresh_shared_instances(&self, session: &SharingSession) {
@@ -1339,8 +1352,8 @@ impl Engine {
             ));
         }
         drop(guard);
-        // Devices opened before sharing started are authorized for this
-        // instance now that the allowlist exists.
+        // Only the new session's checked devices may be visible.
+        self.clear_shared_instances();
         self.refresh_shared_instances(&prepared.session);
         Ok(ResponseData::ShareStarted(prepared.info))
     }
@@ -1348,13 +1361,18 @@ impl Engine {
     /// Stop sharing: close the listener, disconnect every remote client and
     /// revoke the session's credentials.
     pub fn stop_sharing(&self) {
+        // Hold the gate while revoking and stopping: a remote write admitted
+        // concurrently either queued before the bump (and is dropped) or waits
+        // here and then sees the stopped session.
+        let _gate = self.share_gate.write().expect("share gate");
         // Queued, not-yet-started remote writes must not run after sharing
-        // stops; bump every remote client's generation before disconnecting.
+        // stops; bump every device's remote generation before disconnecting.
         self.revoke_remote_writes();
         let session = self.sharing.lock().expect("sharing lock").take();
         if let Some(session) = session {
             session.stop();
         }
+        self.clear_shared_instances();
     }
 
     fn revoke_remote_writes(&self) {
@@ -1424,10 +1442,11 @@ impl Engine {
                 // Invalidate queued remote writes for this device even when
                 // their client has already detached.
                 {
-                    let state = self.state.lock().expect("state lock");
+                    let mut state = self.state.lock().expect("state lock");
                     for device_id in &device_ids {
-                        if let Some(device) = state.devices.get(device_id) {
+                        if let Some(device) = state.devices.get_mut(device_id) {
                             device.write_epoch.fetch_add(1, Ordering::SeqCst);
+                            device.shared = None;
                         }
                     }
                 }
@@ -1522,7 +1541,9 @@ impl Engine {
                         .expect("state lock")
                         .devices
                         .get(&device_id)
-                        .is_some_and(|open| open.shared.is_some()),
+                        .is_some_and(|open| {
+                            open.shared.is_some() && session.allows_path(&open.path)
+                        }),
                     None => session.authorize(&device.path).is_ok(),
                 });
                 Ok(ResponseData::Devices(devices))
@@ -1576,6 +1597,8 @@ impl Engine {
         client_id: u64,
         params: WriteParams,
     ) -> Result<WriteStart, ErrorBody> {
+        // The sharing gate keeps admission atomic with stop/revocation.
+        let _gate = self.share_gate.read().expect("share gate");
         let Some(session) = self.remote_scope(client_id) else {
             return Err(ErrorBody::new(
                 ErrorCode::PermissionDenied,

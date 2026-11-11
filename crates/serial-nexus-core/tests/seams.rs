@@ -142,6 +142,9 @@ fn an_enumerated_device_can_be_shared_and_opened_remotely_without_a_host_open() 
 
 struct FakeState {
     written: Mutex<Vec<u8>>,
+    /// Every buffer passed to `write`, including calls that then fail, so a
+    /// replay attempt is visible even when it writes nothing.
+    attempts: Mutex<Vec<Vec<u8>>>,
     writes: AtomicUsize,
     fail_after: usize,
     baud: u32,
@@ -166,6 +169,11 @@ impl Read for FakePort {
 
 impl Write for FakePort {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.state
+            .attempts
+            .lock()
+            .expect("attempts lock")
+            .push(buffer.to_vec());
         let mut written = self.state.written.lock().expect("written lock");
         let room = self.state.fail_after.saturating_sub(written.len());
         if room == 0 {
@@ -268,6 +276,7 @@ fn a_partial_serial_write_reports_uncertainty_and_is_never_replayed() {
     let owner = connect(&core.socket, ClientInfo::human("owner"));
     let state = Arc::new(FakeState {
         written: Mutex::new(Vec::new()),
+        attempts: Mutex::new(Vec::new()),
         writes: AtomicUsize::new(0),
         fail_after: 4,
         baud: 115_200,
@@ -315,13 +324,198 @@ fn a_partial_serial_write_reports_uncertainty_and_is_never_replayed() {
         "the failure must report uncertainty: {error}"
     );
 
-    // Exactly the prefix left the client once; nothing was replayed.
+    // Exactly the prefix left the client once; nothing was replayed. The
+    // attempts list proves no second write attempt happened either.
     let written = state.written.lock().expect("written lock").clone();
     assert_eq!(written, b"PART", "written bytes: {written:?}");
     assert_eq!(state.writes.load(Ordering::SeqCst), 1);
+    let attempts = state.attempts.lock().expect("attempts lock").clone();
+    assert_eq!(
+        attempts,
+        vec![payload.to_vec(), payload[4..].to_vec()],
+        "write_all's remainder call is the only other attempt"
+    );
 
     // A non-waited write cannot claim success after the device failed.
     let late = remote.write_bytes(opened.device_id, b"late", None);
     assert!(late.is_err(), "a failed device must not accept more writes");
+    let attempts_after = state.attempts.lock().expect("attempts lock").clone();
+    assert_eq!(
+        attempts_after, attempts,
+        "a refused write must not reach the serial writer"
+    );
+    install_serial_factory(None);
+}
+
+#[test]
+fn a_remote_write_cannot_be_admitted_after_stop_begins() {
+    // A concurrent stop and remote write must not let the write execute after
+    // stop returns. The engine holds its state lock while the serial factory
+    // below sleeps, which widens the stop/enqueue window deterministically.
+    let _guard = seam_lock().lock().expect("seam lock");
+
+    struct SlowPort {
+        writes: Arc<Mutex<Vec<u8>>>,
+        baud: u32,
+    }
+    impl std::io::Read for SlowPort {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(Duration::from_millis(5));
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+        }
+    }
+    impl std::io::Write for SlowPort {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.writes
+                .lock()
+                .expect("writes lock")
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl SerialPort for SlowPort {
+        fn name(&self) -> Option<String> {
+            Some("slow".into())
+        }
+        fn baud_rate(&self) -> serialport::Result<u32> {
+            Ok(self.baud)
+        }
+        fn data_bits(&self) -> serialport::Result<DataBits> {
+            Ok(DataBits::Eight)
+        }
+        fn flow_control(&self) -> serialport::Result<FlowControl> {
+            Ok(FlowControl::None)
+        }
+        fn parity(&self) -> serialport::Result<Parity> {
+            Ok(Parity::None)
+        }
+        fn stop_bits(&self) -> serialport::Result<StopBits> {
+            Ok(StopBits::One)
+        }
+        fn timeout(&self) -> Duration {
+            Duration::from_millis(50)
+        }
+        fn set_baud_rate(&mut self, _baud: u32) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn set_data_bits(&mut self, _bits: DataBits) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn set_flow_control(&mut self, _flow: FlowControl) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn set_parity(&mut self, _parity: Parity) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn set_stop_bits(&mut self, _bits: StopBits) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn set_timeout(&mut self, _timeout: Duration) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn write_request_to_send(&mut self, _level: bool) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn write_data_terminal_ready(&mut self, _level: bool) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn read_clear_to_send(&mut self) -> serialport::Result<bool> {
+            Ok(false)
+        }
+        fn read_data_set_ready(&mut self) -> serialport::Result<bool> {
+            Ok(false)
+        }
+        fn read_ring_indicator(&mut self) -> serialport::Result<bool> {
+            Ok(false)
+        }
+        fn read_carrier_detect(&mut self) -> serialport::Result<bool> {
+            Ok(false)
+        }
+        fn bytes_to_read(&self) -> serialport::Result<u32> {
+            Ok(0)
+        }
+        fn bytes_to_write(&self) -> serialport::Result<u32> {
+            Ok(0)
+        }
+        fn clear(&self, _buffer: ClearBuffer) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn try_clone(&self) -> serialport::Result<Box<dyn SerialPort>> {
+            Ok(Box::new(SlowPort {
+                writes: Arc::clone(&self.writes),
+                baud: self.baud,
+            }))
+        }
+        fn set_break(&self) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn clear_break(&self) -> serialport::Result<()> {
+            Ok(())
+        }
+    }
+
+    let core = core();
+    let owner = connect(&core.socket, ClientInfo::human("owner"));
+    let shared = SimulatedDevice::new();
+    let blocker = SimulatedDevice::new();
+    let writes: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let writes_for_factory = Arc::clone(&writes);
+    let block_path = blocker.path.clone();
+    let factory: Arc<serial_nexus_core::device::SerialFactory> = Arc::new(move |path, baud| {
+        if path == block_path {
+            // Open holds the engine state lock; sleeping here widens the
+            // window between stop's epoch bump and its session teardown.
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        Ok(Box::new(SlowPort {
+            writes: Arc::clone(&writes_for_factory),
+            baud,
+        }))
+    });
+    install_serial_factory(Some(factory));
+
+    owner
+        .open(&shared.path, Some(115_200), false)
+        .expect("open shared");
+    let info = owner
+        .start_sharing(bind(), vec![shared.path.clone()])
+        .expect("start");
+    let human = RemoteClient::connect(
+        &info.host,
+        &info.human,
+        Some("race-remote".into()),
+        Duration::from_secs(5),
+    )
+    .expect("pair");
+    let opened = human.open(&shared.path, None, false).expect("open");
+
+    // Hold the engine state lock by opening the blocker device.
+    let blocker_client = connect(&core.socket, ClientInfo::human("blocker"));
+    let blocker_path = blocker.path.clone();
+    let opening = std::thread::spawn(move || {
+        blocker_client
+            .open(&blocker_path, Some(115_200), false)
+            .ok();
+        blocker_client
+    });
+    std::thread::sleep(Duration::from_millis(60));
+
+    let stop_thread = std::thread::spawn(move || owner.stop_sharing());
+    std::thread::sleep(Duration::from_millis(60));
+    let result = human.write_bytes(opened.device_id, b"AFTER-REVOKE", None);
+    let stop_result = stop_thread.join().expect("stop thread");
+    let _blocker_client = opening.join().expect("opening thread");
+    assert!(stop_result.is_ok(), "stop itself must succeed");
+    assert!(
+        result.is_err(),
+        "a write admitted after stop began must be refused"
+    );
+    assert!(
+        !String::from_utf8_lossy(&writes.lock().expect("writes lock")).contains("AFTER-REVOKE"),
+        "a revoked remote write reached the device"
+    );
     install_serial_factory(None);
 }
