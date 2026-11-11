@@ -404,6 +404,17 @@ impl SharingSession {
         }
     }
 
+    /// Mark a path vacated when an expired instance with attached remotes is
+    /// being announced; unlike `mark_vacated`, the entry may already be
+    /// expired because authorization detected the change first.
+    pub fn mark_vacated_attached(&self, path: &str) {
+        self.state
+            .lock()
+            .expect("share state lock")
+            .vacated
+            .insert(path.to_string());
+    }
+
     /// True only for a path whose shared device just closed.
     pub fn is_vacated(&self, path: &str) -> bool {
         self.state

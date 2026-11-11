@@ -327,6 +327,16 @@ fixed with tests:
   PTY-recycling replacement test is `#[ignore]`d because path reuse is not
   guaranteed, with deterministic regular-file identity tests in its place.
 
+### Fourteenth iterative review fixes
+
+- **ShareStatus expiry also bumps epochs in the draining-device registry**, so
+  queued remote writes on a device already removed from the open map are
+  dropped.
+- **A failed wait outcome racing the timeout is returned as uncertainty**, not
+  converted into a successful timed-out write.
+- **Expiry announced for an already-expired entry with attached remotes uses a
+  forced vacated mark**, so `DeviceClosed` actually reaches those remotes.
+
 ### Thirteenth iterative review fixes
 
 - **Owner status expiry revokes queued remote work.** `ShareStatus` expiration

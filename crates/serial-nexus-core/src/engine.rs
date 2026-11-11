@@ -1095,6 +1095,16 @@ impl Engine {
                 // keep its lines rather than losing them, but honor a failure.
                 let mut lines = match rx.try_recv() {
                     Ok(outcome) if outcome.failed.is_none() => outcome.lines,
+                    Ok(outcome) => {
+                        return Err(ErrorBody::new(
+                            ErrorCode::DeviceFailed,
+                            format!(
+                                "the write wait failed: {}; the bytes may already have reached the device and are not replayed",
+                                outcome.failed.unwrap_or_default()
+                            ),
+                        )
+                        .with_details(serde_json::json!({ "may_have_reached_device": true })));
+                    }
                     _ => self.remove_waiter(device_id, waiter_id),
                 };
                 if let Some(tail) = self.snapshot_tail(device_id) {
@@ -1758,6 +1768,14 @@ impl Engine {
                     for id in ids {
                         self.revalidate_shared_instance(id, &session);
                     }
+                    // The device may already be out of the open map but still
+                    // draining in the live-writes registry.
+                    let live = self.live_writes.lock().expect("live writes lock");
+                    for (registered, epoch) in live.values() {
+                        if *registered == path {
+                            epoch.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
                 }
                 Ok(ResponseData::Sharing(session.snapshot()))
             }
@@ -1828,7 +1846,7 @@ impl Engine {
                     .any(|client| remote_ids.contains(client));
                 let path = device.path.clone();
                 if had_remote {
-                    session.mark_vacated(&path);
+                    session.mark_vacated_attached(&path);
                 }
                 device.shared = None;
                 device.write_epoch.fetch_add(1, Ordering::SeqCst);
