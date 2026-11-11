@@ -878,3 +878,28 @@ fn an_ipv6_endpoint_is_reached_with_the_same_pair() {
     assert!(!sent.is_error, "{}", sent.text);
     assert_eq!(device.read_n(2, Duration::from_secs(5)), b"V6");
 }
+
+#[test]
+fn a_fifo_in_place_of_the_pairing_file_is_refused_without_blocking() {
+    use nix::sys::stat::Mode;
+    let host = SharedHost::start(&[]);
+    let (address, port) = host.endpoint();
+    let peers = host.directory.path().join("mcp-peers.json");
+    nix::unistd::mkfifo(&peers, Mode::from_bits_truncate(0o600)).expect("mkfifo");
+    let mut session = spawn(&host.socket, &peers);
+
+    // A blocking open would wait for a writer forever; the tool call must
+    // answer, and the next request on the same session must also answer.
+    let reply = session.call_tool(
+        "list_devices",
+        json!({ "ip": address.to_string(), "port": port }),
+    );
+    assert!(reply.is_error, "{}", reply.text);
+    assert!(
+        reply.text.contains("regular file") || reply.text.contains("symbolic"),
+        "{}",
+        reply.text
+    );
+    let ping = session.request("ping", json!({}));
+    assert!(ping.get("result").is_some(), "{ping}");
+}

@@ -309,7 +309,9 @@ fn open_private(path: &Path) -> Result<File, PeerError> {
     use std::os::unix::fs::OpenOptionsExt;
     match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        // Nonblocking so a FIFO planted at this path cannot stall the caller;
+        // anything but a regular file is rejected next, before any read.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(file) => Ok(file),
