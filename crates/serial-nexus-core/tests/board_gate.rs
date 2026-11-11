@@ -28,6 +28,16 @@ fn env(name: &str) -> Option<String> {
 
 /// Device-sourced lines containing `needle`; human writes and AI writes never
 /// count as a firmware echo.
+/// A fresh echo requires more device-sourced occurrences than existed before
+/// the probe; old output and the probe's own human write never count.
+fn echo_is_fresh(
+    before: usize,
+    lines: &[serial_nexus_protocol::HistoryLine],
+    expected: &str,
+) -> bool {
+    occurrences(lines, expected) > before
+}
+
 fn occurrences(lines: &[serial_nexus_protocol::HistoryLine], needle: &str) -> usize {
     lines
         .iter()
@@ -188,7 +198,7 @@ fn board_gate_over_real_lan() {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {
                 let read = human.read(opened.device_id, Some(2_000)).expect("re-read");
-                if occurrences(&read.lines, expected) > before {
+                if echo_is_fresh(before, &read.lines, expected) {
                     eprintln!("    firmware echoed {expected:?}");
                     break;
                 }

@@ -80,8 +80,9 @@ path as a real serial port and the test drives the master. Covered end to end:
   read/write/status/close and on events, role from credential (AI role spoofing
   refused, one AI controller across local and remote, humans writing beside it),
   loopback IPv4 and IPv6 where available, host certificate pinning and wrong-CA
-  refusal, wrong credentials, oversized frames, handshake deadline, connection
-  and pending-write limits, bind failure leaving sharing off, unchecking
+  refusal, wrong credentials, oversized frames, stalled TLS handshake deadline,
+  unauthenticated handshake connection slots, waited-write admission limits,
+  bind failure leaving sharing off, unchecking
   revoking access and failing pending work while local and other devices keep
   working, owner loss stopping the listener and revoking credentials, stopping
   during a waited write without replay, path replacement not inheriting

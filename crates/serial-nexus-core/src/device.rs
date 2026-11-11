@@ -1,3 +1,4 @@
+use std::fs::File;
 use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -8,6 +9,175 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, Sender};
 use serial_nexus_protocol::Source;
 use serialport::{DataBits, FlowControl, Parity, StopBits};
+
+/// A serial port opened and validated by this crate.
+///
+/// `serialport` is kept for the `SerialPort` interface, but opening and
+/// configuration are done here so the descriptor's identity is known before
+/// termios is touched.
+struct PosixSerial {
+    file: File,
+    baud: u32,
+    timeout: Duration,
+}
+
+impl PosixSerial {
+    fn wait(&self, events: nix::poll::PollFlags, timeout: Duration) -> io::Result<()> {
+        use nix::poll::{poll, PollFd, PollTimeout};
+        // SAFETY: the descriptor is owned by `self` for this call.
+        let fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(self.file.as_raw_fd()) };
+        let mut fds = [PollFd::new(fd, events)];
+        let millis = timeout.as_millis().min(u16::MAX as u128) as u16;
+        match poll(&mut fds, PollTimeout::from(millis)) {
+            Ok(0) => Err(io::Error::from(io::ErrorKind::TimedOut)),
+            Ok(_) => Ok(()),
+            Err(nix::errno::Errno::EINTR) => Ok(()),
+            Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
+        }
+    }
+}
+
+impl io::Read for PosixSerial {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.wait(nix::poll::PollFlags::POLLIN, self.timeout)?;
+        match self.file.read(buffer) {
+            Ok(read) => Ok(read),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Err(io::Error::from(io::ErrorKind::TimedOut))
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl io::Write for PosixSerial {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+        // The writer thread owns this call: wait for room instead of failing a
+        // slow device, matching the previous blocking serial behaviour.
+        loop {
+            // SAFETY: the descriptor is owned by `self` for this call.
+            let fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(self.file.as_raw_fd()) };
+            let mut fds = [PollFd::new(fd, PollFlags::POLLOUT)];
+            match poll(&mut fds, PollTimeout::from(50u16)) {
+                Ok(0) => continue,
+                Ok(_) => {
+                    let flags = fds[0].revents().unwrap_or(PollFlags::empty());
+                    if flags
+                        .intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
+                        && !flags.contains(PollFlags::POLLOUT)
+                    {
+                        return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+                    }
+                }
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
+            }
+            match self.file.write(buffer) {
+                Ok(written) => return Ok(written),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl serialport::SerialPort for PosixSerial {
+    fn name(&self) -> Option<String> {
+        None
+    }
+    fn baud_rate(&self) -> serialport::Result<u32> {
+        Ok(self.baud)
+    }
+    fn data_bits(&self) -> serialport::Result<DataBits> {
+        Ok(DataBits::Eight)
+    }
+    fn flow_control(&self) -> serialport::Result<FlowControl> {
+        Ok(FlowControl::None)
+    }
+    fn parity(&self) -> serialport::Result<Parity> {
+        Ok(Parity::None)
+    }
+    fn stop_bits(&self) -> serialport::Result<StopBits> {
+        Ok(StopBits::One)
+    }
+    fn timeout(&self) -> Duration {
+        self.timeout
+    }
+    fn set_baud_rate(&mut self, baud: u32) -> serialport::Result<()> {
+        self.baud = baud;
+        Ok(())
+    }
+    fn set_data_bits(&mut self, _bits: DataBits) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn set_flow_control(&mut self, _flow: FlowControl) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn set_parity(&mut self, _parity: Parity) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn set_stop_bits(&mut self, _bits: StopBits) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn set_timeout(&mut self, timeout: Duration) -> serialport::Result<()> {
+        self.timeout = timeout;
+        Ok(())
+    }
+    fn write_request_to_send(&mut self, _level: bool) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn write_data_terminal_ready(&mut self, _level: bool) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn read_clear_to_send(&mut self) -> serialport::Result<bool> {
+        Ok(false)
+    }
+    fn read_data_set_ready(&mut self) -> serialport::Result<bool> {
+        Ok(false)
+    }
+    fn read_ring_indicator(&mut self) -> serialport::Result<bool> {
+        Ok(false)
+    }
+    fn read_carrier_detect(&mut self) -> serialport::Result<bool> {
+        Ok(false)
+    }
+    fn bytes_to_read(&self) -> serialport::Result<u32> {
+        Ok(0)
+    }
+    fn bytes_to_write(&self) -> serialport::Result<u32> {
+        Ok(0)
+    }
+    fn clear(&self, _buffer: serialport::ClearBuffer) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn try_clone(&self) -> serialport::Result<Box<dyn serialport::SerialPort>> {
+        let fd = nix::unistd::dup(self.file.as_raw_fd()).map_err(|error| {
+            serialport::Error::new(
+                serialport::ErrorKind::Io(io::ErrorKind::Other),
+                error.to_string(),
+            )
+        })?;
+        // SAFETY: `dup` returned a new owned descriptor.
+        let file = unsafe { File::from_raw_fd(fd) };
+        Ok(Box::new(PosixSerial {
+            file,
+            baud: self.baud,
+            timeout: self.timeout,
+        }))
+    }
+    fn set_break(&self) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn clear_break(&self) -> serialport::Result<()> {
+        Ok(())
+    }
+}
 
 /// Events a device's I/O threads send to the engine.
 #[derive(Debug)]
@@ -161,6 +331,68 @@ pub struct OpenedSerial {
     pub identity: DeviceIdentity,
 }
 
+/// The kernel baud rates this core supports.
+fn baud_rate(baud: u32) -> Option<nix::sys::termios::BaudRate> {
+    use nix::sys::termios::BaudRate;
+    Some(match baud {
+        50 => BaudRate::B50,
+        75 => BaudRate::B75,
+        110 => BaudRate::B110,
+        134 => BaudRate::B134,
+        150 => BaudRate::B150,
+        200 => BaudRate::B200,
+        300 => BaudRate::B300,
+        600 => BaudRate::B600,
+        1_200 => BaudRate::B1200,
+        1_800 => BaudRate::B1800,
+        2_400 => BaudRate::B2400,
+        4_800 => BaudRate::B4800,
+        9_600 => BaudRate::B9600,
+        19_200 => BaudRate::B19200,
+        38_400 => BaudRate::B38400,
+        57_600 => BaudRate::B57600,
+        115_200 => BaudRate::B115200,
+        230_400 => BaudRate::B230400,
+        460_800 => BaudRate::B460800,
+        500_000 => BaudRate::B500000,
+        576_000 => BaudRate::B576000,
+        921_600 => BaudRate::B921600,
+        1_000_000 => BaudRate::B1000000,
+        1_152_000 => BaudRate::B1152000,
+        1_500_000 => BaudRate::B1500000,
+        2_000_000 => BaudRate::B2000000,
+        2_500_000 => BaudRate::B2500000,
+        3_000_000 => BaudRate::B3000000,
+        3_500_000 => BaudRate::B3500000,
+        4_000_000 => BaudRate::B4000000,
+        _ => return None,
+    })
+}
+
+/// Apply the fixed 8N1 framing to an already-open, already-validated fd.
+fn configure_termios(file: &File, baud: u32) -> io::Result<()> {
+    use nix::sys::termios::{
+        cfmakeraw, cfsetispeed, cfsetospeed, tcgetattr, tcsetattr, ControlFlags, SetArg,
+    };
+    let mut settings =
+        tcgetattr(file).map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+    cfmakeraw(&mut settings);
+    settings
+        .control_flags
+        .insert(ControlFlags::CLOCAL | ControlFlags::CREAD);
+    let rate = baud_rate(baud).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported baud rate {baud}"),
+        )
+    })?;
+    cfsetispeed(&mut settings, rate).map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+    cfsetospeed(&mut settings, rate).map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+    tcsetattr(file, SetArg::TCSANOW, &settings)
+        .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+    Ok(())
+}
+
 /// Open a serial port with the first version's fixed framing: 8N1, no flow
 /// control, configurable baud, short read timeout so threads can stop.
 pub fn open_serial(path: &str, baud: u32) -> io::Result<OpenedSerial> {
@@ -201,25 +433,32 @@ pub fn open_serial_checked(
             ));
         }
     }
-    let builder = serialport::new(path, baud)
-        .data_bits(DataBits::Eight)
-        .parity(Parity::None)
-        .stop_bits(StopBits::One)
-        .flow_control(FlowControl::None)
-        .timeout(Duration::from_millis(50));
-    let port = serialport::TTYPort::open(&builder)?;
+    let raw = nix::fcntl::open(
+        path,
+        nix::fcntl::OFlag::O_RDWR
+            | nix::fcntl::OFlag::O_NOCTTY
+            | nix::fcntl::OFlag::O_NONBLOCK
+            | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+    // SAFETY: `open` just returned this descriptor and nothing else owns it.
+    let file = unsafe { File::from_raw_fd(raw) };
+    // Validate the descriptor that was actually opened, before configuring it.
     if let Some(expected) = expected {
-        let same = expected.same_open_file(port.as_raw_fd())?;
-        // Also require the canonical path to still name this node, so a
-        // retargeted symlink cannot keep an authorization alive.
-        let path_still_same = expected.still_valid();
-        if !same || !path_still_same {
+        if current.canonical != expected.canonical || !current.same_open_file(file.as_raw_fd())? {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("{path} changed since it was checked; check it again"),
             ));
         }
     }
+    configure_termios(&file, baud)?;
+    let port = PosixSerial {
+        file,
+        baud,
+        timeout: Duration::from_millis(50),
+    };
     if let Some(factory) = SERIAL_FACTORY.lock().expect("serial factory lock").clone() {
         drop(port);
         let port = factory(path, baud)?;

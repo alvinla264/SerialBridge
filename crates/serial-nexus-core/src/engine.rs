@@ -29,6 +29,7 @@ pub enum WriteStart {
 /// lines. Safe to move to another thread.
 pub struct PendingWrite {
     device_id: u64,
+    client_id: u64,
     waiter_id: u64,
     rx: Receiver<WaitOutcome>,
     timeout: Duration,
@@ -158,6 +159,10 @@ pub struct Engine {
     /// Serializes sharing stop/revocation with remote write admission, so no
     /// remote write can obtain a post-revocation epoch and execute after stop.
     share_gate: RwLock<()>,
+    /// Write generations of every device whose writer is still draining,
+    /// keyed by device id with its canonical path. Kept until the I/O threads
+    /// exit so revocation also reaches a device that already left the state.
+    live_writes: Mutex<HashMap<u64, (String, device::WriteEpoch)>>,
 }
 
 impl Engine {
@@ -182,6 +187,7 @@ impl Engine {
             shutting_down: AtomicBool::new(false),
             sharing: Mutex::new(None),
             share_gate: RwLock::new(()),
+            live_writes: Mutex::new(HashMap::new()),
         })
     }
 
@@ -344,7 +350,7 @@ impl Engine {
         }
         drop(state);
         // Release the serial handles before anyone is told the device closed.
-        join_devices(removed);
+        self.finish_devices(removed);
         self.emit(events);
     }
 
@@ -600,6 +606,10 @@ impl Engine {
                         .filter(|allowed| *allowed == identity),
                     None => None,
                 };
+                self.live_writes
+                    .lock()
+                    .expect("live writes lock")
+                    .insert(device_id, (port.clone(), Arc::clone(&write_epoch)));
                 let device = Device {
                     id: device_id,
                     path: port,
@@ -731,7 +741,7 @@ impl Engine {
         }
         drop(state);
         if let Some(device) = removed {
-            join_devices(vec![device]);
+            self.finish_devices(vec![device]);
         }
         self.emit(events);
         Ok(ResponseData::Closed)
@@ -925,6 +935,7 @@ impl Engine {
             })),
             Some((waiter_id, rx, timeout, _after_seq)) => Ok(WriteStart::Pending(PendingWrite {
                 device_id,
+                client_id,
                 waiter_id,
                 rx,
                 timeout,
@@ -937,6 +948,7 @@ impl Engine {
     pub fn finish_write(&self, pending: PendingWrite) -> Result<WriteResult, ErrorBody> {
         let PendingWrite {
             device_id,
+            client_id,
             waiter_id,
             rx,
             timeout,
@@ -961,11 +973,23 @@ impl Engine {
             )
             .with_details(serde_json::json!({ "may_have_reached_device": true }))),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                // The client must still be authorized before any output is
+                // returned; revocation may have happened while this wait was
+                // finishing.
+                if !self.remote_write_still_authorized(client_id, device_id) {
+                    return Err(ErrorBody::new(
+                        ErrorCode::DeviceFailed,
+                        format!(
+                            "device {device_id} is no longer shared; the bytes may already have reached it and were not replayed"
+                        ),
+                    )
+                    .with_details(serde_json::json!({ "may_have_reached_device": true })));
+                }
                 // A waiter may have completed in the gap before the timeout;
-                // keep its lines rather than losing them.
+                // keep its lines rather than losing them, but honor a failure.
                 let mut lines = match rx.try_recv() {
-                    Ok(outcome) => outcome.lines,
-                    Err(_) => self.remove_waiter(device_id, waiter_id),
+                    Ok(outcome) if outcome.failed.is_none() => outcome.lines,
+                    _ => self.remove_waiter(device_id, waiter_id),
                 };
                 if let Some(tail) = self.snapshot_tail(device_id) {
                     lines.push(HistoryLine {
@@ -992,6 +1016,19 @@ impl Engine {
                 })
             }
         }
+    }
+
+    /// True only for an authenticated remote client whose device is still
+    /// checked and whose instance identity is valid.
+    fn remote_write_still_authorized(&self, client_id: u64, device_id: u64) -> bool {
+        let Some(session) = self.remote_scope(client_id) else {
+            // Local writes have no session scope and are not revoked this way.
+            return true;
+        };
+        if session.is_stopped() {
+            return false;
+        }
+        self.revalidate_shared_instance(device_id, &session)
     }
 
     fn status(&self, client_id: u64, device_id: u64) -> Result<ResponseData, ErrorBody> {
@@ -1130,7 +1167,7 @@ impl Engine {
         };
         let path = removed.as_ref().map(|device| device.path.clone());
         if let Some(device) = removed {
-            join_devices(vec![device]);
+            self.finish_devices(vec![device]);
         }
         // Tell clients (including remote ones) first: the vacated mark still
         // names the path, so a shared device's failure is reported rather than
@@ -1249,7 +1286,7 @@ impl Engine {
                 }
             }
         }
-        join_devices(removed);
+        self.finish_devices(removed);
         events.push(Event::CoreShutdown {
             reason: reason.to_string(),
         });
@@ -1423,7 +1460,14 @@ impl Engine {
     }
 
     fn revoke_remote_writes(&self) {
+        // Lock order is state then live_writes, matching device creation.
         let state = self.state.lock().expect("state lock");
+        // Includes devices whose last client detached and whose writer is
+        // still draining accepted commands.
+        let live = self.live_writes.lock().expect("live writes lock");
+        for (_, epoch) in live.values().map(|(_, epoch)| ((), epoch)) {
+            epoch.fetch_add(1, Ordering::SeqCst);
+        }
         for device in state.devices.values() {
             device.write_epoch.fetch_add(1, Ordering::SeqCst);
         }
@@ -1494,6 +1538,12 @@ impl Engine {
                 // their client has already detached.
                 {
                     let mut state = self.state.lock().expect("state lock");
+                    let live = self.live_writes.lock().expect("live writes lock");
+                    for (path, epoch) in live.values().map(|(path, epoch)| (path, epoch)) {
+                        if *path == identity.canonical {
+                            epoch.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
                     for device_id in &device_ids {
                         if let Some(device) = state.devices.get_mut(device_id) {
                             device.write_epoch.fetch_add(1, Ordering::SeqCst);
@@ -1786,7 +1836,7 @@ impl Engine {
                 }
             }
         }
-        join_devices(removed);
+        self.finish_devices(removed);
         self.emit(events);
     }
 
@@ -2054,6 +2104,19 @@ fn take_device_locked(
         reason: reason.to_string(),
     });
     Some(device)
+}
+
+impl Engine {
+    /// Join I/O threads outside the engine lock, then drop their write
+    /// generations from the revocation registry.
+    fn finish_devices(&self, devices: Vec<Device>) {
+        let ids: Vec<u64> = devices.iter().map(|device| device.id).collect();
+        join_devices(devices);
+        let mut live = self.live_writes.lock().expect("live writes lock");
+        for id in ids {
+            live.remove(&id);
+        }
+    }
 }
 
 /// Join I/O threads outside the engine lock.

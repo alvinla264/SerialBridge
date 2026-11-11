@@ -615,6 +615,9 @@ fn run_connection(
     let Some(role) = session.credential_role(&auth.credential) else {
         return Err(());
     };
+    if session.is_stopped() {
+        return Err(());
+    }
     let kind = match role {
         PairingRole::Human => ClientKind::Human,
         PairingRole::Ai => ClientKind::Ai,
@@ -751,10 +754,10 @@ fn handle_remote_request(
     let request = message.0.request;
     let answer = match request {
         serial_nexus_protocol::Request::Write(params) => {
-            // Refuse before queueing when this connection already has the
-            // maximum number of waits, so no bytes are accepted and then
-            // dropped on the floor.
-            if pending_writes.load(Ordering::SeqCst) >= session.max_pending_writes() {
+            // The limit applies only to requests that actually create a
+            // waiter; a non-waited write never consumes a wait slot.
+            let waits = params.wait.as_ref().is_some_and(|wait| wait.lines > 0);
+            if waits && pending_writes.load(Ordering::SeqCst) >= session.max_pending_writes() {
                 Err(ErrorBody::new(
                     ErrorCode::LimitExceeded,
                     format!(

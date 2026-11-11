@@ -169,6 +169,7 @@ impl RemoteClient {
                         connection,
                         tcp,
                         outgoing_rx,
+                        decoder,
                         pending,
                         subscribers,
                         connected,
@@ -366,11 +367,11 @@ fn connection_loop(
     mut connection: rustls::Connection,
     mut tcp: TcpStream,
     outgoing: Receiver<Vec<u8>>,
+    mut decoder: FrameDecoder,
     pending: PendingMap,
     subscribers: Arc<Mutex<Vec<Sender<Event>>>>,
     connected: Arc<AtomicBool>,
 ) {
-    let mut decoder = FrameDecoder::new();
     loop {
         while let Ok(frame) = outgoing.try_recv() {
             let deadline = Instant::now() + Duration::from_secs(30);

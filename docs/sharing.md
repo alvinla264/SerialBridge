@@ -282,5 +282,42 @@ fixed with tests:
   `a_firmware_echo_must_be_new_device_output_not_the_probe_or_old_history`.
 - The serial-queue limit test is named
   `a_slow_remote_peer_hits_the_bounded_serial_queue_and_queued_work_is_revoked`;
-  the waited-write admission limit is covered by
+  the waited-write admission limit (including a non-waited write that must still
+  be admitted) is covered by
   `a_connection_has_a_bounded_number_of_pending_waited_writes`.
+- Deadline and connection bounds are covered by
+  `a_stalled_tls_handshake_is_closed_after_the_handshake_deadline` and
+  `unauthenticated_handshakes_count_toward_the_connection_limit`.
+- A draining device's queued remote writes are revoked by
+  `a_draining_device_still_revokes_queued_remote_writes`.
+- The deterministic recycled-node identity test uses regular files
+  (`a_checked_but_never_opened_device_rejects_a_recycled_node`); the engine-level
+  PTY-recycling test is `#[ignore]`d because it cannot guarantee the kernel
+  reuses a path on every run.
+
+### Second iterative review fixes
+
+- **Open descriptors are validated before configuration.** Opening now creates
+  and `fstat`s the descriptor itself, compares it with the expected identity,
+  and only then applies 8N1 termios; a replacement at the open boundary is
+  never configured. The regression test
+  `a_mismatched_expected_identity_is_rejected_before_configuration` checks the
+  target baud is unchanged.
+- **Draining devices stay revocable.** Write generations of devices whose last
+  client detached are kept in a registry until their I/O threads exit, so stop
+  and uncheck still drop queued remote writes while the writer drains. Test:
+  `a_draining_device_still_revokes_queued_remote_writes`.
+- **Timed-out waited writes recheck authorization** before returning a partial
+  tail, and a failed wait outcome is honored instead of extracting its lines.
+- **Connection registration rejects a stopped session**, clones before
+  reserving a slot, and authentication checks the session again before
+  registering; a raced accept cannot authenticate with revoked credentials.
+- **The pending-wait limit only applies to requests that create a waiter**; a
+  non-waited write is admitted while waiter slots are full. Test:
+  `a_connection_has_a_bounded_number_of_pending_waited_writes`.
+- **The remote adapter carries its authentication decoder into the connection
+  loop**, so a frame already buffered during authentication is not lost.
+- Added committed tests for a stalled TLS handshake, unauthenticated handshake
+  connection slots, and an unchecked later device instance; the engine-level
+  PTY-recycling replacement test is `#[ignore]`d because path reuse is not
+  guaranteed, with deterministic regular-file identity tests in its place.

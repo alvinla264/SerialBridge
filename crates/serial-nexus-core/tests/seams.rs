@@ -508,7 +508,10 @@ fn a_remote_write_cannot_be_admitted_after_stop_begins() {
     let result = human.write_bytes(opened.device_id, b"AFTER-REVOKE", None);
     let stop_result = stop_thread.join().expect("stop thread");
     let _blocker_client = opening.join().expect("opening thread");
-    assert!(stop_result.is_ok(), "stop itself must succeed");
+    assert!(
+        stop_result.is_ok(),
+        "stop itself must succeed: {stop_result:?}"
+    );
     assert!(
         result.is_err(),
         "a write admitted after stop began must be refused"
