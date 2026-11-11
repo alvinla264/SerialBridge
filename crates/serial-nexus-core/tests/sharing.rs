@@ -2120,3 +2120,44 @@ fn a_remote_read_fits_a_single_oversized_binary_line() {
         "the answer must report trimming to fit the remote frame"
     );
 }
+
+#[test]
+fn a_disconnected_remote_close_releases_its_slot_before_serial_drain() {
+    let core = shared_core_with(|config| config.share_max_connections = 1);
+    let owner = local_owner(&core);
+    let mut device = SimulatedDevice::new();
+    let local = owner
+        .open(&device.path, Some(115_200), false)
+        .expect("local open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![device.path.clone()])
+        .expect("start");
+    let remote = remote(&info, PairingRole::Human, "remote").expect("pair");
+    let opened = remote.open(&device.path, None, false).expect("remote open");
+    owner.close(local.device_id).expect("local detach");
+
+    for _ in 0..4 {
+        remote
+            .write_bytes(opened.device_id, &[b'x'; 8 * 1024], None)
+            .expect("queue stalled write");
+    }
+    let closing = remote.clone();
+    let close_thread = std::thread::spawn(move || closing.close(opened.device_id));
+    std::thread::sleep(Duration::from_millis(100));
+    remote.shutdown_transport();
+    drop(remote);
+
+    // The peer is gone while the writer is still stalled; its slot must be
+    // reusable without draining the device.
+    wait_until(Duration::from_secs(5), || {
+        RemoteClient::connect(
+            &info.host,
+            &info.human,
+            Some("replacement".into()),
+            Duration::from_secs(1),
+        )
+        .is_ok()
+    });
+    device.read_available(Duration::from_millis(300));
+    close_thread.join().expect("close thread").ok();
+}

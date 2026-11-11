@@ -325,6 +325,14 @@ fixed with tests:
   PTY-recycling replacement test is `#[ignore]`d because path reuse is not
   guaranteed, with deterministic regular-file identity tests in its place.
 
+### Tenth iterative review fixes
+
+- **Remote last-detach Close returns without joining the writer.** The device is
+  removed, revoked and reported, then its I/O threads are joined on a cleanup
+  thread, so a disconnected peer's connection slot is released even while
+  accepted writes drain. Test:
+  `a_disconnected_remote_close_releases_its_slot_before_serial_drain`.
+
 ### Ninth iterative review fixes
 
 - **Remote Open expiry revokes like discovery/event expiry.** A failed

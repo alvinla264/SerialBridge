@@ -706,6 +706,45 @@ impl Engine {
     }
 
     fn close(&self, client_id: u64, device_id: u64) -> Result<ResponseData, ErrorBody> {
+        let (events, removed) = self.close_parts(client_id, device_id)?;
+        if let Some(device) = removed {
+            self.finish_devices(vec![device]);
+        }
+        self.emit(events);
+        Ok(ResponseData::Closed)
+    }
+
+    /// Remote close reports before draining: a disconnected peer must release
+    /// its connection slot even if the last-detach writer is stalled.
+    fn close_remote(
+        self: &Arc<Self>,
+        client_id: u64,
+        device_id: u64,
+    ) -> Result<ResponseData, ErrorBody> {
+        let (events, removed) = self.close_parts(client_id, device_id)?;
+        if let Some(device) = removed {
+            let engine = Arc::clone(self);
+            let id = device.id;
+            let _ = std::thread::Builder::new()
+                .name(format!("serial-cleanup-{id}"))
+                .spawn(move || {
+                    join_devices(vec![device]);
+                    engine
+                        .live_writes
+                        .lock()
+                        .expect("live writes lock")
+                        .remove(&id);
+                });
+        }
+        self.emit(events);
+        Ok(ResponseData::Closed)
+    }
+
+    fn close_parts(
+        &self,
+        client_id: u64,
+        device_id: u64,
+    ) -> Result<(Vec<Event>, Option<Device>), ErrorBody> {
         let (kind, name) = self.identity(client_id);
         let session = self.sharing_session();
         let mut state = self.state.lock().expect("state lock");
@@ -725,9 +764,6 @@ impl Engine {
                 ));
             }
             device.clients.remove(&client_id);
-            // This client can no longer receive an answer from a waited write,
-            // so fail its waiters now instead of leaving them to observe
-            // device output after the client has detached.
             let mut kept = Vec::new();
             for waiter in std::mem::take(&mut device.waiters) {
                 if waiter.client_id == client_id {
@@ -774,11 +810,7 @@ impl Engine {
             );
         }
         drop(state);
-        if let Some(device) = removed {
-            self.finish_devices(vec![device]);
-        }
-        self.emit(events);
-        Ok(ResponseData::Closed)
+        Ok((events, removed))
     }
 
     fn read(&self, client_id: u64, params: ReadParams) -> Result<ResponseData, ErrorBody> {
@@ -1829,7 +1861,7 @@ impl Engine {
             }
             Request::Close(device) => {
                 self.authorize_remote_device(&session, device.device_id)?;
-                self.handle(client_id, Request::Close(device))
+                self.close_remote(client_id, device.device_id)
             }
             Request::Read(params) => {
                 self.authorize_remote_device(&session, params.device_id)?;

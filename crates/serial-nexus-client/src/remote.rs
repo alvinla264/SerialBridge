@@ -230,6 +230,15 @@ impl RemoteClient {
         }
     }
 
+    /// Close the transport immediately; used when a request is blocked.
+    #[doc(hidden)]
+    pub fn shutdown_transport(&self) {
+        self.inner
+            .connected
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.inner.tcp.shutdown(std::net::Shutdown::Both);
+    }
+
     pub fn close(&self, device_id: u64) -> Result<(), ClientError> {
         match self.request(
             Request::Close(DeviceRef { device_id }),
