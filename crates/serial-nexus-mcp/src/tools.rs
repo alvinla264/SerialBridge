@@ -1084,7 +1084,7 @@ fn human_duration(millis: u64) -> String {
 /// Turn a core error into a message an AI host (and its human) can act on.
 fn describe_error(error: &ClientError, device: Option<&str>) -> String {
     if let ClientError::Server(body) = error {
-        return describe_server_error(body, device);
+        return describe_server_error(body, device, false);
     }
     match error {
         ClientError::CoreNotFound => {
@@ -1140,13 +1140,17 @@ fn describe_remote_error(
             format!("{lead}the host did not answer in time ({reason})")
         }
         ClientError::Server(body) => {
-            format!("{lead}{}", describe_server_error(body, device))
+            format!("{lead}{}", describe_server_error(body, device, true))
         }
         other => format!("{lead}{other}"),
     }
 }
 
-fn describe_server_error(body: &serial_nexus_client::ErrorBody, device: Option<&str>) -> String {
+fn describe_server_error(
+    body: &serial_nexus_client::ErrorBody,
+    device: Option<&str>,
+    remote: bool,
+) -> String {
     let target = device.unwrap_or("that device");
     match body.code {
         ErrorCode::BaudConflict => format!(
@@ -1168,10 +1172,13 @@ fn describe_server_error(body: &serial_nexus_client::ErrorBody, device: Option<&
             "{}; the device is gone, so call connect again after it is back",
             body.message
         ),
-        ErrorCode::PermissionDenied => format!(
+        // A local permission failure is the operating system's file mode, not
+        // sharing advice; only a remote PermissionDenied can be the allowlist.
+        ErrorCode::PermissionDenied if remote => format!(
             "{} (PermissionDenied); the host owner has not shared this device, or unchecked it",
             body.message
         ),
+        ErrorCode::PermissionDenied => format!("{} (PermissionDenied)", body.message),
         ErrorCode::BadRequest => format!("{} ({:?})", body.message, body.code),
         ErrorCode::Timeout => format!("serial-nexus-core timed out: {}", body.message),
         _ => body.message.clone(),
@@ -1404,6 +1411,18 @@ mod tests {
         assert_eq!(human_duration(950), "950 ms");
         assert_eq!(human_duration(3_200), "3.2 s");
         assert_eq!(human_duration(298_000), "4m 58s");
+    }
+
+    #[test]
+    fn permission_advice_belongs_only_to_remote_errors() {
+        let body = serial_nexus_client::ErrorBody::new(
+            ErrorCode::PermissionDenied,
+            "Permission denied (os error 13)",
+        );
+        let local = describe_server_error(&body, None, false);
+        assert_eq!(local, "Permission denied (os error 13) (PermissionDenied)");
+        let remote = describe_server_error(&body, None, true);
+        assert!(remote.contains("the host owner has not shared this device"));
     }
 
     #[test]
