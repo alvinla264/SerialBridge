@@ -1931,28 +1931,23 @@ fn owner_loss_revokes_sharing_even_while_a_device_close_is_draining() {
     let core = shared_core();
     let owner = local_owner(&core);
     let mut device = SimulatedDevice::new();
-    let holder = connect(&core.socket, ClientInfo::human("holder"));
-    holder
+    owner
         .open(&device.path, Some(115_200), false)
         .expect("open");
     let info = owner
         .start_sharing(localhost_bind(), vec![device.path.clone()])
         .expect("start");
-    // Fill the PTY and start a last-detach close that blocks joining the writer.
-    holder
+
+    // Fill the PTY so the owner handler blocks joining the writer on close.
+    owner
         .write_bytes(1, &vec![b'x'; 128 * 1024], None)
         .expect("queue stalled local write");
-    let close_thread = std::thread::spawn(move || holder.close(1));
-    wait_until(Duration::from_secs(3), || {
-        !owner
-            .list_devices()
-            .expect("list")
-            .devices
-            .iter()
-            .any(|entry| entry.path == device.path)
-    });
+    let close_owner = owner.clone();
+    let close_thread = std::thread::spawn(move || close_owner.close(1));
+    std::thread::sleep(Duration::from_millis(300));
 
-    // The owner socket goes away while its handler is blocked in the close.
+    // Force EOF while that same connection's handler is still blocked.
+    owner.shutdown_transport();
     drop(owner);
     wait_until(Duration::from_secs(5), || {
         RemoteClient::connect(
@@ -1966,4 +1961,60 @@ fn owner_loss_revokes_sharing_even_while_a_device_close_is_draining() {
     // Free the blocked writer so the local thread can finish.
     device.read_available(Duration::from_millis(300));
     close_thread.join().expect("close thread").ok();
+}
+
+#[test]
+fn a_stalled_uncheck_still_revokes_later_devices_in_the_batch() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let mut first = SimulatedDevice::new();
+    let mut second = SimulatedDevice::new();
+    let local = connect(&core.socket, ClientInfo::human("local"));
+    let first_local = local
+        .open(&first.path, Some(115_200), false)
+        .expect("local first");
+    let second_local = local
+        .open(&second.path, Some(115_200), false)
+        .expect("local second");
+    let info = owner
+        .start_sharing(
+            localhost_bind(),
+            vec![first.path.clone(), second.path.clone()],
+        )
+        .expect("start");
+    let human = remote(&info, PairingRole::Human, "remote").expect("pair");
+    let first_open = human.open(&first.path, None, false).expect("first open");
+    let second_open = human.open(&second.path, None, false).expect("second open");
+    let first_id = first_open.device_id;
+    let second_id = second_open.device_id;
+
+    // Leave the remote as the sole attachment on both devices, then fill the
+    // first PTY so its last-detach cleanup blocks joining the writer.
+    local
+        .close(first_local.device_id)
+        .expect("local first close");
+    local
+        .close(second_local.device_id)
+        .expect("local second close");
+    for _ in 0..40 {
+        human
+            .write_bytes(first_id, &[b'x'; 8 * 1024], None)
+            .expect("queue stalled write");
+    }
+    let paths = vec![first.path.clone(), second.path.clone()];
+    let uncheck_owner = owner.clone();
+    let uncheck = std::thread::spawn(move || uncheck_owner.uncheck_shared_devices(paths));
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Authorization for the second device must already be gone even though
+    // cleanup of the first is still blocked.
+    let second_read = human.read(second_id, None);
+    assert!(
+        second_read.is_err(),
+        "second device stayed authorized behind the stalled first device: {second_read:?}"
+    );
+
+    first.read_available(Duration::from_millis(500));
+    uncheck.join().expect("uncheck thread").expect("uncheck");
+    second.read_available(Duration::from_millis(100));
 }

@@ -570,10 +570,12 @@ fn serve_connection(
     let mut client_id = None;
     let _ = run_connection(&engine, &session, &tcp, &mut client_id);
     let authenticated = client_id.is_some();
+    // Release the connection slot before unregistering: unregistering the last
+    // attachment may drain a stalled serial writer.
+    session.connection_closed(connection_id, authenticated);
     if let Some(client_id) = client_id {
         engine.unregister_client(client_id);
     }
-    session.connection_closed(connection_id, authenticated);
     let _ = tcp.shutdown(Shutdown::Both);
 }
 

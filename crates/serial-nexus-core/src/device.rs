@@ -15,7 +15,24 @@ use serialport::{DataBits, FlowControl, Parity, StopBits};
 /// `serialport` is kept for the `SerialPort` interface, but opening and
 /// configuration are done here so the descriptor's identity is known before
 /// termios is touched.
+struct ExclusiveToken {
+    fd: std::os::unix::io::RawFd,
+}
+
+impl Drop for ExclusiveToken {
+    fn drop(&mut self) {
+        // Only the last serial handle (original or clone) drops this token.
+        // SAFETY: TIOCNXCL takes no argument for this valid descriptor.
+        let _ = unsafe {
+            libc::ioctl(self.fd, 0x540D /* TIOCNXCL */)
+        };
+    }
+}
+
 struct PosixSerial {
+    // Declared before `file` so the last handle clears TIOCEXCL while the
+    // descriptor is still open.
+    exclusive: Arc<ExclusiveToken>,
     file: Arc<File>,
     baud: u32,
     timeout: Duration,
@@ -33,19 +50,6 @@ impl PosixSerial {
             Ok(_) => Ok(()),
             Err(nix::errno::Errno::EINTR) => Ok(()),
             Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
-        }
-    }
-}
-
-impl Drop for PosixSerial {
-    fn drop(&mut self) {
-        // Clear exclusive mode only when the last engine handle goes away; a
-        // reader/writer clone must not clear it while the other still uses it.
-        if Arc::strong_count(&self.file) == 1 {
-            // SAFETY: TTYNXCL takes no argument for this valid descriptor.
-            let _ = unsafe {
-                libc::ioctl(self.file.as_raw_fd(), 0x540D /* TIOCNXCL */)
-            };
         }
     }
 }
@@ -85,6 +89,13 @@ fn read_modem_bit(fd: std::os::unix::io::RawFd, bit: libc::c_int) -> serialport:
         return Err(to_serial_error(io::Error::last_os_error()));
     }
     Ok(bits & bit != 0)
+}
+
+impl PosixSerial {
+    fn control_flags(&self) -> serialport::Result<nix::sys::termios::ControlFlags> {
+        let settings = nix::sys::termios::tcgetattr(&self.file).map_err(errno_to_serial)?;
+        Ok(settings.control_flags)
+    }
 }
 
 impl io::Read for PosixSerial {
@@ -147,16 +158,50 @@ impl serialport::SerialPort for PosixSerial {
         Ok(self.baud)
     }
     fn data_bits(&self) -> serialport::Result<DataBits> {
-        Ok(DataBits::Eight)
+        use nix::sys::termios::ControlFlags;
+        let size = self.control_flags()? & ControlFlags::CSIZE;
+        if size == ControlFlags::CS6 {
+            Ok(DataBits::Six)
+        } else if size == ControlFlags::CS7 {
+            Ok(DataBits::Seven)
+        } else if size == ControlFlags::CS8 {
+            Ok(DataBits::Eight)
+        } else {
+            Ok(DataBits::Five)
+        }
     }
     fn flow_control(&self) -> serialport::Result<FlowControl> {
-        Ok(FlowControl::None)
+        use nix::sys::termios::{ControlFlags, InputFlags};
+        let settings = nix::sys::termios::tcgetattr(&self.file).map_err(errno_to_serial)?;
+        if settings.control_flags.contains(ControlFlags::CRTSCTS) {
+            Ok(FlowControl::Hardware)
+        } else if settings
+            .input_flags
+            .intersects(InputFlags::IXON | InputFlags::IXOFF)
+        {
+            Ok(FlowControl::Software)
+        } else {
+            Ok(FlowControl::None)
+        }
     }
     fn parity(&self) -> serialport::Result<Parity> {
-        Ok(Parity::None)
+        use nix::sys::termios::ControlFlags;
+        let flags = self.control_flags()?;
+        if !flags.contains(ControlFlags::PARENB) {
+            Ok(Parity::None)
+        } else if flags.contains(ControlFlags::PARODD) {
+            Ok(Parity::Odd)
+        } else {
+            Ok(Parity::Even)
+        }
     }
     fn stop_bits(&self) -> serialport::Result<StopBits> {
-        Ok(StopBits::One)
+        use nix::sys::termios::ControlFlags;
+        if self.control_flags()?.contains(ControlFlags::CSTOPB) {
+            Ok(StopBits::Two)
+        } else {
+            Ok(StopBits::One)
+        }
     }
     fn timeout(&self) -> Duration {
         self.timeout
@@ -293,6 +338,7 @@ impl serialport::SerialPort for PosixSerial {
         let file = unsafe { File::from_raw_fd(fd) };
         Ok(Box::new(PosixSerial {
             file: Arc::new(file),
+            exclusive: Arc::clone(&self.exclusive),
             baud: self.baud,
             timeout: self.timeout,
         }))
@@ -644,17 +690,28 @@ pub fn open_serial_checked(
             ));
         }
     }
-    configure_termios(&file, baud)?;
-    // Preserve the previous opener's exclusive ownership: TIOCEXCL blocks
-    // later opens and flock serializes other core instances.
-    if unsafe { libc::ioctl(file.as_raw_fd(), libc::TIOCEXCL) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    // Take ownership before changing settings: a failed acquisition must not
+    // alter another application's termios. flock serializes core instances;
+    // TIOCEXCL refuses later opens. A failed configure below clears it.
     // SAFETY: flock on a valid descriptor we own.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: TIOCEXCL takes no argument for this valid descriptor.
+    if unsafe { libc::ioctl(file.as_raw_fd(), libc::TIOCEXCL) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if let Err(error) = configure_termios(&file, baud) {
+        // SAFETY: clear the exclusive flag we just set before closing.
+        let _ = unsafe {
+            libc::ioctl(file.as_raw_fd(), 0x540D /* TIOCNXCL */)
+        };
+        return Err(error);
+    }
     let port = PosixSerial {
+        exclusive: Arc::new(ExclusiveToken {
+            fd: file.as_raw_fd(),
+        }),
         file: Arc::new(file),
         baud,
         timeout: Duration::from_millis(50),
@@ -841,6 +898,81 @@ mod tests {
             nix::sys::stat::Mode::empty(),
         );
         assert!(second.is_err(), "a second open must be refused");
+    }
+
+    #[test]
+    fn dropping_one_clone_keeps_exclusive_mode() {
+        use nix::pty::openpty;
+        let pty = openpty(None, None).expect("pty");
+        let slave: std::fs::File = pty.slave.into();
+        let path = std::fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd()))
+            .expect("path")
+            .to_string_lossy()
+            .into_owned();
+        let port = open_serial(&path, 115_200).expect("open");
+        let clone = port.port.try_clone().expect("clone");
+        drop(clone);
+        let second = nix::fcntl::open(
+            path.as_str(),
+            nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NOCTTY,
+            nix::sys::stat::Mode::empty(),
+        );
+        assert!(second.is_err(), "a live handle must stay exclusive");
+        drop(port);
+        open_serial(&path, 115_200).expect("reopen after all handles drop");
+        drop(slave);
+    }
+
+    #[test]
+    fn failed_opening_leaves_other_settings_and_exclusivity_untouched() {
+        use nix::pty::openpty;
+        use nix::sys::termios::{
+            cfgetispeed, cfsetispeed, cfsetospeed, tcgetattr, tcsetattr, SetArg,
+        };
+        let pty = openpty(None, None).expect("pty");
+        let slave: std::fs::File = pty.slave.into();
+        let path = std::fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd()))
+            .expect("path")
+            .to_string_lossy()
+            .into_owned();
+        let mut settings = tcgetattr(&slave).expect("termios");
+        cfsetispeed(&mut settings, nix::sys::termios::BaudRate::B9600).expect("speed");
+        cfsetospeed(&mut settings, nix::sys::termios::BaudRate::B9600).expect("speed");
+        tcsetattr(&slave, SetArg::TCSANOW, &settings).expect("seed");
+        // SAFETY: flock on a descriptor the test owns.
+        assert_eq!(
+            unsafe { libc::flock(slave.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert!(
+            open_serial(&path, 115_200).is_err(),
+            "locked port must fail"
+        );
+        let after = tcgetattr(&slave).expect("termios after");
+        assert_eq!(cfgetispeed(&after), nix::sys::termios::BaudRate::B9600);
+        // SAFETY: release the lock before reopening.
+        assert_eq!(unsafe { libc::flock(slave.as_raw_fd(), libc::LOCK_UN) }, 0);
+        open_serial(&path, 115_200).expect("open after lock release");
+    }
+
+    #[test]
+    fn framing_setters_are_reflected_by_getters() {
+        use nix::pty::openpty;
+        use serialport::StopBits;
+        let pty = openpty(None, None).expect("pty");
+        let slave: std::fs::File = pty.slave.into();
+        let path = std::fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd()))
+            .expect("path")
+            .to_string_lossy()
+            .into_owned();
+        let mut opened = open_serial(&path, 115_200).expect("open");
+        let port = &mut opened.port;
+        port.set_stop_bits(StopBits::Two).expect("stop bits");
+        assert_eq!(port.stop_bits().expect("stop getter"), StopBits::Two);
+        assert_eq!(
+            port.data_bits().expect("bits getter"),
+            serialport::DataBits::Eight
+        );
     }
 
     #[test]

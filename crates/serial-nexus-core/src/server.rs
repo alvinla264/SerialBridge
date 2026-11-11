@@ -233,18 +233,19 @@ fn read_requests(engine: Arc<Engine>, client_id: u64, stream: UnixStream, tx: Re
             // EOF between messages.
             Ok(None) => break,
             Err(error) => {
-                let _ = tx.send(Some(Err(error.to_string())));
+                let _ = tx.try_send(Some(Err(error.to_string())));
                 break;
             }
         };
         match serial_nexus_protocol::decode_line::<RequestMessage>(&line) {
-            Ok(request) => {
-                if tx.send(Some(Ok(request))).is_err() {
-                    break;
-                }
-            }
+            Ok(request) => match tx.try_send(Some(Ok(request))) {
+                Ok(()) => {}
+                // A full queue disconnects this client instead of stalling the
+                // reader, so EOF and owner loss stay observable.
+                Err(_) => break,
+            },
             Err(error) => {
-                let _ = tx.send(Some(Err(error.to_string())));
+                let _ = tx.try_send(Some(Err(error.to_string())));
                 break;
             }
         }
@@ -252,7 +253,7 @@ fn read_requests(engine: Arc<Engine>, client_id: u64, stream: UnixStream, tx: Re
     // The owning local terminal is gone; revoke sharing even if this
     // connection's handler is still blocked in a device close.
     engine.owner_connection_lost(client_id);
-    let _ = tx.send(None);
+    let _ = tx.try_send(None);
 }
 
 fn write_message(writer: &mut BufWriter<UnixStream>, message: &ServerMessage) -> io::Result<()> {

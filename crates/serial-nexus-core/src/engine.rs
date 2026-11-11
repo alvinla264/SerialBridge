@@ -1547,6 +1547,7 @@ impl Engine {
         params: ShareDevicesParams,
     ) -> Result<ResponseData, ErrorBody> {
         let session = self.owner_session(client_id)?;
+        let mut revoked = Vec::new();
         for path in &params.devices {
             if let Some(identity) = session.uncheck(path) {
                 let device_ids: Vec<u64> = self
@@ -1575,11 +1576,14 @@ impl Engine {
                         }
                     }
                 }
-                // Revoke immediately: detach remote clients and fail their
-                // pending work. Local clients and other devices are untouched.
-                self.detach_remote_clients(&device_ids, "device was unshared");
+                revoked.extend(device_ids);
             }
         }
+        // Revoke every requested device before any blocking serial cleanup, so
+        // a stalled first device cannot delay authorization removal for later
+        // ones. Local clients and other devices are untouched.
+        let removed = self.begin_detach_remote_clients(&revoked, "device was unshared");
+        self.finish_devices(removed);
         Ok(ResponseData::Sharing(session.snapshot()))
     }
 
@@ -1780,6 +1784,14 @@ impl Engine {
     /// Detach remote clients from these devices and fail their pending waits,
     /// leaving local clients and other shared devices alone.
     fn detach_remote_clients(&self, device_ids: &[u64], reason: &str) {
+        let removed = self.begin_detach_remote_clients(device_ids, reason);
+        self.finish_devices(removed);
+    }
+
+    /// Revoke and detach remote clients without waiting for serial I/O
+    /// threads. Callers that batch devices must do all authorization changes
+    /// first, then call `finish_devices` once.
+    fn begin_detach_remote_clients(&self, device_ids: &[u64], reason: &str) -> Vec<Device> {
         let session = self.sharing_session();
         let remote_ids: HashSet<u64> = self
             .clients
@@ -1790,7 +1802,7 @@ impl Engine {
             .map(|(id, _)| *id)
             .collect();
         if device_ids.is_empty() || remote_ids.is_empty() {
-            return;
+            return Vec::new();
         }
         let mut events = Vec::new();
         let mut removed = Vec::new();
@@ -1860,8 +1872,8 @@ impl Engine {
                 }
             }
         }
-        self.finish_devices(removed);
         self.emit(events);
+        removed
     }
 
     // ---- helpers ----------------------------------------------------------

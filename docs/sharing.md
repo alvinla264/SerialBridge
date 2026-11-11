@@ -322,6 +322,29 @@ fixed with tests:
   PTY-recycling replacement test is `#[ignore]`d because path reuse is not
   guaranteed, with deterministic regular-file identity tests in its place.
 
+### Fourth iterative review fixes
+
+- **Owner liveness no longer depends on request-queue backpressure.** The
+  local reader uses non-blocking queue inserts and disconnects a client whose
+  bounded queue is full, so EOF and `owner_connection_lost` are always reached.
+- **Batch uncheck revokes every requested device before blocking cleanup.**
+  `begin_detach_remote_clients` performs authorization, waiter and detach
+  changes for the whole batch, then `finish_devices` joins I/O threads once.
+  Test: `a_stalled_uncheck_still_revokes_later_devices_in_the_batch`.
+- **Failed serial acquisition has no side effects.** `flock` and `TIOCEXCL`
+  are taken before termios changes, and a failed configure clears exclusive
+  mode. Test: `failed_opening_leaves_other_settings_and_exclusivity_untouched`.
+- **Disconnected remotes release their connection slot before device
+  draining**, so a stalled writer cannot keep the authenticated limit full.
+- **Exclusive ownership follows clones** through a shared token rather than a
+  per-handle `Arc` count. Tests: `dropping_one_clone_keeps_exclusive_mode`,
+  `reopening_after_drop_clears_exclusive_mode`.
+- The owner-loss regression test now blocks the owner's own handler and forces
+  EOF on that connection; it fails when the reader-thread notification is
+  removed.
+- Serial framing getters read effective termios settings instead of returning
+  constants.
+
 ### Third iterative review fixes
 
 - **Owner loss is observed independently of the request handler.** The reader

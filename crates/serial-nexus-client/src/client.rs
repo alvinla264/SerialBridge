@@ -183,6 +183,16 @@ impl Client {
         Ok(client)
     }
 
+    /// Close the transport immediately. Pending requests fail; this is used
+    /// when a caller needs to drop a connection whose request is blocked.
+    #[doc(hidden)]
+    pub fn shutdown_transport(&self) {
+        self.inner.connected.store(false, Ordering::SeqCst);
+        if let Ok(writer) = self.inner.writer.lock() {
+            let _ = writer.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
     /// The core's hello answer: id, version and bounded limits.
     pub fn hello(&self) -> HelloResult {
         self.inner.hello.lock().expect("hello lock").clone()
