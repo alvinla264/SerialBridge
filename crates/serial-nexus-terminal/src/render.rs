@@ -16,7 +16,10 @@ use ratatui::style::{Color as RColor, Modifier, Style as RStyle};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::screen::{Color, Style};
-use crate::state::{AppState, Focus, SettingsRow, Severity, SidebarButton, View};
+use crate::state::{
+    AppState, ConnectForm, Focus, SettingsRow, Severity, SidebarButton, SidebarRow, View,
+    CONNECT_FIELDS,
+};
 
 /// The sidebar's preferred narrowest width when both panes are shown.
 pub const MIN_SIDEBAR_WIDTH: u16 = 20;
@@ -308,18 +311,24 @@ pub fn hit_test(state: &AppState, area: Rect, column: u16, row: u16) -> Option<H
     if list.height == 0 || !in_rect(list, column, row) {
         return None;
     }
-    let index = (row - list.y) as usize + first_device_row(state, sidebar);
-    (index < state.devices.len()).then_some(Hit::Device(index))
+    let rows = state.sidebar_rows();
+    let first = first_sidebar_row(state, &rows, sidebar);
+    let offset = (row - list.y) as usize + first;
+    match rows.get(offset) {
+        Some(SidebarRow::Device(index)) => Some(Hit::Device(*index)),
+        _ => None,
+    }
 }
 
-/// The first device index the list shows, so the highlight stays in view.
-fn first_device_row(state: &AppState, sidebar: Sidebar) -> usize {
+/// The first sidebar row the list shows, so the highlighted device stays in
+/// view together with its group heading where possible.
+fn first_sidebar_row(state: &AppState, rows: &[SidebarRow], sidebar: Sidebar) -> usize {
     let capacity = sidebar.list.height.max(1) as usize;
-    if state.selected >= capacity {
-        state.selected + 1 - capacity
-    } else {
-        0
-    }
+    let selected = rows
+        .iter()
+        .position(|row| matches!(row, SidebarRow::Device(index) if *index == state.selected))
+        .unwrap_or(0);
+    selected.saturating_add(1).saturating_sub(capacity)
 }
 
 fn in_rect(rect: Rect, column: u16, row: u16) -> bool {
@@ -362,6 +371,7 @@ fn draw_right(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16,
         View::Scrollback => draw_stream(state, buffer, area),
         View::Settings => draw_settings(state, buffer, area),
         View::Pairing => draw_pairing(state, buffer, area),
+        View::Connect => draw_connect(state, buffer, area),
     }
 }
 
@@ -409,6 +419,7 @@ fn draw_header(state: &AppState, buffer: &mut Buffer, area: Rect) {
         (Focus::Right, View::Settings) => "focus: settings",
         (Focus::Right, View::Scrollback) => "focus: scrollback",
         (Focus::Right, View::Pairing) => "focus: pairing",
+        (Focus::Right, View::Connect) => "focus: connect",
     };
 
     let brand = " SerialNexus ";
@@ -496,60 +507,67 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u1
             dim(),
         );
     }
-    let shown = state.shown_device().map(|device| device.path.clone());
-    let first = first_device_row(state, sidebar);
-    for (offset, (index, device)) in state.devices.iter().enumerate().skip(first).enumerate() {
+    let shown = state
+        .shown_device()
+        .map(|device| (device.endpoint, device.path.clone()));
+    let rows = state.sidebar_rows();
+    let first = first_sidebar_row(state, &rows, sidebar);
+    for (offset, row) in rows.iter().skip(first).enumerate() {
         if offset >= list.height as usize {
             break;
         }
         let y = list.y + offset as u16;
-        let row = Rect::new(list.x, y, list.width, 1);
-        let selected = index == state.selected;
-        let shown_here = shown.as_deref() == Some(device.path.as_str());
-        // `▸` is the row both highlighted and shown, `›` only highlighted,
-        // `▹` only shown.
-        let marker = match (selected, shown_here) {
-            (true, true) => "▸",
-            (true, false) => "›",
-            (false, true) => "▹",
-            (false, false) => " ",
-        };
-        let dot = if device.open { "●" } else { "○" };
-        let label = format!("{marker} {dot} {}", device.path);
-        let attached = state
-            .sessions
-            .values()
-            .any(|session| session.path == device.path);
-        // The dot already says open or closed, so the status leads with the
-        // baud and then the AI holder and description, most useful first. A
-        // narrow row clips the tail instead of hiding all of it.
-        let mut status = if attached {
-            device.baud.map(|b| b.to_string()).unwrap_or_default()
-        } else if device.open {
-            format!(
-                "other {}",
-                device.baud.map(|b| b.to_string()).unwrap_or_default()
-            )
-        } else {
-            "closed".to_string()
-        };
-        if let Some(control) = &device.control {
-            status.push_str(&format!(" · AI: {control}"));
+        let line = Rect::new(list.x, y, list.width, 1);
+        match row {
+            SidebarRow::Group(endpoint) => {
+                let label = state.endpoint_label(*endpoint);
+                put(buffer, line, 0, &format!(" {label}"), dim());
+            }
+            SidebarRow::Device(index) => {
+                let device = &state.devices[*index];
+                let selected = *index == state.selected;
+                let shown_here = shown.as_ref().is_some_and(|(endpoint, path)| {
+                    *endpoint == device.endpoint && path == &device.path
+                });
+                let marker = match (selected, shown_here) {
+                    (true, true) => "▸",
+                    (true, false) => "›",
+                    (false, true) => "▹",
+                    (false, false) => " ",
+                };
+                let dot = if device.open { "●" } else { "○" };
+                let label = format!("{marker} {dot} {}", device.path);
+                let attached = state.sessions.values().any(|session| {
+                    session.endpoint == device.endpoint && session.path == device.path
+                });
+                let mut status = if attached {
+                    device.baud.map(|b| b.to_string()).unwrap_or_default()
+                } else if device.open {
+                    format!(
+                        "other {}",
+                        device.baud.map(|b| b.to_string()).unwrap_or_default()
+                    )
+                } else {
+                    "closed".to_string()
+                };
+                if let Some(control) = &device.control {
+                    status.push_str(&format!(" · AI: {control}"));
+                }
+                if let Some(description) = &device.description {
+                    status.push_str(&format!(" · {description}"));
+                }
+                let style = if selected {
+                    highlighted(true)
+                } else if shown_here {
+                    RStyle::default()
+                        .fg(RColor::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    RStyle::default()
+                };
+                draw_row(buffer, line, &label, &status, style);
+            }
         }
-        if let Some(description) = &device.description {
-            status.push_str(&format!(" · {description}"));
-        }
-        // The shown device is legible even when the highlight is elsewhere.
-        let style = if selected {
-            highlighted(true)
-        } else if shown_here {
-            RStyle::default()
-                .fg(RColor::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            RStyle::default()
-        };
-        draw_row(buffer, row, &label, &status, style);
     }
 
     // The three buttons are real rows: selected with the arrow keys and
@@ -622,7 +640,11 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u1
         Some((sidebar.title.x + 1, sidebar.title.y))
     } else {
         // The highlighted device row, which the list has kept in view.
-        let offset = state.selected.saturating_sub(first) as u16;
+        let selected_row = rows
+            .iter()
+            .position(|row| matches!(row, SidebarRow::Device(index) if *index == state.selected))
+            .unwrap_or(0);
+        let offset = selected_row.saturating_sub(first) as u16;
         Some((list.x + 1, list.y + offset))
     }
 }
@@ -842,6 +864,66 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
     pieces
 }
 
+/// The remote-connect form: address, port and the host's pairing information.
+/// The credential is masked; nothing here is written anywhere.
+fn draw_connect(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16, u16)> {
+    let Some(form) = &state.connect else {
+        put(buffer, area, 1, "Press c or use the Connect button.", dim());
+        return Some((area.x + 1, area.y));
+    };
+    let mut cursor = (area.x, area.y);
+    let title_style = if state.focus == Focus::Right {
+        RStyle::default()
+            .fg(RColor::Black)
+            .bg(RColor::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        RStyle::default()
+            .fg(RColor::Cyan)
+            .add_modifier(Modifier::BOLD)
+    };
+    put(buffer, area, 0, " Connect to a remote host ", title_style);
+    let error_rows = usize::from(form.error.is_some());
+    let available = area.height as usize;
+    for field in 0..CONNECT_FIELDS {
+        let offset = field + 1;
+        if offset >= available.saturating_sub(error_rows) {
+            break;
+        }
+        let selected = field == form.field;
+        let value = form.value(field);
+        let label = ConnectForm::field_name(field).unwrap_or_default();
+        let marker = if selected { "▸" } else { " " };
+        let line = Rect::new(area.x, area.y + offset as u16, area.width, 1);
+        draw_value_row(
+            buffer,
+            line,
+            &format!("{marker} {label}"),
+            &value,
+            highlighted(selected),
+        );
+        if selected {
+            let value_column = area.width.saturating_sub(display_width(&value));
+            cursor = (area.x + value_column, line.y);
+        }
+    }
+    if let Some(error) = &form.error {
+        put(
+            buffer,
+            Rect::new(
+                area.x,
+                area.y + area.height.saturating_sub(1),
+                area.width,
+                1,
+            ),
+            0,
+            &format!(" {error} "),
+            RStyle::default().fg(RColor::White).bg(RColor::Red),
+        );
+    }
+    Some(cursor)
+}
+
 fn draw_stream(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16, u16)> {
     if area.height == 0 || area.width == 0 {
         return None;
@@ -998,6 +1080,9 @@ fn draw_hints(state: &AppState, buffer: &mut Buffer, area: Rect) {
         }
         (Focus::Right, View::Pairing) => {
             " ↑/↓ scroll · s stop sharing · Esc back to the stream ".to_string()
+        }
+        (Focus::Right, View::Connect) => {
+            " Tab/↑↓ field · Enter connects · Esc cancels ".to_string()
         }
     };
     put(buffer, area, 0, &hints, dim());
@@ -1165,6 +1250,7 @@ fn to_ratatui(colour: Color) -> RColor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::SessionKey;
     use crate::state::{AppState, DeviceEntry, Focus, View};
     use serial_nexus_protocol::Event;
 
@@ -1279,7 +1365,11 @@ mod tests {
     #[test]
     fn the_header_names_the_shown_device_and_the_focused_pane() {
         let mut state = demo();
-        state.sessions.get_mut(&7).unwrap().control = Some("claude".into());
+        state
+            .sessions
+            .get_mut(&SessionKey::local(7))
+            .unwrap()
+            .control = Some("claude".into());
         let header = &screen(&state, 100, 16)[0];
         assert!(header.contains("/dev/ttyUSB1"), "{header}");
         assert!(header.contains("57600 baud"), "{header}");
@@ -1355,12 +1445,17 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         let cursor = render(&state, &mut buffer, area).expect("cursor");
         let sidebar = sidebar(panes(area).sidebar).unwrap();
-        let first = first_device_row(&state, sidebar);
+        let rows = state.sidebar_rows();
+        let first = first_sidebar_row(&state, &rows, sidebar);
+        let selected_row = rows
+            .iter()
+            .position(|row| matches!(row, SidebarRow::Device(index) if *index == state.selected))
+            .unwrap_or(0);
         assert_eq!(
             cursor,
             (
                 sidebar.list.x + 1,
-                sidebar.list.y + (state.selected - first) as u16
+                sidebar.list.y + (selected_row - first) as u16
             )
         );
 
@@ -1551,11 +1646,16 @@ mod tests {
             "the sidebar is still beside the scrollback: {live}"
         );
 
-        let history = state.sessions.get(&7).unwrap().screen.history_len();
+        let history = state
+            .sessions
+            .get(&SessionKey::local(7))
+            .unwrap()
+            .screen
+            .history_len();
         assert!(history > 0, "the rows above the live view were kept");
         state
             .sessions
-            .get_mut(&7)
+            .get_mut(&SessionKey::local(7))
             .unwrap()
             .screen
             .scroll_back(history);
@@ -1722,7 +1822,11 @@ mod tests {
         );
 
         let mut state = demo();
-        state.sessions.get_mut(&7).unwrap().control = Some("界界界界界界".into());
+        state
+            .sessions
+            .get_mut(&SessionKey::local(7))
+            .unwrap()
+            .control = Some("界界界界界界".into());
         let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 16));
         render(&state, &mut buffer, Rect::new(0, 0, 120, 16));
         let header = &screen(&state, 120, 16)[0];

@@ -418,7 +418,10 @@ fn explicit_disconnect_leaves_the_other_device_connected() {
         notice.text
     );
     assert!(!notice.text.contains("unplugged"), "{}", notice.text);
-    assert!(app.state.sessions.contains_key(&second_id));
+    assert!(app
+        .state
+        .sessions
+        .contains_key(&serial_nexus_terminal::state::SessionKey::local(second_id)));
     assert!(app.client().status(first_id).is_err());
     assert!(app.client().status(second_id).is_ok());
     assert_eq!(

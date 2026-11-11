@@ -166,3 +166,37 @@ Device rules:
   exceed the IPC frame limit or drop the connection. Incoming frames are read
   with a hard byte bound, so an unfinished line cannot grow memory without
   limit.
+
+## LAN sharing and remote terminals
+
+Sharing is off by default and needs no configuration until it is used. The
+human terminal is the owner: open Settings, set a concrete IPv4 or IPv6 address
+and port, tick the devices to share, Save, and start sharing from the sidebar's
+Share button (or `s`). See
+[Sharing devices on the LAN from the terminal](clients.md#sharing-devices-on-the-lan-from-the-terminal)
+for the controls.
+
+The pairing view shows two separate credentials:
+
+- the **human credential** goes into another terminal's Connect form, together
+  with the host address, port, CA certificate and certificate fingerprint;
+- the **MCP credential** goes into the AI host's private pairing file.
+
+For MCP, keep the credential in a file that only your user can read, for
+example `~/.config/serial-nexus/mcp-peers.json` with mode `0600`, and never put
+it in shell history, a repository or a synchronous tool call. The
+[MCP guide](clients.md#mcp-server-serial-nexus-mcp) documents the file's shape.
+Credentials are per sharing session: stopping or restarting sharing invalidates
+the old ones and new ones must be paired.
+
+**Exposure.** The listener exists only on the chosen address, and only while
+the terminal that started sharing is running. Firewall rules and router/NAT
+configuration decide who can actually reach it; forwarding a port can expose it
+outside the LAN. Prefer loopback (`127.0.0.1` or `::1`) for same-machine use and
+a trusted LAN address only when another device must connect.
+
+**Unplug and revocation.** Unchecking a device while sharing revokes remote
+access immediately; unplugging it, or replacing it at the same path, clears its
+checkbox and requires a recheck. A write already in progress may finish, and a
+write whose answer is lost is reported as uncertain: nothing is retried or
+rolled back.

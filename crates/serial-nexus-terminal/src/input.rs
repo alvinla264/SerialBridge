@@ -71,6 +71,11 @@ pub enum Action {
     OpenPairing,
     /// Ask for a remote host's address, port and pairing information.
     ConnectRemote,
+    ConnectChar(char),
+    ConnectBackspace,
+    ConnectNext(i32),
+    ConnectSubmit,
+    ConnectCancel,
     /// Leave the pairing view for the stream.
     LeavePairing,
     /// Scroll the pairing information back (`> 0`) or forward by lines.
@@ -118,6 +123,17 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
             Key::Backspace => Action::SettingsEditBackspace,
             Key::Char(ch) if ch.is_ascii_graphic() => Action::SettingsEditChar(ch),
             Key::Tab | Key::BackTab => Action::SettingsEditDone,
+            _ => Action::Ignore,
+        };
+    }
+    if state.view == View::Connect && state.focus == Focus::Right {
+        return match key {
+            Key::Esc => Action::ConnectCancel,
+            Key::Enter => Action::ConnectSubmit,
+            Key::Tab | Key::Down => Action::ConnectNext(1),
+            Key::BackTab | Key::Up => Action::ConnectNext(-1),
+            Key::Backspace => Action::ConnectBackspace,
+            Key::Char(ch) if ch.is_ascii_graphic() => Action::ConnectChar(ch),
             _ => Action::Ignore,
         };
     }
@@ -187,9 +203,9 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
             Key::PageDown => Action::PairingScroll(state.rows().max(1) as i32),
             _ => Action::Ignore,
         },
-        // The settings branch above owns a right-focused settings view; the
-        // left-focused one takes the sidebar's commands instead.
-        (Focus::Right, View::Settings) => Action::Ignore,
+        // The settings and connect branches above own their right-focused
+        // views; the left-focused ones take the sidebar's commands instead.
+        (Focus::Right, View::Settings | View::Connect) => Action::Ignore,
     }
 }
 

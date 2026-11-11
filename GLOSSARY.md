@@ -120,3 +120,33 @@ these words in their tool names and user-facing text.
 - **Remote frame**: one length-prefixed JSON message on a remote connection
   (4-byte big-endian length, then that many bytes), bounded to keep one peer
   from exhausting memory.
+
+LAN sharing terms (the terminal's side; the core's contract is in
+[docs/sharing.md](docs/sharing.md)):
+
+- **Sharing session**: the opt-in TLS listener one human terminal starts on one
+  concrete IPv4 or IPv6 address and port. It lives only while that terminal's
+  connection to the local core lives. Off by default.
+- **Owner**: the local human terminal that started the sharing session. Only
+  the owner may check, uncheck, inspect or stop it; other local clients cannot.
+- **Checked device**: a detected device path the owner has ticked in the
+  settings checklist. Checking is session-only, defaults to none and does not
+  open the device. The core's checked list, not the UI, authorizes access.
+- **Checklist draft**: the checked set being edited in the settings view. Save
+  applies it (and writes the preferences); Cancel throws it away; a failed save
+  applies neither.
+- **Pairing information**: what a remote client needs for one session: the
+  bound endpoint, host name, CA certificate, pinned host certificate
+  fingerprint and one credential. Shown only to the owner.
+- **Human credential** and **MCP credential**: the two distinct secrets a
+  session generates. The core derives the remote client's role from which one
+  matched; neither is persisted or sent to a device.
+- **Pairing view**: the owner-only right-pane view (`p`) showing the bound
+  address, host authentication data, both credentials and the checked devices.
+- **Connect form**: the remote terminal's memory-only form for a host address,
+  port, CA certificate, fingerprint and human credential. A wrong certificate
+  is refused rather than trusted.
+- **Endpoint**: one connected host. `Local` is this machine's core; each
+  connected remote host is a separate endpoint with its own transport and
+  grouping heading. A **session key** is an endpoint plus that host's device
+  id, so equal paths or ids on two hosts cannot collide.

@@ -78,7 +78,9 @@ configuration details.
   allowing multiple readers and human writes.
 - **serial-nexus-mcp** exposes devices to an AI host through MCP tool calls.
 - **serial-nexus-terminal** provides the human terminal: a device sidebar
-  beside the live stream of the device you are watching.
+  beside the live stream of the device you are watching. It can also share
+  chosen devices on the LAN with opt-in pairing, and connect to another host's
+  shared devices.
 - **serial-nexus-client** and **serial-nexus-protocol** share the core interface
   and communication types, including the opt-in LAN sharing seam.
 
@@ -89,7 +91,7 @@ for control, history, and lifecycle details.
 ## Documentation
 
 - [Installation, running, and device behavior](docs/getting-started.md)
-- [Client library, human terminal, and MCP server](docs/clients.md)
+- [Client library, human terminal, LAN sharing and MCP server](docs/clients.md)
 - [Security, building, and testing](docs/development.md)
 - [LAN sharing internal contract](docs/sharing.md)
 - [MCP tool reference](crates/serial-nexus-mcp/README.md)

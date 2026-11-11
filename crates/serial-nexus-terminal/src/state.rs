@@ -41,6 +41,9 @@ pub enum View {
     /// The owner's pairing information for the running sharing session. The
     /// secrets in it exist only in memory and are drawn only here.
     Pairing,
+    /// The form that asks for a remote host's address, port and pairing
+    /// information.
+    Connect,
 }
 
 /// The settings rows before the detected-device checklist: local echo,
@@ -141,9 +144,143 @@ impl Default for SharingState {
     }
 }
 
-/// One row in the sidebar: a serial device the core can see.
+/// One connected host. `0` is this machine's core; every remote link gets a
+/// fresh number, so two hosts may both have a device with id 1 and a path like
+/// `/dev/ttyUSB0` without colliding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EndpointId(pub u64);
+
+/// This machine's core.
+pub const LOCAL_ENDPOINT: EndpointId = EndpointId(0);
+
+/// One attached device: its endpoint and the core's device id on that host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SessionKey {
+    pub endpoint: EndpointId,
+    pub device_id: u64,
+}
+
+impl SessionKey {
+    pub fn local(device_id: u64) -> Self {
+        Self {
+            endpoint: LOCAL_ENDPOINT,
+            device_id,
+        }
+    }
+}
+
+/// The remote-connect form. Every value is memory-only: nothing here is
+/// written to the settings file, logged, or sent to a device.
+pub struct ConnectForm {
+    /// The field that takes typed text: address, port, CA, fingerprint,
+    /// credential.
+    pub field: usize,
+    pub address: String,
+    pub port: String,
+    pub ca: String,
+    pub fingerprint: String,
+    pub credential: String,
+    pub error: Option<String>,
+}
+
+/// The form fields, in drawing order.
+pub const CONNECT_FIELDS: usize = 5;
+
+impl ConnectForm {
+    pub fn new() -> Self {
+        Self {
+            field: 0,
+            address: String::new(),
+            port: String::new(),
+            ca: String::new(),
+            fingerprint: String::new(),
+            credential: String::new(),
+            error: None,
+        }
+    }
+
+    pub fn field_name(field: usize) -> Option<&'static str> {
+        match field {
+            0 => Some("Host address"),
+            1 => Some("Port"),
+            2 => Some("CA certificate (base64 DER)"),
+            3 => Some("Host certificate SHA-256"),
+            4 => Some("Human pairing credential"),
+            _ => None,
+        }
+    }
+
+    /// What the form shows for one field. The credential is masked.
+    pub fn value(&self, field: usize) -> String {
+        match field {
+            0 => self.address.clone(),
+            1 => self.port.clone(),
+            2 => self.ca.clone(),
+            3 => self.fingerprint.clone(),
+            4 => {
+                if self.credential.is_empty() {
+                    String::new()
+                } else {
+                    "••••••••".to_string()
+                }
+            }
+            _ => String::new(),
+        }
+    }
+
+    pub fn push(&mut self, ch: char) {
+        if !ch.is_ascii_graphic() {
+            return;
+        }
+        let field = match self.field {
+            0 => &mut self.address,
+            1 => &mut self.port,
+            2 => &mut self.ca,
+            3 => &mut self.fingerprint,
+            _ => &mut self.credential,
+        };
+        if field.len() < 4096 {
+            field.push(ch);
+        }
+        self.error = None;
+    }
+
+    pub fn backspace(&mut self) {
+        let field = match self.field {
+            0 => &mut self.address,
+            1 => &mut self.port,
+            2 => &mut self.ca,
+            3 => &mut self.fingerprint,
+            _ => &mut self.credential,
+        };
+        field.pop();
+        self.error = None;
+    }
+
+    pub fn next_field(&mut self, delta: i32) {
+        let last = CONNECT_FIELDS - 1;
+        self.field = (self.field as i32 + delta).clamp(0, last as i32) as usize;
+    }
+}
+
+impl Default for ConnectForm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One diagonal row of the sidebar: a host group heading or a device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidebarRow {
+    Group(EndpointId),
+    Device(usize),
+}
+
+/// One row in the sidebar: a serial device the core or a remote host shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceEntry {
+    /// The host this device belongs to.
+    pub endpoint: EndpointId,
     pub path: String,
     pub description: Option<String>,
     pub open: bool,
@@ -157,7 +294,12 @@ pub struct DeviceEntry {
 
 impl DeviceEntry {
     pub fn new(path: impl Into<String>) -> Self {
+        Self::on(LOCAL_ENDPOINT, path)
+    }
+
+    pub fn on(endpoint: EndpointId, path: impl Into<String>) -> Self {
         Self {
+            endpoint,
             path: path.into(),
             description: None,
             open: false,
@@ -171,6 +313,7 @@ impl DeviceEntry {
 
 /// A device this terminal is attached to.
 pub struct Session {
+    pub endpoint: EndpointId,
     pub device_id: u64,
     pub path: String,
     pub baud: u32,
@@ -185,6 +328,7 @@ pub struct Session {
 /// Baud prompt shown when opening a closed device.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BaudPrompt {
+    pub endpoint: EndpointId,
     pub path: String,
     pub input: String,
     pub error: Option<String>,
@@ -192,7 +336,12 @@ pub struct BaudPrompt {
 
 impl BaudPrompt {
     pub fn new(path: impl Into<String>) -> Self {
+        Self::on(LOCAL_ENDPOINT, path)
+    }
+
+    pub fn on(endpoint: EndpointId, path: impl Into<String>) -> Self {
         Self {
+            endpoint,
             path: path.into(),
             input: String::new(),
             error: None,
@@ -227,9 +376,9 @@ pub struct AppState {
     pub focus: Focus,
     /// What the right pane shows.
     pub view: View,
-    pub sessions: BTreeMap<u64, Session>,
+    pub sessions: BTreeMap<SessionKey, Session>,
     /// The session shown in the right pane, if any.
-    shown: Option<u64>,
+    shown: Option<SessionKey>,
     pub notice: Option<Notice>,
     pub prompt: Option<BaudPrompt>,
     pub quit: bool,
@@ -252,6 +401,11 @@ pub struct AppState {
     pub draft_checked: BTreeSet<String>,
     /// This terminal's sharing session (owner only).
     pub sharing: SharingState,
+    /// Labels for connected remote hosts, keyed by endpoint. The local
+    /// endpoint is always present in the sidebar's grouping.
+    pub remote_labels: BTreeMap<EndpointId, String>,
+    /// The remote-connect form while it is open.
+    pub connect: Option<ConnectForm>,
     rows: usize,
     cols: usize,
 }
@@ -283,6 +437,8 @@ impl AppState {
             draft: TerminalSettings::default(),
             draft_checked: BTreeSet::new(),
             sharing: SharingState::new(),
+            remote_labels: BTreeMap::new(),
+            connect: None,
             rows: rows.max(1),
             cols: cols.max(1),
         }
@@ -524,6 +680,35 @@ impl AppState {
         }
     }
 
+    /// The sidebar's rows. With a connected remote host, devices are grouped
+    /// under a heading per endpoint, so identical paths on two hosts cannot be
+    /// mistaken for one device.
+    pub fn sidebar_rows(&self) -> Vec<SidebarRow> {
+        let grouped = !self.remote_labels.is_empty();
+        let mut rows = Vec::new();
+        let mut last: Option<EndpointId> = None;
+        for (index, device) in self.devices.iter().enumerate() {
+            if grouped && last != Some(device.endpoint) {
+                rows.push(SidebarRow::Group(device.endpoint));
+                last = Some(device.endpoint);
+            }
+            rows.push(SidebarRow::Device(index));
+        }
+        rows
+    }
+
+    /// The heading of one endpoint's device group.
+    pub fn endpoint_label(&self, endpoint: EndpointId) -> String {
+        if endpoint == LOCAL_ENDPOINT {
+            "Local".to_string()
+        } else {
+            self.remote_labels
+                .get(&endpoint)
+                .cloned()
+                .unwrap_or_else(|| format!("Remote {}", endpoint.0))
+        }
+    }
+
     /// Whether the sidebar's Settings button is highlighted.
     pub fn settings_button_selected(&self) -> bool {
         self.selected_button == Some(SidebarButton::Settings)
@@ -563,38 +748,51 @@ impl AppState {
         self.devices.get(self.selected)
     }
 
+    /// The key of the session shown in the right pane, if any.
+    pub fn shown_key(&self) -> Option<SessionKey> {
+        self.shown
+    }
+
     /// The device shown in the right pane, found by its session.
     pub fn shown_device(&self) -> Option<&DeviceEntry> {
-        let id = self.shown?;
-        let session = self.sessions.get(&id)?;
-        self.devices
-            .iter()
-            .find(|device| device.device_id == Some(id) || device.path == session.path)
+        let key = self.shown?;
+        let session = self.sessions.get(&key)?;
+        self.devices.iter().find(|device| {
+            device.endpoint == key.endpoint
+                && (device.device_id == Some(key.device_id) || device.path == session.path)
+        })
     }
 
     /// The session shown in the right pane.
     pub fn shown_session(&self) -> Option<&Session> {
-        self.shown.and_then(|id| self.sessions.get(&id))
+        self.shown.and_then(|key| self.sessions.get(&key))
     }
 
     pub fn shown_session_mut(&mut self) -> Option<&mut Session> {
-        let id = self.shown?;
-        self.sessions.get_mut(&id)
+        let key = self.shown?;
+        self.sessions.get_mut(&key)
     }
 
     /// The session of the highlighted device row, if it is attached.
     pub fn highlighted_session(&self) -> Option<&Session> {
-        let path = &self.selected_device()?.path;
-        self.sessions.values().find(|session| &session.path == path)
+        let device = self.selected_device()?;
+        self.sessions
+            .values()
+            .find(|session| session.endpoint == device.endpoint && session.path == device.path)
     }
 
     /// Show a session in the right pane without changing the highlight.
-    pub fn show_device(&mut self, device_id: u64) -> bool {
-        if !self.sessions.contains_key(&device_id) {
+    pub fn show_device(&mut self, key: SessionKey) -> bool {
+        if !self.sessions.contains_key(&key) {
             return false;
         }
-        self.shown = Some(device_id);
+        self.shown = Some(key);
         true
+    }
+
+    /// Show one local session, for callers that only use this core.
+    pub fn show_local_device(&mut self, device_id: u64) -> bool {
+        self.show_device(SessionKey::local(device_id))
     }
 
     /// Select one sidebar row. The shown stream is untouched: choosing a row
@@ -643,13 +841,35 @@ impl AppState {
             .is_some()
     }
 
-    /// Replace the discovered device list, keeping the highlight and any
-    /// sessions the core did not enumerate (PTYs in tests, for example).
-    pub fn set_devices(&mut self, mut devices: Vec<DeviceEntry>) {
-        let selected_path = self.selected_device().map(|device| device.path.clone());
+    pub fn select_endpoint_path(&mut self, endpoint: EndpointId, path: &str) -> bool {
+        self.devices
+            .iter()
+            .position(|device| device.endpoint == endpoint && device.path == path)
+            .map(|index| self.select_index(index))
+            .is_some()
+    }
+
+    /// Replace this machine's discovered device list.
+    pub fn set_devices(&mut self, devices: Vec<DeviceEntry>) {
+        self.set_endpoint_devices(LOCAL_ENDPOINT, devices);
+    }
+
+    /// Replace one endpoint's discovered device list, keeping the highlight
+    /// and any sessions that host did not enumerate. Other endpoints' rows are
+    /// untouched, so identical paths on two hosts stay separate.
+    pub fn set_endpoint_devices(&mut self, endpoint: EndpointId, mut devices: Vec<DeviceEntry>) {
+        let selected = self
+            .selected_device()
+            .map(|device| (device.endpoint, device.path.clone()));
+        for device in &mut devices {
+            device.endpoint = endpoint;
+        }
         for session in self.sessions.values() {
-            if devices.iter().all(|device| device.path != session.path) {
+            if session.endpoint == endpoint
+                && devices.iter().all(|device| device.path != session.path)
+            {
                 devices.push(DeviceEntry {
+                    endpoint,
                     path: session.path.clone(),
                     description: None,
                     open: true,
@@ -660,9 +880,13 @@ impl AppState {
                 });
             }
         }
-        // The core's device list is authoritative for open state and the AI
-        // control holder; reconcile sessions by stable client id.
-        for session in self.sessions.values_mut() {
+        // The host's device list is authoritative for open state and the AI
+        // control holder; reconcile this endpoint's sessions by stable id.
+        for session in self
+            .sessions
+            .values_mut()
+            .filter(|session| session.endpoint == endpoint)
+        {
             if let Some(device) = devices
                 .iter()
                 .find(|device| device.device_id == Some(session.device_id))
@@ -674,16 +898,24 @@ impl AppState {
                 }
             }
         }
-        devices.sort_by(|left, right| left.path.cmp(&right.path));
-        self.devices = devices;
-        // A button keeps the highlight; a device row keeps its device by path
-        // when the list was re-sorted or grew.
+        self.devices.retain(|device| device.endpoint != endpoint);
+        self.devices.extend(devices);
+        self.devices.sort_by(|left, right| {
+            left.endpoint
+                .cmp(&right.endpoint)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        // A button keeps the highlight; a device row keeps its device by
+        // endpoint and path when the list was re-sorted or grew.
         if self.selected_button.is_some() {
             return;
         }
-        let row = selected_path
-            .as_deref()
-            .and_then(|path| self.devices.iter().position(|device| device.path == path))
+        let row = selected
+            .and_then(|(endpoint, path)| {
+                self.devices
+                    .iter()
+                    .position(|device| device.endpoint == endpoint && device.path == path)
+            })
             .unwrap_or(0);
         self.select_index(row);
     }
@@ -691,6 +923,7 @@ impl AppState {
     /// Add a freshly opened session, point the sidebar at it and show it. The
     /// screen starts empty and is fed only by live events, so output is never
     /// duplicated by a history snapshot racing the live subscription.
+    /// Add a freshly opened local session (tests and the local-only path).
     pub fn add_session(
         &mut self,
         device_id: u64,
@@ -698,8 +931,26 @@ impl AppState {
         baud: u32,
         control: Option<Holder>,
     ) {
+        self.add_endpoint_session(LOCAL_ENDPOINT, device_id, path, baud, control);
+    }
+
+    /// Add a freshly opened session on one host, point the sidebar at it and
+    /// show it. The screen starts empty and is fed only by live events.
+    pub fn add_endpoint_session(
+        &mut self,
+        endpoint: EndpointId,
+        device_id: u64,
+        path: impl Into<String>,
+        baud: u32,
+        control: Option<Holder>,
+    ) {
         let path = path.into();
+        let key = SessionKey {
+            endpoint,
+            device_id,
+        };
         let session = Session {
+            endpoint,
             device_id,
             path: path.clone(),
             baud,
@@ -713,8 +964,12 @@ impl AppState {
             rows: self.rows,
             cols: self.cols,
         };
-        self.sessions.insert(device_id, session);
-        if let Some(device) = self.devices.iter_mut().find(|device| device.path == path) {
+        self.sessions.insert(key, session);
+        if let Some(device) = self
+            .devices
+            .iter_mut()
+            .find(|device| device.endpoint == endpoint && device.path == path)
+        {
             device.open = true;
             device.device_id = Some(device_id);
             device.baud = Some(baud);
@@ -722,6 +977,7 @@ impl AppState {
             device.control_id = control.as_ref().map(|holder| holder.client_id);
         } else {
             self.devices.push(DeviceEntry {
+                endpoint,
                 path: path.clone(),
                 description: None,
                 open: true,
@@ -733,19 +989,25 @@ impl AppState {
             self.devices
                 .sort_by(|left, right| left.path.cmp(&right.path));
         }
-        if let Some(index) = self.devices.iter().position(|device| device.path == path) {
+        if let Some(index) = self
+            .devices
+            .iter()
+            .position(|device| device.endpoint == endpoint && device.path == path)
+        {
             self.select_index(index);
         }
-        self.shown = Some(device_id);
+        self.shown = Some(key);
     }
 
     /// Drop a session. A disconnect never closes the terminal and never drops
     /// the settings view: when the shown device goes away, another attached
     /// session takes the right pane, or the pane shows its empty hint.
-    pub fn remove_session(&mut self, device_id: u64) -> Option<Session> {
-        let session = self.sessions.remove(&device_id)?;
+    pub fn remove_session(&mut self, key: SessionKey) -> Option<Session> {
+        let session = self.sessions.remove(&key)?;
         for device in &mut self.devices {
-            if device.device_id == Some(device_id) || device.path == session.path {
+            if device.endpoint == key.endpoint
+                && (device.device_id == Some(key.device_id) || device.path == session.path)
+            {
                 device.open = false;
                 device.device_id = None;
                 device.baud = None;
@@ -753,17 +1015,23 @@ impl AppState {
                 device.control_id = None;
             }
         }
-        if self.shown == Some(device_id) {
+        if self.shown == Some(key) {
             self.shown = self
                 .sessions
-                .values()
-                .min_by(|left, right| left.path.cmp(&right.path))
-                .map(|session| session.device_id);
+                .iter()
+                .min_by(|(left_key, _), (right_key, _)| {
+                    left_key.endpoint.cmp(&right_key.endpoint).then_with(|| {
+                        self.sessions[left_key]
+                            .path
+                            .cmp(&self.sessions[right_key].path)
+                    })
+                })
+                .map(|(key, _)| *key);
             match self.view {
                 // The stream forwards keys to the device, so it always shows
                 // the live screen of the session that takes over.
                 View::Stream => {
-                    if let Some(session) = self.shown.and_then(|id| self.sessions.get_mut(&id)) {
+                    if let Some(session) = self.shown.and_then(|key| self.sessions.get_mut(&key)) {
                         session.screen.scroll_to_bottom();
                     }
                     // A stream that suddenly belongs to another device must
@@ -775,10 +1043,29 @@ impl AppState {
                 // own kept rows and scrolled position. With nothing left, the
                 // view falls back to the empty stream.
                 View::Scrollback if self.shown.is_none() => self.view = View::Stream,
-                View::Scrollback | View::Settings | View::Pairing => {}
+                View::Scrollback | View::Settings | View::Pairing | View::Connect => {}
             }
         }
         Some(session)
+    }
+
+    /// Drop every session of one endpoint (its host disconnected).
+    pub fn remove_endpoint_sessions(&mut self, endpoint: EndpointId) -> Vec<SessionKey> {
+        let keys: Vec<SessionKey> = self
+            .sessions
+            .keys()
+            .filter(|key| key.endpoint == endpoint)
+            .copied()
+            .collect();
+        for key in &keys {
+            self.remove_session(*key);
+        }
+        keys
+    }
+
+    /// Every attached session, with its endpoint and that host's device id.
+    pub fn all_sessions(&self) -> Vec<SessionKey> {
+        self.sessions.keys().copied().collect()
     }
 
     /// Take the core's authoritative sharing snapshot. A device the core no
@@ -821,16 +1108,21 @@ impl AppState {
             .any(|device| self.draft_checked.contains(&device.path))
     }
 
-    pub fn all_device_ids(&self) -> Vec<u64> {
-        self.sessions.keys().copied().collect()
+    /// Apply one local core event.
+    pub fn apply_event(&mut self, event: &Event) {
+        self.apply_endpoint_event(LOCAL_ENDPOINT, event);
     }
 
-    /// Apply one core event. Device output goes to its screen, AI writes are
-    /// shown, human writes are never echoed, and closure becomes a notice.
-    pub fn apply_event(&mut self, event: &Event) {
+    /// Apply one event from a specific host. Session lookups are keyed by the
+    /// endpoint, so two hosts with the same device id cannot cross streams.
+    pub fn apply_endpoint_event(&mut self, endpoint: EndpointId, event: &Event) {
         match event {
             Event::DeviceOutput { device_id, .. } => {
-                if let Some(session) = self.sessions.get_mut(device_id) {
+                let key = SessionKey {
+                    endpoint,
+                    device_id: *device_id,
+                };
+                if let Some(session) = self.sessions.get_mut(&key) {
                     if let Some(Ok(bytes)) = event.bytes() {
                         session.screen.feed(&bytes);
                     }
@@ -840,7 +1132,11 @@ impl AppState {
                 device_id, source, ..
             } => {
                 if *source == Source::Ai {
-                    if let Some(session) = self.sessions.get_mut(device_id) {
+                    let key = SessionKey {
+                        endpoint,
+                        device_id: *device_id,
+                    };
+                    if let Some(session) = self.sessions.get_mut(&key) {
                         if let Some(Ok(bytes)) = event.bytes() {
                             session.screen.feed_ai(&bytes);
                         }
@@ -852,11 +1148,15 @@ impl AppState {
                 path,
                 reason,
             } => {
-                self.remove_session(*device_id);
+                let key = SessionKey {
+                    endpoint,
+                    device_id: *device_id,
+                };
+                self.remove_session(key);
                 self.notice = Some(Notice::error(format!("unplugged: {path} ({reason})")));
             }
             Event::ControlGranted { device_id, holder } => {
-                self.set_control(*device_id, Some(holder));
+                self.set_control(endpoint, *device_id, Some(holder));
             }
             Event::ControlReleased {
                 device_id,
@@ -865,23 +1165,28 @@ impl AppState {
             } => {
                 // Match the stable client id: a release event may omit the
                 // name the holder had when control was granted.
+                let key = SessionKey {
+                    endpoint,
+                    device_id: *device_id,
+                };
                 let matches = self
                     .sessions
-                    .get(device_id)
+                    .get(&key)
                     .is_some_and(|session| session.control_id == Some(holder.client_id))
                     || self.devices.iter().any(|device| {
-                        device.device_id == Some(*device_id)
+                        device.endpoint == endpoint
+                            && device.device_id == Some(*device_id)
                             && device.control_id == Some(holder.client_id)
                     });
                 if matches {
-                    self.set_control(*device_id, None);
+                    self.set_control(endpoint, *device_id, None);
                 }
                 self.notice = Some(Notice::info(format!("AI control released ({reason:?})")));
             }
             Event::ControlDenied {
                 device_id, holder, ..
             } => {
-                self.set_control(*device_id, Some(holder));
+                self.set_control(endpoint, *device_id, Some(holder));
             }
             Event::TransportClosed { reason } => {
                 self.notice = Some(Notice::error(format!("core connection closed: {reason}")));
@@ -893,15 +1198,19 @@ impl AppState {
         }
     }
 
-    fn set_control(&mut self, device_id: u64, holder: Option<&Holder>) {
+    fn set_control(&mut self, endpoint: EndpointId, device_id: u64, holder: Option<&Holder>) {
         let label = holder.map(short_holder);
         let control_id = holder.map(|holder| holder.client_id);
-        if let Some(session) = self.sessions.get_mut(&device_id) {
+        let key = SessionKey {
+            endpoint,
+            device_id,
+        };
+        if let Some(session) = self.sessions.get_mut(&key) {
             session.control = label.clone();
             session.control_id = control_id;
         }
         for device in &mut self.devices {
-            if device.device_id == Some(device_id) {
+            if device.endpoint == endpoint && device.device_id == Some(device_id) {
                 device.control = label.clone();
                 device.control_id = control_id;
             }
@@ -917,8 +1226,9 @@ impl AppState {
         if device.device_id.is_some() {
             return false;
         }
+        let endpoint = device.endpoint;
         let path = device.path.clone();
-        self.prompt = Some(BaudPrompt::new(path));
+        self.prompt = Some(BaudPrompt::on(endpoint, path));
         true
     }
 
@@ -1012,11 +1322,11 @@ mod tests {
         let mut state = AppState::new(10, 80);
         state.add_session(7, "/dev/a", 115_200, None);
         state.add_session(8, "/dev/b", 115_200, None);
-        state.show_device(8);
+        state.show_local_device(8);
         state.view = View::Stream;
         state.focus = Focus::Right;
 
-        state.remove_session(8);
+        state.remove_session(SessionKey::local(8));
 
         assert_eq!(state.shown_session().unwrap().device_id, 7);
         assert_eq!(
@@ -1036,8 +1346,13 @@ mod tests {
             state.apply_event(&Event::device_output(7, line.as_bytes()));
         }
         // B is the shown session; its own screen stays where it was.
-        state.show_device(8);
-        state.sessions.get_mut(&8).unwrap().screen.scroll_back(2);
+        state.show_local_device(8);
+        state
+            .sessions
+            .get_mut(&SessionKey::local(8))
+            .unwrap()
+            .screen
+            .scroll_back(2);
         state.view = View::Scrollback;
         state.focus = Focus::Right;
 
@@ -1061,7 +1376,7 @@ mod tests {
         state.add_session(7, "/dev/a", 115_200, None);
         state.view = View::Scrollback;
 
-        state.remove_session(7);
+        state.remove_session(SessionKey::local(7));
 
         assert!(state.shown_session().is_none());
         assert_eq!(
@@ -1167,11 +1482,11 @@ mod tests {
     fn a_session_keeps_scrolled_off_output_and_scrolls_back_through_it() {
         let mut state = session_state(4, true);
         write_lines(&mut state, 0, 8);
-        let session = state.sessions.get(&7).expect("session");
+        let session = state.sessions.get(&SessionKey::local(7)).expect("session");
         assert_eq!(session.screen.history_len(), 5, "five lines scrolled off");
         assert_eq!(session.screen.scroll(), 0, "the live view is the start");
 
-        let session = state.sessions.get_mut(&7).unwrap();
+        let session = state.sessions.get_mut(&SessionKey::local(7)).unwrap();
         session.screen.scroll_back(4);
         assert_eq!(session.screen.scroll(), 4);
         let row: String = (0..20)
@@ -1195,14 +1510,14 @@ mod tests {
     fn scrolling_back_while_output_arrives_keeps_the_same_text_in_view() {
         let mut state = session_state(4, true);
         write_lines(&mut state, 0, 8);
-        let session = state.sessions.get_mut(&7).unwrap();
+        let session = state.sessions.get_mut(&SessionKey::local(7)).unwrap();
         session.screen.scroll_back(3);
         let before: String = (0..20)
             .map(|col| session.screen.view_cell(0, col).ch)
             .collect();
 
         write_lines(&mut state, 8, 2);
-        let session = state.sessions.get(&7).unwrap();
+        let session = state.sessions.get(&SessionKey::local(7)).unwrap();
         assert!(session.screen.scroll() > 3, "the view stayed on its text");
         let after: String = (0..20)
             .map(|col| session.screen.view_cell(0, col).ch)
@@ -1214,7 +1529,7 @@ mod tests {
     fn without_the_scrollback_setting_nothing_is_kept_or_scrolled() {
         let mut state = session_state(4, false);
         write_lines(&mut state, 0, 12);
-        let session = state.sessions.get_mut(&7).unwrap();
+        let session = state.sessions.get_mut(&SessionKey::local(7)).unwrap();
         assert_eq!(session.screen.history_len(), 0);
         session.screen.scroll_back(5);
         assert_eq!(session.screen.scroll(), 0, "nothing to scroll to");
@@ -1224,13 +1539,21 @@ mod tests {
     fn saving_scrollback_off_clears_every_sessions_history() {
         let mut state = session_state(4, true);
         write_lines(&mut state, 0, 12);
-        assert!(state.sessions.get(&7).unwrap().screen.history_len() > 0);
+        assert!(
+            state
+                .sessions
+                .get(&SessionKey::local(7))
+                .unwrap()
+                .screen
+                .history_len()
+                > 0
+        );
 
         state.begin_settings();
         state.draft.scrollback = false;
         state.commit_settings();
         assert!(!state.settings.scrollback);
-        let session = state.sessions.get(&7).unwrap();
+        let session = state.sessions.get(&SessionKey::local(7)).unwrap();
         assert_eq!(session.screen.history_len(), 0, "the rows are freed");
         assert_eq!(session.screen.scroll(), 0, "the view is back on live");
     }
@@ -1243,25 +1566,56 @@ mod tests {
         state.draft.scrollback = true;
         state.commit_settings();
         write_lines(&mut state, 8, 8);
-        assert!(state.sessions.get(&7).unwrap().screen.history_len() > 0);
+        assert!(
+            state
+                .sessions
+                .get(&SessionKey::local(7))
+                .unwrap()
+                .screen
+                .history_len()
+                > 0
+        );
     }
 
     #[test]
     fn resizing_keeps_every_sessions_scroll_position() {
         let mut state = session_state(6, true);
         write_lines(&mut state, 0, 12);
-        state.sessions.get_mut(&7).unwrap().screen.scroll_back(4);
-        let scroll = state.sessions.get(&7).unwrap().screen.scroll();
+        state
+            .sessions
+            .get_mut(&SessionKey::local(7))
+            .unwrap()
+            .screen
+            .scroll_back(4);
+        let scroll = state
+            .sessions
+            .get(&SessionKey::local(7))
+            .unwrap()
+            .screen
+            .scroll();
         assert!(scroll > 0);
 
         state.resize(4, 30);
         assert_eq!(
-            state.sessions.get(&7).unwrap().screen.scroll(),
+            state
+                .sessions
+                .get(&SessionKey::local(7))
+                .unwrap()
+                .screen
+                .scroll(),
             scroll,
             "a resize keeps the scrolled position"
         );
         state.resize(8, 50);
-        assert_eq!(state.sessions.get(&7).unwrap().screen.scroll(), scroll);
+        assert_eq!(
+            state
+                .sessions
+                .get(&SessionKey::local(7))
+                .unwrap()
+                .screen
+                .scroll(),
+            scroll
+        );
     }
 }
 
@@ -1388,7 +1742,7 @@ mod sharing_tests {
 
     #[test]
     fn settings_row_kinds_follow_the_detected_devices() {
-        let mut state = state_with_devices();
+        let state = state_with_devices();
         assert_eq!(state.settings_row_count(), SETTINGS_FIXED_ROWS + 2);
         assert_eq!(state.settings_kind(0), Some(SettingsRow::LocalEcho));
         assert_eq!(state.settings_kind(2), Some(SettingsRow::ShareAddress));

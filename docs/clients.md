@@ -261,3 +261,81 @@ devices. There is no continuous stream: poll `read`.
 See [`crates/serial-nexus-mcp/README.md`](../crates/serial-nexus-mcp/README.md)
 for the tool reference, protocol notes and limitations (text only, one request at
 a time per session, bounded waits and reads, Linux only).
+
+### Sharing devices on the LAN from the terminal
+
+Sharing is opt-in and off by default. The sidebar has `[ Share: off ]` between
+the device list and the Settings button; `s` does the same from the sidebar.
+Nothing listens on the network until it is started deliberately.
+
+1. Open Settings and type the interface address and port the host should listen
+   on: one concrete IPv4 or IPv6 address (for example `192.168.1.20` or `::1`).
+   A wildcard such as `0.0.0.0` or `::` is refused. The address and port are
+   saved preferences; the device checklist is not.
+2. Tick the detected devices to share. A device does not need to be open by the
+   host, and at least one must be ticked before sharing can start. `Space` or
+   `Enter` toggles a checkbox; clicking it does the same.
+3. `Ctrl+S`/`[ Save ]` writes the preferences and applies the checklist. `Esc`/
+   `[ Cancel ]` throws both away. A save that fails — a refused checklist change
+   or a settings file that cannot be written — applies neither the checklist nor
+   the preferences and keeps the draft.
+4. Start sharing with the Share button or `s`. A bind failure is shown in the
+   footer and sharing stays off. Once on, the pairing view shows the bound
+   address and what a remote client needs.
+
+The pairing view (`p`, or `Enter` on the running Share button) shows the host
+name, the host certificate's SHA-256 fingerprint, the session's CA certificate
+(base64 DER) and two separate credentials: one for the human terminal, one for
+MCP/AI clients. The credentials are shown only to the owner, are never written
+to the settings file or a device, and disappear when sharing stops. Use `↑`/`↓`
+to scroll the long certificate.
+
+While sharing is on, saving a checklist that unchecks a device tells the core
+to revoke it at once: remote clients on that device are detached and their
+queued writes dropped. Local clients and other checked devices are untouched.
+Unplugging a device, or replacing it with a different device at the same path,
+clears its checkbox; a replacement must be ticked again. The core's checked
+list is authoritative, never the UI's idea of it.
+
+Stopping sharing (`s` again, the Share button, or leaving the terminal) closes
+the listener, disconnects every remote client and revokes both credentials. A
+crashed terminal is noticed by the core when its owner connection closes, with
+the same effect. Restarting is off and creates fresh credentials.
+
+**Firewall and router exposure.** Binding an address only makes the process
+listen on it. Whether another machine can reach it is decided by the host
+firewall and by router/NAT configuration; opening a home router port exposes
+the service beyond the LAN. Share only on a trusted network, share only the
+devices needed, and stop sharing when finished.
+
+**A write is not transactional.** Accepting a write means it may reach the
+device; a USB unplug, an uncheck or a lost connection can leave a partially
+written command. The terminal never retries or replays a write, and a write
+whose answer was lost is reported as uncertain so the human can decide what to
+do.
+
+### Connecting to a shared host
+
+The sidebar's `[ Connect ]` button (or `c`) opens a form for the host address,
+port, CA certificate, host fingerprint and human pairing credential. Every value
+is entered by hand or pasted and lives only in memory: it is not saved, not
+logged and never sent to a serial device. The terminal verifies the host's
+certificate against the entered CA and pinned fingerprint before sending the
+credential; a mismatch is refused and the form stays open with the reason.
+
+After a successful pair, the connected host's approved devices appear in the
+sidebar under a `Remote <address:port>` heading (the local devices stay under
+`Local`). Identical device paths on two hosts are separate rows with separate
+sessions, and only devices the host checked are listed. Selecting or
+highlighting a row never changes the shown stream; only `Enter`, a double-click
+or an explicit open does. A device the host allows but has not opened asks for a
+baud rate; later clients join at the active rate. Remote devices keep their own
+scrollback, settings and local echo like local ones.
+
+A remote write failure, disconnect or unplug is shown in the footer. It affects
+only that device (or that host's sessions on disconnect); local devices and
+other remote hosts keep working. The terminal never retries a remote write. An
+MCP client and a human may use the same shared device concurrently, and the
+core's one-AI-writer rule still applies across local and remote AI clients.
+Reconnecting after quitting the terminal requires entering the pairing
+information again.
