@@ -248,12 +248,7 @@ impl App {
             // The core ends a sharing session when its owner connection goes
             // away; there is no listener or credential left to show.
             self.state.sharing.clear_session();
-            if self.state.view == View::Pairing {
-                // A remote stream may still be attached in the right pane.
-                // Return the keys to the sidebar so `s` cannot become a write.
-                self.state.view = View::Stream;
-                self.state.focus = Focus::Sidebar;
-            }
+            self.state.close_pairing_view();
         }
         self.state.apply_endpoint_event(endpoint, &event);
     }
@@ -1109,9 +1104,7 @@ impl App {
                 );
                 if ended {
                     self.state.sharing.clear_session();
-                    if self.state.view == View::Pairing {
-                        self.state.view = View::Stream;
-                    }
+                    self.state.close_pairing_view();
                     self.state.notice = Some(Notice::error(format!("sharing stopped: {error}")));
                 } else {
                     self.state.notice = Some(Notice::error(format!(

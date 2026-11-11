@@ -319,12 +319,16 @@ impl DeviceEntry {
         Self::on(LOCAL_ENDPOINT, path)
     }
 
+    /// A detected entry with a synthetic identity, for tests and local-only
+    /// construction. Real discovery replaces it with the core's identity.
     pub fn on(endpoint: EndpointId, path: impl Into<String>) -> Self {
+        let path = path.into();
+        let identity = Some(format!("entry:{path}"));
         Self {
             endpoint,
-            path: path.into(),
+            path,
             description: None,
-            identity: None,
+            identity,
             open: false,
             device_id: None,
             baud: None,
@@ -584,9 +588,15 @@ impl AppState {
                     self.draft_identities.remove(&path);
                     false
                 } else {
-                    if let Some(identity) = &device.identity {
-                        self.draft_identities.insert(path.clone(), identity.clone());
-                    }
+                    // Without a captured identity the core could only match a
+                    // path, so a replacement could inherit this check.
+                    let Some(identity) = device.identity.clone() else {
+                        self.notice = Some(Notice::error(
+                            "this device has no captured identity; refresh and try again",
+                        ));
+                        return Some(false);
+                    };
+                    self.draft_identities.insert(path.clone(), identity);
                     self.draft_checked.insert(path);
                     true
                 };
@@ -1178,9 +1188,17 @@ impl AppState {
         self.sharing.snapshot = snapshot.active.then_some(snapshot);
         if !self.sharing.active {
             self.sharing.pairing = None;
-            if self.view == View::Pairing {
-                self.view = View::Stream;
-            }
+            self.close_pairing_view();
+        }
+    }
+
+    /// Leave a pairing view after sharing ended without the human asking.
+    /// The keys go back to the sidebar, so a later `s` cannot be written to a
+    /// remote stream that happens to be in the right pane.
+    pub fn close_pairing_view(&mut self) {
+        if self.view == View::Pairing {
+            self.view = View::Stream;
+            self.focus = Focus::Sidebar;
         }
     }
 

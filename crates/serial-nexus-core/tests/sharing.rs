@@ -344,6 +344,46 @@ fn unchecking_revokes_remote_access_immediately_and_keeps_other_sessions() {
 }
 
 #[test]
+fn replacing_the_allowlist_revokes_removed_remote_clients() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let first = SimulatedDevice::new();
+    let second = SimulatedDevice::new();
+    let local = connect(&core.socket, ClientInfo::human("local"));
+    local
+        .open(&first.path, Some(115_200), false)
+        .expect("open first");
+    local
+        .open(&second.path, Some(115_200), false)
+        .expect("open second");
+    let info = owner
+        .start_sharing(
+            localhost_bind(),
+            vec![first.path.clone(), second.path.clone()],
+        )
+        .expect("start");
+    let human = remote(&info, PairingRole::Human, "remote").expect("pair");
+    let first_remote = human.open(&first.path, None, false).expect("open first");
+    let second_remote = human.open(&second.path, None, false).expect("open second");
+
+    let snapshot = owner
+        .replace_shared_devices_expected(
+            vec![second.path.clone()],
+            std::collections::BTreeMap::new(),
+        )
+        .expect("replace");
+    assert_eq!(snapshot.checked.len(), 1);
+    assert_eq!(snapshot.checked[0].path, second.path);
+    assert!(
+        human.read(first_remote.device_id, Some(1)).is_err(),
+        "the removed device is revoked at once"
+    );
+    human
+        .write_bytes(second_remote.device_id, b"still", None)
+        .expect("the kept device keeps working");
+}
+
+#[test]
 fn losing_the_owner_connection_stops_the_listener_and_disconnects_remotes() {
     let core = shared_core();
     let device = SimulatedDevice::new();

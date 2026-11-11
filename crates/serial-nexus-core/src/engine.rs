@@ -1511,6 +1511,46 @@ impl Engine {
         Ok(identity)
     }
 
+    /// Validate and resolve a selected device set: every path must still be
+    /// the node the owner selected, an open instance must be the same node,
+    /// and duplicates collapse to one canonical path.
+    fn validated_shared_identities(
+        &self,
+        paths: &[String],
+        expected: &BTreeMap<String, String>,
+    ) -> Result<Vec<DeviceIdentity>, ErrorBody> {
+        let mut identities = Vec::new();
+        let mut seen = HashSet::new();
+        for path in paths {
+            let identity = self.detected_device(path)?;
+            if !identity_matches_expected(&identity, expected.get(path)) {
+                return Err(ErrorBody::new(
+                    ErrorCode::DeviceFailed,
+                    format!("the device at {path} changed; check it again"),
+                ));
+            }
+            let canonical = identity.canonical.clone();
+            let stale_open = {
+                let state = self.state.lock().expect("state lock");
+                state
+                    .devices
+                    .values()
+                    .find(|device| device.path == canonical)
+                    .map(|device| !device_matches_identity(device, &identity))
+            };
+            if stale_open == Some(true) {
+                return Err(ErrorBody::new(
+                    ErrorCode::DeviceFailed,
+                    "an open instance at this path is a different device; close it first",
+                ));
+            }
+            if seen.insert(canonical) {
+                identities.push(identity);
+            }
+        }
+        Ok(identities)
+    }
+
     fn start_sharing(
         self: &Arc<Self>,
         client_id: u64,
@@ -1550,35 +1590,7 @@ impl Engine {
                 format!("at most {MAX_SHARED_DEVICES} devices may be shared"),
             ));
         }
-        let mut identities = Vec::new();
-        let mut seen = HashSet::new();
-        for path in &params.devices {
-            let identity = self.detected_device(path)?;
-            if !identity_matches_expected(&identity, params.expected.get(path)) {
-                return Err(ErrorBody::new(
-                    ErrorCode::DeviceFailed,
-                    format!("the device at {path} changed; check it again"),
-                ));
-            }
-            if let Some(device) = self
-                .state
-                .lock()
-                .expect("state lock")
-                .devices
-                .values()
-                .find(|device| device.path == identity.canonical)
-            {
-                if !device_matches_identity(device, &identity) {
-                    return Err(ErrorBody::new(
-                        ErrorCode::DeviceFailed,
-                        "an open instance at this path is a different device; close it first",
-                    ));
-                }
-            }
-            if seen.insert(identity.canonical.clone()) {
-                identities.push(identity);
-            }
-        }
+        let identities = self.validated_shared_identities(&params.devices, &params.expected)?;
         // Binding is synchronous: a failure here leaves sharing off.
         let prepared = share::prepare(client_id, &params, identities, self.share_limits())
             .map_err(|message| ErrorBody::new(ErrorCode::DeviceFailed, message))?;
@@ -1685,35 +1697,7 @@ impl Engine {
         }
         // Validate every path first, then add the whole batch at once. A
         // failed batch leaves the allowlist exactly as it was.
-        let mut identities = Vec::new();
-        let mut seen = HashSet::new();
-        for path in &params.devices {
-            let identity = self.detected_device(path)?;
-            if !identity_matches_expected(&identity, params.expected.get(path)) {
-                return Err(ErrorBody::new(
-                    ErrorCode::DeviceFailed,
-                    format!("the device at {path} changed; check it again"),
-                ));
-            }
-            let canonical = identity.canonical.clone();
-            let stale_open = {
-                let state = self.state.lock().expect("state lock");
-                state
-                    .devices
-                    .values()
-                    .find(|device| device.path == canonical)
-                    .map(|device| !device_matches_identity(device, &identity))
-            };
-            if stale_open == Some(true) {
-                return Err(ErrorBody::new(
-                    ErrorCode::DeviceFailed,
-                    "an open instance at this path is a different device; close it first",
-                ));
-            }
-            if seen.insert(canonical) {
-                identities.push(identity);
-            }
-        }
+        let identities = self.validated_shared_identities(&params.devices, &params.expected)?;
         let expired = session.check_many(identities.clone())?;
         {
             let mut state = self.state.lock().expect("state lock");
@@ -1747,41 +1731,15 @@ impl Engine {
                 "sharing is stopping",
             ));
         }
-        let mut identities = Vec::new();
-        let mut seen = HashSet::new();
-        for path in &params.devices {
-            let identity = self.detected_device(path)?;
-            if !identity_matches_expected(&identity, params.expected.get(path)) {
-                return Err(ErrorBody::new(
-                    ErrorCode::DeviceFailed,
-                    format!("the device at {path} changed; check it again"),
-                ));
-            }
-            let canonical = identity.canonical.clone();
-            let stale_open = {
-                let state = self.state.lock().expect("state lock");
-                state
-                    .devices
-                    .values()
-                    .find(|device| device.path == canonical)
-                    .map(|device| !device_matches_identity(device, &identity))
-            };
-            if stale_open == Some(true) {
-                return Err(ErrorBody::new(
-                    ErrorCode::DeviceFailed,
-                    "an open instance at this path is a different device; close it first",
-                ));
-            }
-            if seen.insert(canonical) {
-                identities.push(identity);
-            }
-        }
+        let identities = self.validated_shared_identities(&params.devices, &params.expected)?;
         let (expired, removed) = session.replace(identities)?;
-        self.clear_shared_instances();
-        self.refresh_shared_instances(&session);
+        // Revoke while the removed instances still carry their shared marker;
+        // revalidation needs it to detach remote clients and cancel waits.
         for path in expired.into_iter().chain(removed) {
             self.revoke_path_everywhere(&path, &session);
         }
+        self.clear_shared_instances();
+        self.refresh_shared_instances(&session);
         Ok(ResponseData::Sharing(session.snapshot()))
     }
 

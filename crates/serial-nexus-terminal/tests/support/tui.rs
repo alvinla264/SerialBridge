@@ -219,14 +219,16 @@ impl TuiSession {
     }
 
     /// Screen text safe to print: pairing credentials never reach test logs.
+    /// Wrapped credential fragments have no marker of their own, so a pairing
+    /// screen is redacted as a whole.
     fn redacted(text: &str) -> String {
-        text.lines()
-            .map(|line| match line.find("credential:") {
-                Some(at) => format!("{} credential: ••••••••", &line[..at]),
-                None => line.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        if text.contains("credential:")
+            || text.contains("Human terminal pairing")
+            || text.contains("MCP (AI) pairing")
+        {
+            return "[screen redacted: pairing credentials may be visible]".to_string();
+        }
+        text.to_string()
     }
 
     /// Wait for a condition on the whole screen, then keep going.

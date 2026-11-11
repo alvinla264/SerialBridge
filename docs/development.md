@@ -82,7 +82,8 @@ path as a real serial port and the test drives the master. Covered end to end:
   loopback IPv4 and IPv6 where available, host certificate pinning and wrong-CA
   refusal, wrong credentials, oversized frames, stalled TLS handshake deadline,
   unauthenticated handshake connection slots, waited-write admission limits,
-  an expected device identity enforced by the core at ShareStart/ShareCheck,
+  an expected device identity enforced by the core at ShareStart/ShareCheck/
+  ShareReplace (atomic whole-list replacement),
   bind failure leaving sharing off, unchecking
   revoking access and failing pending work while local and other devices keep
   working, owner loss stopping the listener and revoking credentials, stopping
