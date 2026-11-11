@@ -281,9 +281,8 @@ fixed with tests:
 - **The remote client encodes before registering a pending request**, so a
   refused oversized request retains nothing. Test:
   `refused_oversized_remote_requests_do_not_leak_pending_entries`.
-- **The board gate echo check only counts new device-sourced output**, never
-  the probe's human write or old history. Unit test
-  `a_firmware_echo_must_be_new_device_output_not_the_probe_or_old_history`.
+- **The board gate echo check only accepts fresh device-output events**, never
+  the probe's human write or a sliding history window.
 - The serial-queue limit test is named
   `a_slow_remote_peer_hits_the_bounded_serial_queue_and_queued_work_is_revoked`;
   the waited-write admission limit (including a non-waited write that must still
@@ -325,6 +324,18 @@ fixed with tests:
   connection slots, and an unchecked later device instance; the engine-level
   PTY-recycling replacement test is `#[ignore]`d because path reuse is not
   guaranteed, with deterministic regular-file identity tests in its place.
+
+### Ninth iterative review fixes
+
+- **Remote Open expiry revokes like discovery/event expiry.** A failed
+  `session.authorize` in the Open branch detaches the instance, bumps its
+  write epoch, cancels remote waiters and drops queued writes.
+- **A straddling remote write cannot enqueue after `device.shared` is
+  cleared.** `begin_write` refuses remote writes when the shared marker is
+  gone, closing the authorize-then-enqueue race with identity expiry.
+- **The failed-device revocation test waits for the writer to resume** before
+  asserting the queued command was dropped.
+- Documentation no longer cites a removed firmware-echo unit test.
 
 ### Eighth iterative review fixes
 

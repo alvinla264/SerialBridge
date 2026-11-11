@@ -896,6 +896,12 @@ impl Engine {
         }
         refresh_control(device, client_id);
         let remote = self.remote_scope(client_id).is_some();
+        if remote && device.shared.is_none() {
+            return Err(ErrorBody::new(
+                ErrorCode::DeviceFailed,
+                "device is no longer shared; check it again",
+            ));
+        }
         let epoch = device.write_epoch.load(Ordering::SeqCst);
         if remote {
             let queued = device.remote_queued.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1792,7 +1798,13 @@ impl Engine {
                 Ok(ResponseData::Devices(devices))
             }
             Request::Open(params) => {
-                let identity = session.authorize(&params.port)?;
+                let identity = match session.authorize(&params.port) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        self.detach_remote_path(&params.port, "device is no longer shared");
+                        return Err(error);
+                    }
+                };
                 self.open_with_identity(
                     client_id,
                     OpenParams {
@@ -1859,6 +1871,22 @@ impl Engine {
             return Err(error);
         }
         self.begin_write(client_id, params)
+    }
+
+    fn detach_remote_path(&self, path: &str, reason: &str) {
+        let target = identity_path(path);
+        let ids: Vec<u64> = self
+            .state
+            .lock()
+            .expect("state lock")
+            .devices
+            .iter()
+            .filter(|(_, device)| device.path == target || device.path == path)
+            .map(|(id, _)| *id)
+            .collect();
+        if !ids.is_empty() {
+            self.detach_remote_clients(&ids, reason);
+        }
     }
 
     fn authorize_remote_device_only(
