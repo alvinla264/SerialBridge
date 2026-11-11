@@ -16,7 +16,7 @@ use serialport::{DataBits, FlowControl, Parity, StopBits};
 /// configuration are done here so the descriptor's identity is known before
 /// termios is touched.
 struct PosixSerial {
-    file: File,
+    file: Arc<File>,
     baud: u32,
     timeout: Duration,
 }
@@ -37,10 +37,61 @@ impl PosixSerial {
     }
 }
 
+impl Drop for PosixSerial {
+    fn drop(&mut self) {
+        // Clear exclusive mode only when the last engine handle goes away; a
+        // reader/writer clone must not clear it while the other still uses it.
+        if Arc::strong_count(&self.file) == 1 {
+            // SAFETY: TTYNXCL takes no argument for this valid descriptor.
+            let _ = unsafe {
+                libc::ioctl(self.file.as_raw_fd(), 0x540D /* TIOCNXCL */)
+            };
+        }
+    }
+}
+
+fn errno_to_serial(error: nix::errno::Errno) -> serialport::Error {
+    serialport::Error::new(
+        serialport::ErrorKind::Io(io::Error::from_raw_os_error(error as i32).kind()),
+        error.to_string(),
+    )
+}
+
+fn to_serial_error(error: io::Error) -> serialport::Error {
+    serialport::Error::new(serialport::ErrorKind::Io(error.kind()), error.to_string())
+}
+
+fn set_modem_bit(
+    fd: std::os::unix::io::RawFd,
+    bit: libc::c_int,
+    level: bool,
+) -> serialport::Result<()> {
+    let request = if level {
+        libc::TIOCMBIS
+    } else {
+        libc::TIOCMBIC
+    };
+    // SAFETY: TIOCMBIS/TIOCMBIC read one int for this valid descriptor.
+    if unsafe { libc::ioctl(fd, request, &bit) } != 0 {
+        return Err(to_serial_error(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+fn read_modem_bit(fd: std::os::unix::io::RawFd, bit: libc::c_int) -> serialport::Result<bool> {
+    let mut bits: libc::c_int = 0;
+    // SAFETY: TIOCMGET writes one int for this valid descriptor.
+    if unsafe { libc::ioctl(fd, libc::TIOCMGET, &mut bits) } != 0 {
+        return Err(to_serial_error(io::Error::last_os_error()));
+    }
+    Ok(bits & bit != 0)
+}
+
 impl io::Read for PosixSerial {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         self.wait(nix::poll::PollFlags::POLLIN, self.timeout)?;
-        match self.file.read(buffer) {
+        let mut file = &*self.file;
+        match file.read(buffer) {
             Ok(read) => Ok(read),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 Err(io::Error::from(io::ErrorKind::TimedOut))
@@ -73,7 +124,8 @@ impl io::Write for PosixSerial {
                 Err(nix::errno::Errno::EINTR) => continue,
                 Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
             }
-            match self.file.write(buffer) {
+            let mut file = &*self.file;
+            match file.write(buffer) {
                 Ok(written) => return Ok(written),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -110,50 +162,124 @@ impl serialport::SerialPort for PosixSerial {
         self.timeout
     }
     fn set_baud_rate(&mut self, baud: u32) -> serialport::Result<()> {
+        configure_termios(&self.file, baud).map_err(|error| {
+            serialport::Error::new(
+                serialport::ErrorKind::Io(io::ErrorKind::Other),
+                error.to_string(),
+            )
+        })?;
         self.baud = baud;
         Ok(())
     }
-    fn set_data_bits(&mut self, _bits: DataBits) -> serialport::Result<()> {
-        Ok(())
+    fn set_data_bits(&mut self, bits: DataBits) -> serialport::Result<()> {
+        use nix::sys::termios::{tcgetattr, tcsetattr, ControlFlags, SetArg};
+        let mut settings = tcgetattr(&self.file).map_err(errno_to_serial)?;
+        settings.control_flags.remove(ControlFlags::CSIZE);
+        settings.control_flags.insert(match bits {
+            DataBits::Five => ControlFlags::CS5,
+            DataBits::Six => ControlFlags::CS6,
+            DataBits::Seven => ControlFlags::CS7,
+            DataBits::Eight => ControlFlags::CS8,
+        });
+        tcsetattr(&self.file, SetArg::TCSANOW, &settings).map_err(errno_to_serial)
     }
-    fn set_flow_control(&mut self, _flow: FlowControl) -> serialport::Result<()> {
-        Ok(())
+    fn set_flow_control(&mut self, flow: FlowControl) -> serialport::Result<()> {
+        use nix::sys::termios::{tcgetattr, tcsetattr, ControlFlags, InputFlags, SetArg};
+        let mut settings = tcgetattr(&self.file).map_err(errno_to_serial)?;
+        settings.control_flags.remove(ControlFlags::CRTSCTS);
+        settings
+            .input_flags
+            .remove(InputFlags::IXON | InputFlags::IXOFF);
+        match flow {
+            FlowControl::None => {}
+            FlowControl::Hardware => {
+                settings.control_flags.insert(ControlFlags::CRTSCTS);
+            }
+            FlowControl::Software => {
+                settings
+                    .input_flags
+                    .insert(InputFlags::IXON | InputFlags::IXOFF);
+            }
+        }
+        tcsetattr(&self.file, SetArg::TCSANOW, &settings).map_err(errno_to_serial)
     }
-    fn set_parity(&mut self, _parity: Parity) -> serialport::Result<()> {
-        Ok(())
+    fn set_parity(&mut self, parity: Parity) -> serialport::Result<()> {
+        use nix::sys::termios::{tcgetattr, tcsetattr, ControlFlags, SetArg};
+        let mut settings = tcgetattr(&self.file).map_err(errno_to_serial)?;
+        settings
+            .control_flags
+            .remove(ControlFlags::PARENB | ControlFlags::PARODD);
+        match parity {
+            Parity::None => {}
+            Parity::Odd => {
+                settings
+                    .control_flags
+                    .insert(ControlFlags::PARENB | ControlFlags::PARODD);
+            }
+            Parity::Even => {
+                settings.control_flags.insert(ControlFlags::PARENB);
+            }
+        }
+        tcsetattr(&self.file, SetArg::TCSANOW, &settings).map_err(errno_to_serial)
     }
-    fn set_stop_bits(&mut self, _bits: StopBits) -> serialport::Result<()> {
-        Ok(())
+    fn set_stop_bits(&mut self, bits: StopBits) -> serialport::Result<()> {
+        use nix::sys::termios::{tcgetattr, tcsetattr, ControlFlags, SetArg};
+        let mut settings = tcgetattr(&self.file).map_err(errno_to_serial)?;
+        settings.control_flags.remove(ControlFlags::CSTOPB);
+        if bits == StopBits::Two {
+            settings.control_flags.insert(ControlFlags::CSTOPB);
+        }
+        tcsetattr(&self.file, SetArg::TCSANOW, &settings).map_err(errno_to_serial)
     }
     fn set_timeout(&mut self, timeout: Duration) -> serialport::Result<()> {
         self.timeout = timeout;
         Ok(())
     }
-    fn write_request_to_send(&mut self, _level: bool) -> serialport::Result<()> {
-        Ok(())
+    fn write_request_to_send(&mut self, level: bool) -> serialport::Result<()> {
+        set_modem_bit(self.file.as_raw_fd(), libc::TIOCM_RTS, level)
     }
-    fn write_data_terminal_ready(&mut self, _level: bool) -> serialport::Result<()> {
-        Ok(())
+    fn write_data_terminal_ready(&mut self, level: bool) -> serialport::Result<()> {
+        set_modem_bit(self.file.as_raw_fd(), libc::TIOCM_DTR, level)
     }
     fn read_clear_to_send(&mut self) -> serialport::Result<bool> {
-        Ok(false)
+        read_modem_bit(self.file.as_raw_fd(), libc::TIOCM_CTS)
     }
     fn read_data_set_ready(&mut self) -> serialport::Result<bool> {
-        Ok(false)
+        read_modem_bit(self.file.as_raw_fd(), libc::TIOCM_DSR)
     }
     fn read_ring_indicator(&mut self) -> serialport::Result<bool> {
-        Ok(false)
+        read_modem_bit(self.file.as_raw_fd(), libc::TIOCM_RI)
     }
     fn read_carrier_detect(&mut self) -> serialport::Result<bool> {
-        Ok(false)
+        read_modem_bit(self.file.as_raw_fd(), libc::TIOCM_CD)
     }
     fn bytes_to_read(&self) -> serialport::Result<u32> {
-        Ok(0)
+        let mut available: libc::c_int = 0;
+        // SAFETY: FIONREAD writes one int for this valid descriptor.
+        if unsafe { libc::ioctl(self.file.as_raw_fd(), libc::FIONREAD, &mut available) } != 0 {
+            return Err(to_serial_error(io::Error::last_os_error()));
+        }
+        Ok(available.max(0) as u32)
     }
     fn bytes_to_write(&self) -> serialport::Result<u32> {
-        Ok(0)
+        let mut queued: libc::c_int = 0;
+        // SAFETY: TIOCOUTQ writes one int for this valid descriptor.
+        if unsafe { libc::ioctl(self.file.as_raw_fd(), libc::TIOCOUTQ, &mut queued) } != 0 {
+            return Err(to_serial_error(io::Error::last_os_error()));
+        }
+        Ok(queued.max(0) as u32)
     }
-    fn clear(&self, _buffer: serialport::ClearBuffer) -> serialport::Result<()> {
+    fn clear(&self, buffer: serialport::ClearBuffer) -> serialport::Result<()> {
+        use serialport::ClearBuffer;
+        let what = match buffer {
+            ClearBuffer::Input => libc::TCIFLUSH,
+            ClearBuffer::Output => libc::TCOFLUSH,
+            ClearBuffer::All => libc::TCIOFLUSH,
+        };
+        // SAFETY: tcflush on this valid descriptor.
+        if unsafe { libc::tcflush(self.file.as_raw_fd(), what) } != 0 {
+            return Err(to_serial_error(io::Error::last_os_error()));
+        }
         Ok(())
     }
     fn try_clone(&self) -> serialport::Result<Box<dyn serialport::SerialPort>> {
@@ -166,15 +292,20 @@ impl serialport::SerialPort for PosixSerial {
         // SAFETY: `dup` returned a new owned descriptor.
         let file = unsafe { File::from_raw_fd(fd) };
         Ok(Box::new(PosixSerial {
-            file,
+            file: Arc::new(file),
             baud: self.baud,
             timeout: self.timeout,
         }))
     }
     fn set_break(&self) -> serialport::Result<()> {
+        // SAFETY: tcsendbreak on this valid descriptor.
+        if unsafe { libc::tcsendbreak(self.file.as_raw_fd(), 0) } != 0 {
+            return Err(to_serial_error(io::Error::last_os_error()));
+        }
         Ok(())
     }
     fn clear_break(&self) -> serialport::Result<()> {
+        // A sent break ends by itself; there is no separate clear operation.
         Ok(())
     }
 }
@@ -372,24 +503,84 @@ fn baud_rate(baud: u32) -> Option<nix::sys::termios::BaudRate> {
 /// Apply the fixed 8N1 framing to an already-open, already-validated fd.
 fn configure_termios(file: &File, baud: u32) -> io::Result<()> {
     use nix::sys::termios::{
-        cfmakeraw, cfsetispeed, cfsetospeed, tcgetattr, tcsetattr, ControlFlags, SetArg,
+        cfmakeraw, cfsetispeed, cfsetospeed, tcgetattr, tcsetattr, ControlFlags, InputFlags, SetArg,
     };
     let mut settings =
         tcgetattr(file).map_err(|error| io::Error::from_raw_os_error(error as i32))?;
     cfmakeraw(&mut settings);
+    // cfmakeraw does not clear all framing/flow bits inherited from another
+    // application, so normalize them explicitly to 8N1 with no flow control.
+    settings.control_flags.remove(
+        ControlFlags::CSTOPB | ControlFlags::PARENB | ControlFlags::PARODD | ControlFlags::CRTSCTS,
+    );
+    settings
+        .input_flags
+        .remove(InputFlags::IXON | InputFlags::IXOFF | InputFlags::IXANY);
     settings
         .control_flags
-        .insert(ControlFlags::CLOCAL | ControlFlags::CREAD);
-    let rate = baud_rate(baud).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("unsupported baud rate {baud}"),
-        )
-    })?;
-    cfsetispeed(&mut settings, rate).map_err(|error| io::Error::from_raw_os_error(error as i32))?;
-    cfsetospeed(&mut settings, rate).map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+        .insert(ControlFlags::CLOCAL | ControlFlags::CREAD | ControlFlags::CS8);
+    if let Some(rate) = baud_rate(baud) {
+        cfsetispeed(&mut settings, rate)
+            .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+        cfsetospeed(&mut settings, rate)
+            .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+    } else {
+        // tcsetattr cannot express an arbitrary speed; apply the flags with a
+        // table rate, then set the real speed through termios2 below.
+        cfsetispeed(&mut settings, nix::sys::termios::BaudRate::B9600)
+            .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+        cfsetospeed(&mut settings, nix::sys::termios::BaudRate::B9600)
+            .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+    }
     tcsetattr(file, SetArg::TCSANOW, &settings)
         .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+    if baud_rate(baud).is_none() {
+        set_arbitrary_baud(file, baud)?;
+    }
+    Ok(())
+}
+
+/// Linux `termios2` supports arbitrary baud rates through `BOTHER`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Termios2 {
+    c_iflag: u32,
+    c_oflag: u32,
+    c_cflag: u32,
+    c_lflag: u32,
+    c_line: u8,
+    c_cc: [u8; 19],
+    c_ispeed: u32,
+    c_ospeed: u32,
+}
+
+fn set_arbitrary_baud(file: &File, baud: u32) -> io::Result<()> {
+    const TCGETS2: libc::c_ulong = 0x802C_542A;
+    const TCSETS2: libc::c_ulong = 0x402C_542B;
+    const BOTHER: u32 = 0o010000;
+    const CBAUD: u32 = 0o010017;
+    let fd = file.as_raw_fd();
+    let mut termios = Termios2 {
+        c_iflag: 0,
+        c_oflag: 0,
+        c_cflag: 0,
+        c_lflag: 0,
+        c_line: 0,
+        c_cc: [0; 19],
+        c_ispeed: 0,
+        c_ospeed: 0,
+    };
+    // SAFETY: TCGETS2/TCSETS2 read and write a `termios2` for this descriptor.
+    if unsafe { libc::ioctl(fd, TCGETS2, &mut termios) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    termios.c_cflag = (termios.c_cflag & !CBAUD) | BOTHER;
+    termios.c_ispeed = baud;
+    termios.c_ospeed = baud;
+    // SAFETY: same struct, valid for this descriptor.
+    if unsafe { libc::ioctl(fd, TCSETS2, &termios) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(())
 }
 
@@ -454,8 +645,17 @@ pub fn open_serial_checked(
         }
     }
     configure_termios(&file, baud)?;
+    // Preserve the previous opener's exclusive ownership: TIOCEXCL blocks
+    // later opens and flock serializes other core instances.
+    if unsafe { libc::ioctl(file.as_raw_fd(), libc::TIOCEXCL) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: flock on a valid descriptor we own.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     let port = PosixSerial {
-        file,
+        file: Arc::new(file),
         baud,
         timeout: Duration::from_millis(50),
     };
@@ -600,6 +800,91 @@ pub fn write_source(ai: bool) -> Source {
 mod tests {
     use super::*;
     use std::os::unix::io::AsRawFd;
+
+    #[test]
+    fn opening_normalizes_framing_and_flow_control() {
+        use nix::pty::openpty;
+        use nix::sys::termios::{tcgetattr, tcsetattr, ControlFlags, SetArg};
+
+        let pty = openpty(None, None).expect("pty");
+        let slave: std::fs::File = pty.slave.into();
+        let path = std::fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd()))
+            .expect("path")
+            .to_string_lossy()
+            .into_owned();
+        let mut settings = tcgetattr(&slave).expect("termios");
+        settings
+            .control_flags
+            .insert(ControlFlags::CSTOPB | ControlFlags::CRTSCTS);
+        tcsetattr(&slave, SetArg::TCSANOW, &settings).expect("seed");
+
+        let _port = open_serial(&path, 115_200).expect("open");
+        let after = tcgetattr(&slave).expect("termios after");
+        assert!(!after.control_flags.contains(ControlFlags::CSTOPB));
+        assert!(!after.control_flags.contains(ControlFlags::CRTSCTS));
+        assert!(after.control_flags.contains(ControlFlags::CS8));
+    }
+
+    #[test]
+    fn opening_keeps_exclusive_ownership() {
+        use nix::pty::openpty;
+        let pty = openpty(None, None).expect("pty");
+        let slave: std::fs::File = pty.slave.into();
+        let path = std::fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd()))
+            .expect("path")
+            .to_string_lossy()
+            .into_owned();
+        let _port = open_serial(&path, 115_200).expect("open");
+        let second = nix::fcntl::open(
+            path.as_str(),
+            nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NOCTTY,
+            nix::sys::stat::Mode::empty(),
+        );
+        assert!(second.is_err(), "a second open must be refused");
+    }
+
+    #[test]
+    fn reopening_after_drop_clears_exclusive_mode() {
+        use nix::pty::openpty;
+        let pty = openpty(None, None).expect("pty");
+        let slave: std::fs::File = pty.slave.into();
+        let path = std::fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd()))
+            .expect("path")
+            .to_string_lossy()
+            .into_owned();
+        drop(open_serial(&path, 115_200).expect("first open"));
+        open_serial(&path, 115_200).expect("reopen after drop");
+        drop(slave);
+    }
+
+    #[test]
+    fn opening_supports_arbitrary_baud_rates() {
+        use nix::pty::openpty;
+        let pty = openpty(None, None).expect("pty");
+        let slave: std::fs::File = pty.slave.into();
+        let path = std::fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd()))
+            .expect("path")
+            .to_string_lossy()
+            .into_owned();
+        let _port = open_serial(&path, 123_456).expect("open arbitrary baud");
+        let mut termios = Termios2 {
+            c_iflag: 0,
+            c_oflag: 0,
+            c_cflag: 0,
+            c_lflag: 0,
+            c_line: 0,
+            c_cc: [0; 19],
+            c_ispeed: 0,
+            c_ospeed: 0,
+        };
+        const TCGETS2: libc::c_ulong = 0x802C_542A;
+        // SAFETY: TCGETS2 fills a termios2 for this valid descriptor.
+        assert_eq!(
+            unsafe { libc::ioctl(slave.as_raw_fd(), TCGETS2, &mut termios) },
+            0
+        );
+        assert_eq!(termios.c_ospeed, 123_456);
+    }
 
     #[test]
     fn a_mismatched_expected_identity_is_rejected_before_configuration() {

@@ -176,7 +176,7 @@ head changes.
   filtering now require the exact open device instance to have been authorized
   for sharing (`Device.shared`, set at open, at check, and when sharing
   starts), not merely a path present in the allowlist. Tests:
-  `an_expired_entry_does_not_leak_events_for_a_later_device_instance`,
+  `an_unchecked_entry_does_not_leak_events_for_a_later_instance`,
   `a_replacement_at_the_same_path_does_not_inherit_authorization`,
   `a_checked_device_survives_an_ordinary_close_and_reopen`,
   `a_checked_but_never_opened_device_rejects_a_recycled_node`.
@@ -264,7 +264,7 @@ fixed with tests:
   delivery revalidate the instance identity, expire the allowlist entry and
   bump its write generation when it no longer matches. Tests:
   `remote_operations_are_limited_to_checked_devices_by_acl`,
-  `an_expired_entry_does_not_leak_events_for_a_later_device_instance`.
+  `an_unchecked_entry_does_not_leak_events_for_a_later_instance`.
 - **Detached waiters are cancelled.** `Close` fails that client's waited writes
   immediately, so unchecking cannot leave a detached waiter collecting later
   output. Test:
@@ -321,3 +321,27 @@ fixed with tests:
   connection slots, and an unchecked later device instance; the engine-level
   PTY-recycling replacement test is `#[ignore]`d because path reuse is not
   guaranteed, with deterministic regular-file identity tests in its place.
+
+### Third iterative review fixes
+
+- **Owner loss is observed independently of the request handler.** The reader
+  thread tells the engine when the owning connection reaches EOF, so sharing
+  stops even while that connection's handler is blocked draining a device.
+  Test: `owner_loss_revokes_sharing_even_while_a_device_close_is_draining`.
+- **Serial opening normalizes inherited framing.** `cfmakeraw` leaves
+  `CSTOPB`, `PARENB`, `PARODD` and `CRTSCTS` untouched, so opening now clears
+  them explicitly and restores exclusive ownership with `TIOCEXCL`, `flock`
+  and `TIOCNXCL` on the last handle. Tests:
+  `opening_normalizes_framing_and_flow_control`,
+  `opening_keeps_exclusive_ownership` and
+  `reopening_after_drop_clears_exclusive_mode`.
+- **Non-table baud rates use `termios2`/`BOTHER`** instead of failing, and the
+  `SerialPort` setters and modem-control getters perform their documented
+  operations. Test: `opening_supports_arbitrary_baud_rates`.
+- **Expiring an instance fails its pending remote waiters** and a successful
+  waited write rechecks authorization before returning device output.
+- **Generated host certificates include the CA Authority Key Identifier**, as
+  required by strict OpenSSL/Python verifiers.
+- Fixed the later-instance test to close and reopen a genuinely new instance,
+  the firmware-echo helper test to assert freshness, and removed the redundant
+  raw-TCP oversized test.

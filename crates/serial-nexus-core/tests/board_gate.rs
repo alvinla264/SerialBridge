@@ -68,6 +68,20 @@ fn a_firmware_echo_must_be_new_device_output_not_the_probe_or_old_history() {
         0,
         "a human write is not echo"
     );
+    assert!(
+        !echo_is_fresh(1, &lines, "UNIQUE"),
+        "unchanged old history is not a fresh echo"
+    );
+    let mut with_new = lines.clone();
+    with_new.push(HistoryLine {
+        source: Source::Device,
+        text: "NEW UNIQUE".into(),
+        partial: false,
+    });
+    assert!(
+        echo_is_fresh(1, &with_new, "UNIQUE"),
+        "new device output is a fresh echo"
+    );
 }
 
 #[test]

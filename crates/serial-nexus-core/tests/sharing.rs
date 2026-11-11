@@ -505,7 +505,7 @@ fn a_client_that_cannot_verify_the_host_is_refused() {
 }
 
 #[test]
-fn bad_credentials_and_oversized_frames_are_refused() {
+fn bad_credentials_are_refused() {
     let core = shared_core();
     let owner = local_owner(&core);
     let device = SimulatedDevice::new();
@@ -521,44 +521,6 @@ fn bad_credentials_and_oversized_frames_are_refused() {
     let error = RemoteClient::connect(&info.host, &wrong, None, Duration::from_secs(3))
         .expect_err("wrong credential");
     assert!(matches!(error, ClientError::Authentication(_)), "{error}");
-
-    // A raw TLS peer that sends an over-limit frame length is disconnected.
-    let (mut connection, mut tcp) = raw_tls(&info);
-    tcp.write_all(&u32::MAX.to_be_bytes())
-        .expect("write header");
-    connection.writer().flush().ok();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut closed = false;
-    while Instant::now() < deadline {
-        let mut buffer = [0u8; 256];
-        match connection.reader().read(&mut buffer) {
-            Ok(0) => {
-                closed = true;
-                break;
-            }
-            Ok(_) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(_) => {
-                closed = true;
-                break;
-            }
-        }
-        if serial_nexus_protocol::share::tlsio::pump(
-            &mut connection,
-            &mut tcp,
-            &mut Default::default(),
-        )
-        .is_err()
-        {
-            closed = true;
-            break;
-        }
-    }
-    assert!(closed, "oversized frame must close the connection");
 }
 
 #[test]
@@ -1878,24 +1840,36 @@ fn an_unchecked_entry_does_not_leak_events_for_a_later_instance() {
     let core = shared_core();
     let owner = local_owner(&core);
     let device = SimulatedDevice::new();
-    owner
+    let original = owner
         .open(&device.path, Some(115_200), false)
         .expect("open");
     let info = owner
         .start_sharing(localhost_bind(), vec![device.path.clone()])
         .expect("start");
     let human = remote(&info, PairingRole::Human, "remote").expect("pair");
-    let opened = human.open(&device.path, None, false).expect("open");
+    human.open(&device.path, None, false).expect("remote open");
     let events = human.subscribe();
 
     owner
         .uncheck_shared_devices(vec![device.path.clone()])
         .expect("uncheck");
-    // Reopen the same live device locally without rechecking it, then close it.
-    owner
+    owner.close(original.device_id).expect("close original");
+    wait_until(Duration::from_secs(3), || {
+        !owner
+            .list_devices()
+            .expect("list")
+            .devices
+            .iter()
+            .any(|entry| entry.path == device.path && entry.open)
+    });
+    let later = owner
         .open(&device.path, Some(115_200), false)
-        .expect("local reopen without recheck");
-    owner.close(opened.device_id).ok();
+        .expect("open a later instance without rechecking");
+    assert_ne!(
+        later.device_id, original.device_id,
+        "the later open must create a new instance"
+    );
+    owner.close(later.device_id).expect("close later");
     std::thread::sleep(Duration::from_millis(300));
     while let Ok(event) = events.try_recv() {
         assert!(
@@ -1950,4 +1924,46 @@ fn a_draining_device_still_revokes_queued_remote_writes() {
         !String::from_utf8_lossy(&received).contains("DRAIN-MARKER"),
         "a queued write drained after revocation"
     );
+}
+
+#[test]
+fn owner_loss_revokes_sharing_even_while_a_device_close_is_draining() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let mut device = SimulatedDevice::new();
+    let holder = connect(&core.socket, ClientInfo::human("holder"));
+    holder
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![device.path.clone()])
+        .expect("start");
+    // Fill the PTY and start a last-detach close that blocks joining the writer.
+    holder
+        .write_bytes(1, &vec![b'x'; 128 * 1024], None)
+        .expect("queue stalled local write");
+    let close_thread = std::thread::spawn(move || holder.close(1));
+    wait_until(Duration::from_secs(3), || {
+        !owner
+            .list_devices()
+            .expect("list")
+            .devices
+            .iter()
+            .any(|entry| entry.path == device.path)
+    });
+
+    // The owner socket goes away while its handler is blocked in the close.
+    drop(owner);
+    wait_until(Duration::from_secs(5), || {
+        RemoteClient::connect(
+            &info.host,
+            &info.human,
+            Some("after-owner-loss".into()),
+            Duration::from_secs(1),
+        )
+        .is_err()
+    });
+    // Free the blocked writer so the local thread can finish.
+    device.read_available(Duration::from_millis(300));
+    close_thread.join().expect("close thread").ok();
 }

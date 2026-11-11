@@ -133,9 +133,10 @@ fn handle_connection(engine: Arc<Engine>, stream: UnixStream, uid: u32) {
             return;
         }
     };
+    let reader_engine = Arc::clone(&engine);
     if std::thread::Builder::new()
         .name("serial-nexus-core-reader".into())
-        .spawn(move || read_requests(reader_stream, request_tx))
+        .spawn(move || read_requests(reader_engine, client_id, reader_stream, request_tx))
         .is_err()
     {
         engine.unregister_client(client_id);
@@ -224,7 +225,7 @@ fn response(result: Result<ResponseData, ErrorBody>, id: u64) -> ServerMessage {
     }
 }
 
-fn read_requests(stream: UnixStream, tx: RequestSender) {
+fn read_requests(engine: Arc<Engine>, client_id: u64, stream: UnixStream, tx: RequestSender) {
     let mut reader = BufReader::new(stream);
     loop {
         let line = match serial_nexus_protocol::read_line(&mut reader, MAX_MESSAGE_BYTES) {
@@ -248,6 +249,9 @@ fn read_requests(stream: UnixStream, tx: RequestSender) {
             }
         }
     }
+    // The owning local terminal is gone; revoke sharing even if this
+    // connection's handler is still blocked in a device close.
+    engine.owner_connection_lost(client_id);
     let _ = tx.send(None);
 }
 

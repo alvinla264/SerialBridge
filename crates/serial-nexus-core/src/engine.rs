@@ -956,6 +956,15 @@ impl Engine {
         } = pending;
         match rx.recv_timeout(timeout + Duration::from_millis(50)) {
             Ok(outcome) if outcome.failed.is_none() => {
+                if !self.remote_write_still_authorized(client_id, device_id) {
+                    return Err(ErrorBody::new(
+                        ErrorCode::DeviceFailed,
+                        format!(
+                            "device {device_id} is no longer shared; the bytes may already have reached it and were not replayed"
+                        ),
+                    )
+                    .with_details(serde_json::json!({ "may_have_reached_device": true })));
+                }
                 let (lines, truncated) = fit_lines(outcome.lines);
                 Ok(WriteResult {
                     bytes_written,
@@ -1440,6 +1449,21 @@ impl Engine {
         self.clear_shared_instances();
         self.refresh_shared_instances(&prepared.session);
         Ok(ResponseData::ShareStarted(prepared.info))
+    }
+
+    /// The local reader thread saw this connection end. If it owned a sharing
+    /// session, revoke immediately instead of waiting for the request handler
+    /// (which may be blocked draining a device).
+    pub fn owner_connection_lost(&self, client_id: u64) {
+        let owns = self
+            .sharing
+            .lock()
+            .expect("sharing lock")
+            .as_ref()
+            .is_some_and(|session| session.owner_client_id() == client_id);
+        if owns {
+            self.stop_sharing();
+        }
     }
 
     /// Stop sharing: close the listener, disconnect every remote client and

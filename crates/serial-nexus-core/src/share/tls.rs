@@ -47,6 +47,9 @@ pub fn build(session_id: &str, address: IpAddr) -> Result<SessionTls, String> {
     let host_key = KeyPair::generate().map_err(|error| error.to_string())?;
     let mut host_params = CertificateParams::new(Vec::new()).map_err(|error| error.to_string())?;
     host_params.is_ca = IsCa::NoCa;
+    // Strict verifiers (for example Python 3.13/OpenSSL defaults) require the
+    // leaf to carry the CA's Authority Key Identifier.
+    host_params.use_authority_key_identifier_extension = true;
     host_params.subject_alt_names = vec![SanType::IpAddress(address)];
     host_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     host_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];

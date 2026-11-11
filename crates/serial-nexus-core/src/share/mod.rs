@@ -467,18 +467,21 @@ impl SharingSession {
 
     /// Reserve a connection slot, or refuse when the bounded limits are full.
     fn register_connection(&self, stream: &TcpStream) -> Option<u64> {
+        // Clone before reserving a slot: a clone failure must not leak one.
+        let cloned = stream.try_clone().ok()?;
         let mut state = self.state.lock().expect("share state lock");
+        if self.is_stopped() {
+            return None;
+        }
         if state.authenticated + state.pending >= self.limits.max_connections {
             return None;
         }
         state.pending += 1;
         let id = self.next_connection_id.fetch_add(1, Ordering::SeqCst);
-        self.connections.lock().expect("connections lock").insert(
-            id,
-            RemoteSocket {
-                stream: stream.try_clone().ok()?,
-            },
-        );
+        self.connections
+            .lock()
+            .expect("connections lock")
+            .insert(id, RemoteSocket { stream: cloned });
         Some(id)
     }
 
