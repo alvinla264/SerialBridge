@@ -107,6 +107,18 @@ fn check_device(tui: &mut TuiSession, path: &str) {
     });
 }
 
+fn set_port(tui: &mut TuiSession, port: u16) {
+    click_text(tui, "Share port");
+    tui.send(&[0x7f, 0x7f, 0x7f, 0x7f]);
+    tui.send_text(&port.to_string());
+    tui.send(KEY_ENTER);
+    tui.wait_until("the typed port", |text| {
+        text.lines()
+            .find(|line| line.contains("Share port"))
+            .is_some_and(|line| line.trim_end().ends_with(&port.to_string()))
+    });
+}
+
 fn set_port_zero(tui: &mut TuiSession) {
     // A click on a text row starts editing; clear the default and ask the OS
     // for a free port.
@@ -176,7 +188,7 @@ fn the_host_checks_a_device_starts_sharing_sees_the_secrets_and_leaves_it_off() 
     // The pairing screen survives a narrow resize and `s` stops the session.
     tui.resize(20, 40);
     tui.wait_until("the pairing view at a narrow width", |text| {
-        text.contains("Share") || text.contains("Sharing")
+        text.contains("stop sharing") || text.contains("Sharing")
     });
     tui.resize(ROWS, COLS);
     tui.wait_for_text("focus: pairing");
@@ -255,4 +267,46 @@ fn cancel_discards_the_checklist_and_the_share_button_refuses_an_empty_one() {
     assert!(tui.text().contains("[ Share: off ]"));
 
     tui.quit();
+}
+
+#[test]
+fn quitting_the_owner_terminal_closes_the_listener_without_stopping_first() {
+    let fixture = Fixture::new();
+    let path = fixture.device.path.clone();
+    let reserved = TcpListener::bind(("127.0.0.1", 0)).expect("reserve a port");
+    let port = reserved.local_addr().expect("addr").port();
+    drop(reserved);
+
+    let mut tui = fixture.tui();
+    tui.wait_for_text("Devices (");
+    tui.wait_for_text(&path);
+    open_settings(&mut tui);
+    check_device(&mut tui, &path);
+    set_port(&mut tui, port);
+    tui.send(KEY_CTRL_S);
+    tui.wait_for_text("settings saved");
+    click_text(&mut tui, "[ Share: off ]");
+    tui.wait_for_text("focus: pairing");
+    std::net::TcpStream::connect(("127.0.0.1", port)).expect("the listener is up");
+
+    // Leave the pairing screen but keep sharing on, then quit through the
+    // terminal's normal cleanup path.
+    tui.send(KEY_ESC);
+    tui.wait_until("the live stream after leaving pairing", |text| {
+        text.contains("focus: stream")
+    });
+    tui.send(KEY_CTRL_BRACKET);
+    tui.wait_for_text("focus: sidebar");
+    tui.quit();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Err(_) => break,
+            Ok(_) if std::time::Instant::now() >= deadline => {
+                panic!("the listener survived the owner terminal")
+            }
+            Ok(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
 }

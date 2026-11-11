@@ -14,7 +14,7 @@ use serial_nexus_protocol::{
 };
 
 use crate::input::{echo_key, map_key, Action, Key};
-use crate::render::{hit_test, panes, settings_hit_test, Hit, SettingsHit};
+use crate::render::{hit_test, pairing_max_scroll, panes, settings_hit_test, Hit, SettingsHit};
 use crate::settings::{SettingsStore, TerminalSettings};
 use crate::state::{
     short_holder, AppState, ConnectForm, DeviceEntry, EndpointId, Focus, Notice, SessionKey,
@@ -874,8 +874,7 @@ impl App {
             Ok(()) => {
                 self.state.sharing.clear_session();
                 if self.state.view == View::Pairing {
-                    self.state.view = View::Stream;
-                    self.state.focus = Focus::Right;
+                    self.show_live_stream();
                 }
                 self.state.notice = Some(Notice::info("sharing stopped"));
             }
@@ -905,16 +904,13 @@ impl App {
     }
 
     fn leave_pairing(&mut self) {
-        self.state.view = View::Stream;
-        self.state.focus = Focus::Right;
-        if let Some(session) = self.state.shown_session_mut() {
-            session.screen.scroll_to_bottom();
-        }
+        self.show_live_stream();
     }
 
     fn scroll_pairing(&mut self, delta: i32) {
         let next = self.state.pairing_scroll as i32 + delta;
-        self.state.pairing_scroll = next.max(0) as usize;
+        let max = pairing_max_scroll(&self.state);
+        self.state.pairing_scroll = next.clamp(0, max as i32) as usize;
     }
 
     /// Ask a remote host for its address, port and pairing information. The
@@ -970,7 +966,7 @@ impl App {
                 self.state.focus = Focus::Sidebar;
                 self.refresh_remotes();
                 self.state.notice = Some(Notice::info(format!(
-                    "connected to {label}: its approved devices are in the sidebar"
+                    "connected to {label}: its checked devices are in the sidebar"
                 )));
             }
             Err(error) => {

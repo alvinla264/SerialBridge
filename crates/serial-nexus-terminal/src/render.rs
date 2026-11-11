@@ -779,19 +779,11 @@ fn draw_settings(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u
     Some((column, layout.rows.y + (row - first) as u16))
 }
 
-/// The owner's pairing view: the reachable address, what authenticates the
-/// host, and the two separate pairing credentials. The secrets exist only in
-/// this session's memory and are drawn only here.
-fn draw_pairing(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16, u16)> {
+/// The pairing view's text, before wrapping. Bounded and secret-bearing: only
+/// the owner's pairing view draws it.
+fn pairing_lines(state: &AppState) -> Vec<String> {
     let Some(pairing) = &state.sharing.pairing else {
-        put(
-            buffer,
-            area,
-            1,
-            "Sharing is off: press s or use the Share button to start it.",
-            dim(),
-        );
-        return Some((area.x + 1, area.y));
+        return Vec::new();
     };
     let snapshot = state.sharing.snapshot.as_ref();
     let checked: Vec<String> = state.sharing.checked().into_iter().collect();
@@ -838,6 +830,34 @@ fn draw_pairing(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u1
     lines.push("Secrets are shown only here and are never saved or sent to a device.".to_string());
     lines.push("Esc back · s stops sharing · ↑/↓ scroll".to_string());
 
+    lines
+}
+
+/// The highest useful pairing scroll offset for the current pane size. Keeping
+/// navigation clamped stops invisible overscroll from trapping the view.
+pub fn pairing_max_scroll(state: &AppState) -> usize {
+    let width = state.cols().max(1);
+    let lines = pairing_lines(state)
+        .iter()
+        .flat_map(|line| wrap_line(line, width))
+        .count();
+    lines.saturating_sub(state.rows().max(1))
+}
+
+/// The owner's pairing view: the reachable address, what authenticates the
+/// host, and the two separate pairing credentials. The secrets exist only in
+/// this session's memory and are drawn only here.
+fn draw_pairing(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16, u16)> {
+    if state.sharing.pairing.is_none() {
+        let message = if state.sharing.active {
+            "Sharing is on, but its pairing information was lost with a failed answer. Press s to stop, then start again for fresh credentials."
+        } else {
+            "Sharing is off: press s or use the Share button to start it."
+        };
+        put(buffer, area, 1, message, dim());
+        return Some((area.x + 1, area.y));
+    }
+    let lines = pairing_lines(state);
     let width = area.width.max(1) as usize;
     let wrapped: Vec<String> = lines
         .iter()

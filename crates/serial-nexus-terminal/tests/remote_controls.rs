@@ -185,7 +185,10 @@ fn a_paired_terminal_opens_an_allowed_unopened_port_and_keeps_the_secret_out_of_
 
     // The pairing values never reach the settings file.
     let saved = terminal.settings_text();
-    assert!(!saved.contains(&host.info.human.credential), "{saved}");
+    assert!(
+        !saved.contains(&host.info.human.credential),
+        "the settings file contains the human credential"
+    );
     assert!(!saved.contains("credential"));
     assert!(!saved.contains(&host.info.host.ca_cert_der_b64));
 
@@ -223,7 +226,10 @@ fn a_wrong_host_certificate_is_refused_and_leaves_no_endpoint() {
         .and_then(|form| form.error.clone())
         .expect("the refusal is shown");
     assert!(error.contains("not connected"), "{error}");
-    assert!(!error.contains(&host.info.human.credential), "{error}");
+    assert!(
+        !error.contains(&host.info.human.credential),
+        "the connect error contains the human credential"
+    );
     assert!(
         !terminal
             .app
@@ -356,11 +362,31 @@ fn unchecking_one_remote_device_keeps_the_other_and_the_local_core() {
         .open_endpoint(second_endpoint, &second_path, Some(9_600))
         .expect("open second");
 
-    // The host revokes the first device. The terminal sees it at the next
-    // refresh, detaches that session and says so; the second stays usable.
+    // The host revokes the first device. Before the next refresh the terminal
+    // still shows that session; a write to it fails visibly, reaches neither
+    // device and is not retried.
     host.owner
         .uncheck_shared_devices(vec![first_path.clone()])
         .expect("uncheck");
+    terminal.app.show_session_now(first_key);
+    terminal.app.write_shown(b"never", Key::Char('n'));
+    let notice = terminal.app.state.notice.as_ref().expect("notice");
+    assert!(
+        notice.text.contains("write to"),
+        "the write failure is visible: {}",
+        notice.text
+    );
+    assert!(
+        first.try_read().is_empty(),
+        "the failed write was not replayed"
+    );
+    assert!(
+        second.try_read().is_empty(),
+        "the failed write did not fall through to the healthy device"
+    );
+
+    // At the next refresh the revoked session is detached and said so; the
+    // second stays usable.
     terminal.app.refresh_devices();
     assert!(
         !terminal.app.state.sessions.contains_key(&first_key),
@@ -372,22 +398,10 @@ fn unchecking_one_remote_device_keeps_the_other_and_the_local_core() {
         "the revocation is visible: {}",
         notice.text
     );
-    assert!(
-        first.try_read().is_empty(),
-        "the revoked device got no bytes"
-    );
 
     terminal.app.show_session_now(second_key);
     terminal.app.write_shown(b"still", Key::Char('s'));
     second.read_until(b"still", Duration::from_secs(5));
-
-    // A write aimed at the detached device reaches nothing and is not retried.
-    terminal.app.show_session_now(first_key);
-    terminal.app.write_shown(b"never", Key::Char('n'));
-    assert!(
-        first.try_read().is_empty(),
-        "the failed write was not replayed"
-    );
 
     terminal.app.shutdown();
 }

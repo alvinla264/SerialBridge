@@ -1429,8 +1429,9 @@ impl Engine {
         }
     }
 
-    /// Mark already-open engine devices whose path is checked, so their events
-    /// and discovery entries are visible to remote clients.
+    /// Recompute every open device's sharing marker from the session in one
+    /// state-lock hold. Remote discovery never sees a half-updated list while
+    /// an allowlist replacement keeps most devices checked.
     fn refresh_shared_instances(&self, session: &SharingSession) {
         let checked: Vec<String> = session
             .snapshot()
@@ -1438,20 +1439,21 @@ impl Engine {
             .into_iter()
             .map(|device| device.path)
             .collect();
+        let authorized: HashMap<String, DeviceIdentity> = checked
+            .iter()
+            .filter_map(|path| session.authorize(path).ok().map(|id| (path.clone(), id)))
+            .collect();
         let mut state = self.state.lock().expect("state lock");
-        for path in checked {
-            let identity = session.authorize(&path).ok();
-            for device in state.devices.values_mut() {
-                if device.path == path {
-                    device.shared = identity
-                        .clone()
-                        .filter(|identity| device_matches_identity(device, identity));
-                    if device.shared.is_none() {
-                        // The open instance is not the checked node; never
-                        // authorize it for sharing.
-                        session.revoke_path(&device.path);
-                    }
-                }
+        for device in state.devices.values_mut() {
+            let allowed = authorized
+                .get(&device.path)
+                .cloned()
+                .filter(|identity| device_matches_identity(device, identity));
+            device.shared = allowed;
+            if device.shared.is_none() && checked.contains(&device.path) {
+                // The open instance is not the checked node; never authorize
+                // it for sharing.
+                session.revoke_path(&device.path);
             }
         }
     }
@@ -1606,7 +1608,6 @@ impl Engine {
         drop(guard);
         drop(dead);
         // Only the new session's checked devices may be visible.
-        self.clear_shared_instances();
         self.refresh_shared_instances(&prepared.session);
         Ok(ResponseData::ShareStarted(prepared.info))
     }
@@ -1738,7 +1739,6 @@ impl Engine {
         for path in expired.into_iter().chain(removed) {
             self.revoke_path_everywhere(&path, &session);
         }
-        self.clear_shared_instances();
         self.refresh_shared_instances(&session);
         Ok(ResponseData::Sharing(session.snapshot()))
     }
@@ -1913,15 +1913,9 @@ impl Engine {
             // expired instance, so no stale controller remains attached.
             let removed =
                 self.begin_detach_remote_clients(&[device_id], "device is no longer shared");
-            let removed_device = !removed.is_empty();
             self.cleanup_devices_async(removed);
-            if !removed_device {
-                self.emit(vec![Event::DeviceClosed {
-                    device_id,
-                    path: path.clone(),
-                    reason: "device is no longer shared".into(),
-                }]);
-            }
+            // Local clients still attached to the device keep it open: a
+            // revocation must not look like an unplug to them.
             session.clear_vacated(&path);
         }
         false

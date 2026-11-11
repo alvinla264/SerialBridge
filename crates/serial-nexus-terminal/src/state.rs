@@ -801,6 +801,12 @@ impl AppState {
     pub fn resize(&mut self, rows: usize, cols: usize) {
         self.rows = rows.max(1);
         self.cols = cols.max(1);
+        let buttons = self.sidebar_buttons();
+        if let Some(button) = self.selected_button {
+            if !buttons.contains(&button) {
+                self.selected_button = Some(SidebarButton::Settings);
+            }
+        }
         for session in self.sessions.values_mut() {
             session.screen.resize(self.rows, self.cols);
             session.rows = self.rows;
@@ -863,31 +869,45 @@ impl AppState {
         self.show_device(SessionKey::local(device_id))
     }
 
+    /// The buttons the sidebar can draw at its current height, in drawing
+    /// order. The navigation uses the same list as the renderer.
+    pub fn sidebar_buttons(&self) -> Vec<SidebarButton> {
+        if self.rows >= 4 {
+            vec![
+                SidebarButton::Share,
+                SidebarButton::Connect,
+                SidebarButton::Settings,
+            ]
+        } else {
+            vec![SidebarButton::Settings]
+        }
+    }
+
     /// Select one sidebar row. The shown stream is untouched: choosing a row
     /// never redirects typed device input.
     pub fn select_index(&mut self, index: usize) {
         if index >= self.devices.len() {
-            // The buttons follow the devices, in drawing order.
-            self.selected_button = match index - self.devices.len() {
-                0 => Some(SidebarButton::Share),
-                1 => Some(SidebarButton::Connect),
-                _ => Some(SidebarButton::Settings),
-            };
+            let buttons = self.sidebar_buttons();
+            self.selected_button = buttons
+                .get(index - self.devices.len())
+                .copied()
+                .or_else(|| buttons.last().copied());
             return;
         }
         self.selected_button = None;
         self.selected = index;
     }
 
-    /// Move the sidebar selection over the devices and the three buttons:
-    /// Share, Connect and Settings, in that drawing order.
+    /// Move the sidebar selection over the devices and the visible buttons.
     pub fn select_delta(&mut self, delta: i32) {
-        let buttons = 3;
-        let last = self.devices.len() + buttons - 1;
+        let buttons = self.sidebar_buttons();
+        let last = self.devices.len() + buttons.len() - 1;
         let current = match self.selected_button {
-            Some(SidebarButton::Share) => self.devices.len(),
-            Some(SidebarButton::Connect) => self.devices.len() + 1,
-            Some(SidebarButton::Settings) => self.devices.len() + 2,
+            Some(button) => buttons
+                .iter()
+                .position(|candidate| *candidate == button)
+                .map(|position| self.devices.len() + position)
+                .unwrap_or_else(|| self.devices.len() + buttons.len() - 1),
             None => self.selected,
         };
         let next = current as i32 + delta;
@@ -1082,8 +1102,11 @@ impl AppState {
                 control: control.as_ref().map(short_holder),
                 control_id: control.as_ref().map(|holder| holder.client_id),
             });
-            self.devices
-                .sort_by(|left, right| left.path.cmp(&right.path));
+            self.devices.sort_by(|left, right| {
+                left.endpoint
+                    .cmp(&right.endpoint)
+                    .then_with(|| left.path.cmp(&right.path))
+            });
         }
         if let Some(index) = self
             .devices
@@ -1174,17 +1197,21 @@ impl AppState {
             .iter()
             .map(|device| device.path.clone())
             .collect();
-        for path in previous.difference(&next) {
-            self.draft_checked.remove(path);
-            self.draft_identities.remove(path);
+        if snapshot.active {
+            for path in previous.difference(&next) {
+                self.draft_checked.remove(path);
+                self.draft_identities.remove(path);
+            }
+            self.sharing.pending_checked = next;
+            self.sharing.pending_identities = snapshot
+                .checked
+                .iter()
+                .map(|device| (device.path.clone(), device.identity.clone()))
+                .collect();
         }
+        // An inactive snapshot says only that sharing is off; the session-only
+        // checked selection stays for this launch, as an explicit stop does.
         self.sharing.active = snapshot.active;
-        self.sharing.pending_checked = next;
-        self.sharing.pending_identities = snapshot
-            .checked
-            .iter()
-            .map(|device| (device.path.clone(), device.identity.clone()))
-            .collect();
         self.sharing.snapshot = snapshot.active.then_some(snapshot);
         if !self.sharing.active {
             self.sharing.pairing = None;
@@ -1794,6 +1821,22 @@ mod sharing_tests {
             remote_clients: 0,
             pending_connections: 0,
         }
+    }
+
+    #[test]
+    fn a_short_sidebar_navigates_only_the_buttons_it_draws() {
+        let mut state = state_with_devices();
+        state.resize(2, 80);
+        assert_eq!(state.sidebar_buttons(), vec![SidebarButton::Settings]);
+        state.select_index(1);
+        state.select_delta(1);
+        assert_eq!(
+            state.selected_button(),
+            Some(SidebarButton::Settings),
+            "the hidden Share/Connect rows are not selectable"
+        );
+        state.select_delta(1);
+        assert_eq!(state.selected_button(), Some(SidebarButton::Settings));
     }
 
     #[test]
