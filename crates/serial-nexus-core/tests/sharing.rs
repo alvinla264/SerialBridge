@@ -1517,3 +1517,115 @@ fn an_oversized_waited_write_answer_stays_a_successful_write() {
     assert!(written.truncated, "the answer must be trimmed to fit");
     assert!(!written.timed_out);
 }
+
+#[test]
+fn unchecked_and_new_session_devices_are_not_discoverable() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let device = SimulatedDevice::new();
+    owner
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![device.path.clone()])
+        .expect("start");
+    let human = remote(&info, PairingRole::Human, "remote").expect("pair");
+    assert_eq!(human.list_devices().expect("list").devices.len(), 1);
+
+    owner
+        .uncheck_shared_devices(vec![device.path.clone()])
+        .expect("uncheck");
+    assert!(
+        human.list_devices().expect("list").devices.is_empty(),
+        "an unchecked but locally open device must not be listed"
+    );
+
+    owner.stop_sharing().expect("stop");
+    let fresh = owner
+        .start_sharing(ShareBind::new(info.bind.ip(), free_port()), vec![])
+        .expect("empty session");
+    let second = remote(&fresh, PairingRole::Human, "remote-2").expect("pair");
+    assert!(
+        second.list_devices().expect("list").devices.is_empty(),
+        "a new empty session must not inherit discovery from the old one"
+    );
+}
+
+#[test]
+fn many_empty_waited_lines_keep_a_successful_write() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let mut device = SimulatedDevice::new();
+    owner
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![device.path.clone()])
+        .expect("start");
+    let human = remote(&info, PairingRole::Human, "remote").expect("pair");
+    let opened = human.open(&device.path, None, false).expect("open");
+
+    let waiting = human.clone();
+    let device_id = opened.device_id;
+    let pending = std::thread::spawn(move || {
+        waiting.write_bytes(
+            device_id,
+            b"EMPTY-LINES",
+            Some(WaitSpec {
+                lines: 2_000,
+                timeout_ms: Some(5_000),
+            }),
+        )
+    });
+    device.read_until(b"EMPTY-LINES", Duration::from_secs(3));
+    device.write(&[b'\n'; 2_000]);
+    let written = pending
+        .join()
+        .expect("thread")
+        .expect("a completed write must stay a successful result");
+    assert_eq!(written.bytes_written, b"EMPTY-LINES".len());
+    assert!(!written.timed_out);
+    assert!(written.truncated);
+}
+
+#[test]
+fn near_limit_waited_write_answers_survive_the_tls_send() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let mut device = SimulatedDevice::new();
+    owner
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![device.path.clone()])
+        .expect("start");
+    let human = remote(&info, PairingRole::Human, "remote").expect("pair");
+    let opened = human.open(&device.path, None, false).expect("open");
+
+    // Bodies just under the 64 KiB frame limit previously passed encoding but
+    // failed to fit rustls's plaintext buffer, closing the connection after the
+    // device write had executed.
+    for length in (65_340usize..=65_430).step_by(10) {
+        let waiting = human.clone();
+        let device_id = opened.device_id;
+        let pending = std::thread::spawn(move || {
+            waiting.write_bytes(
+                device_id,
+                b"EXECUTED-ONCE",
+                Some(WaitSpec {
+                    lines: 1,
+                    timeout_ms: Some(5_000),
+                }),
+            )
+        });
+        device.read_until(b"EXECUTED-ONCE", Duration::from_secs(3));
+        device.write(format!("{}\r\n", "q".repeat(length)).as_bytes());
+        let written = pending
+            .join()
+            .expect("thread")
+            .unwrap_or_else(|error| panic!("length {length} lost its write answer: {error:?}"));
+        assert_eq!(written.bytes_written, b"EXECUTED-ONCE".len());
+        assert!(!written.timed_out);
+    }
+    human.status(opened.device_id).expect("connection survived");
+}

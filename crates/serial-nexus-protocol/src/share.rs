@@ -453,7 +453,9 @@ pub mod tlsio {
         fn process_new_packets(&mut self) -> Result<(), String>;
         fn is_handshaking(&self) -> bool;
         fn read_plaintext(&mut self, buffer: &mut [u8]) -> io::Result<usize>;
-        fn write_plaintext(&mut self, buffer: &[u8]) -> io::Result<()>;
+        /// Write as much plaintext as the TLS buffer accepts; callers loop and
+        /// flush, because a write may be short or return zero when full.
+        fn write_plaintext(&mut self, buffer: &[u8]) -> io::Result<usize>;
     }
 
     impl TlsConnection for rustls::Connection {
@@ -477,8 +479,8 @@ pub mod tlsio {
         fn read_plaintext(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
             self.reader().read(buffer)
         }
-        fn write_plaintext(&mut self, buffer: &[u8]) -> io::Result<()> {
-            self.writer().write_all(buffer)
+        fn write_plaintext(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.writer().write(buffer)
         }
     }
 
@@ -560,7 +562,41 @@ pub mod tlsio {
         frame: &[u8],
         deadline: Instant,
     ) -> io::Result<()> {
-        connection.write_plaintext(frame)?;
+        // rustls buffers only a bounded amount of plaintext. Write in bounded
+        // chunks and flush whenever the buffer is full, so a valid maximum
+        // frame is never turned into a connection failure.
+        const CHUNK: usize = 16 * 1024;
+        let mut offset = 0usize;
+        while offset < frame.len() {
+            let end = (offset + CHUNK).min(frame.len());
+            match connection.write_plaintext(&frame[offset..end]) {
+                Ok(0) => {
+                    flush(connection, tcp, deadline)?;
+                    // No progress after a flush means the peer is not draining.
+                    if connection.write_plaintext(&frame[offset..end])? == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "the TLS stream accepted no plaintext after a flush",
+                        ));
+                    }
+                }
+                Ok(written) => {
+                    offset += written;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    flush(connection, tcp, deadline)?;
+                }
+                Err(error) => return Err(error),
+            }
+            flush(connection, tcp, deadline)?;
+        }
         flush(connection, tcp, deadline)
     }
 

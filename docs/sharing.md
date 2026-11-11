@@ -210,6 +210,10 @@ Findings fixed after the additional focused review:
   the serialized response (binary-searching kept newest lines), so many empty
   or short lines cannot turn a successful write into an error. Test:
   `many_empty_waited_lines_keep_a_successful_write`.
+- **TLS send boundary.** The transport now writes plaintext in bounded chunks
+  and flushes whenever rustls's buffer is full, so a valid near-limit frame
+  cannot close the connection after the device write executed. Tests:
+  `near_limit_waited_write_answers_survive_the_tls_send`.
 - **Seam replay observability.** The fake serial port now records every write
   attempt, including failed ones, and the test asserts the exact
   `write_all` remainder sequence with no later attempt.
