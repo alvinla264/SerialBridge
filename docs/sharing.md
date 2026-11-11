@@ -69,6 +69,7 @@ type:
 | `ShareStart(ShareStartParams)` | `ShareStarted(ShareSessionInfo)` | owner only, one active session |
 | `ShareStop` | `ShareStopped` | owner only |
 | `ShareCheck(ShareDevicesParams)` | `Sharing(SharingSnapshot)` | owner only |
+| `ShareReplace(ShareDevicesParams)` | `Sharing(SharingSnapshot)` | owner only, atomic whole-list replacement |
 | `ShareUncheck(ShareDevicesParams)` | `Sharing(SharingSnapshot)` | owner only, revokes now |
 | `ShareStatus` | `Sharing(SharingSnapshot)` | owner only; `active: false` when off |
 

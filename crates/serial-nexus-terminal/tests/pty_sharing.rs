@@ -113,7 +113,7 @@ fn set_port_zero(tui: &mut TuiSession) {
     click_text(tui, "Share port");
     tui.send(&[0x7f, 0x7f, 0x7f, 0x7f]);
     tui.send_text("0");
-    tui.send(KEY_ESC);
+    tui.send(KEY_ENTER);
     tui.wait_until("the port to be 0", |text| {
         text.lines()
             .find(|line| line.contains("Share port"))

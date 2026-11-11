@@ -360,6 +360,22 @@ impl Client {
         }
     }
 
+    /// Replace the whole allowlist atomically, requiring each selected
+    /// device's identity. A rejected batch changes nothing.
+    pub fn replace_shared_devices_expected(
+        &self,
+        devices: Vec<String>,
+        expected: BTreeMap<String, String>,
+    ) -> Result<SharingSnapshot, ClientError> {
+        match self.request(
+            Request::ShareReplace(ShareDevicesParams { devices, expected }),
+            self.timeout(),
+        )? {
+            ResponseData::Sharing(snapshot) => Ok(snapshot),
+            other => Err(ClientError::UnexpectedResponse(format!("{other:?}"))),
+        }
+    }
+
     /// Uncheck devices: remote access is revoked immediately.
     pub fn uncheck_shared_devices(
         &self,

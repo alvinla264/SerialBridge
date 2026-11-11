@@ -551,8 +551,10 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u1
                 let label = if state.remote_labels.is_empty() {
                     format!("{marker} {dot} {}", device.path)
                 } else {
+                    // The tag comes before the path so clipping keeps the
+                    // endpoint visible even for a long device name.
                     let tag = state.endpoint_tag(device.endpoint);
-                    format!("{marker} {dot} {} ({tag})", device.path)
+                    format!("{marker} {dot} {tag} {}", device.path)
                 };
                 let attached = state.sessions.values().any(|session| {
                     session.endpoint == device.endpoint && session.path == device.path
@@ -902,11 +904,21 @@ fn draw_connect(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u1
     put(buffer, area, 0, " Connect to a remote host ", title_style);
     let error_rows = usize::from(form.error.is_some());
     let available = area.height as usize;
-    for (index, field) in ConnectField::ALL.iter().enumerate() {
-        let offset = index + 1;
-        if offset >= available.saturating_sub(error_rows) {
-            break;
-        }
+    let visible = available.saturating_sub(1 + error_rows).max(1);
+    let selected_index = ConnectField::ALL
+        .iter()
+        .position(|field| *field == form.field)
+        .unwrap_or(0);
+    let first = selected_index
+        .saturating_sub(visible - 1)
+        .min(ConnectField::ALL.len().saturating_sub(visible));
+    for (index, field) in ConnectField::ALL
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(visible)
+    {
+        let offset = index - first + 1;
         let selected = *field == form.field;
         let value = form.value(*field);
         let label = field.name();

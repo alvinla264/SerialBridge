@@ -365,6 +365,50 @@ impl SharingSession {
         Ok(expired)
     }
 
+    /// Replace the whole allowlist in one step. Nothing is inserted or
+    /// removed when the new set is too large, so a failed Save has no effect.
+    /// Returns the expired and removed canonical paths for revocation.
+    pub fn replace(
+        &self,
+        identities: Vec<DeviceIdentity>,
+    ) -> Result<(Vec<String>, Vec<String>), ErrorBody> {
+        let mut state = self.state.lock().expect("share state lock");
+        let mut expired = Vec::new();
+        for entry in state.devices.values_mut() {
+            if !entry.expired && !entry.identity.still_valid() {
+                entry.expired = true;
+                expired.push(entry.identity.canonical.clone());
+            }
+        }
+        let keep: std::collections::HashSet<String> = identities
+            .iter()
+            .map(|identity| identity.canonical.clone())
+            .collect();
+        if keep.len() > MAX_SHARED_DEVICES {
+            return Err(ErrorBody::new(
+                ErrorCode::LimitExceeded,
+                format!("at most {MAX_SHARED_DEVICES} devices may be shared"),
+            ));
+        }
+        let removed: Vec<String> = state
+            .devices
+            .keys()
+            .filter(|path| !keep.contains(*path) && !expired.contains(path))
+            .cloned()
+            .collect();
+        state.devices.retain(|path, _| keep.contains(path));
+        for identity in identities {
+            state.devices.insert(
+                identity.canonical.clone(),
+                AuthorizedDevice {
+                    identity,
+                    expired: false,
+                },
+            );
+        }
+        Ok((expired, removed))
+    }
+
     /// Remove one device from the allowlist and return it when it was checked.
     pub fn uncheck(&self, requested: &str) -> Option<DeviceIdentity> {
         let mut state = self.state.lock().expect("share state lock");

@@ -415,6 +415,7 @@ impl Engine {
             Request::ShareStart(params) => self.start_sharing(client_id, params),
             Request::ShareStop => self.stop_sharing_from_owner(client_id),
             Request::ShareCheck(params) => self.check_shared_devices(client_id, params),
+            Request::ShareReplace(params) => self.replace_shared_devices(client_id, params),
             Request::ShareUncheck(params) => self.uncheck_shared_devices(client_id, params),
             Request::ShareStatus => self.sharing_status(client_id),
         }
@@ -1734,6 +1735,56 @@ impl Engine {
         Ok(ResponseData::Sharing(session.snapshot()))
     }
 
+    fn replace_shared_devices(
+        &self,
+        client_id: u64,
+        params: ShareDevicesParams,
+    ) -> Result<ResponseData, ErrorBody> {
+        let session = self.owner_session(client_id)?;
+        if session.is_stopped() {
+            return Err(ErrorBody::new(
+                ErrorCode::ShuttingDown,
+                "sharing is stopping",
+            ));
+        }
+        let mut identities = Vec::new();
+        let mut seen = HashSet::new();
+        for path in &params.devices {
+            let identity = self.detected_device(path)?;
+            if !identity_matches_expected(&identity, params.expected.get(path)) {
+                return Err(ErrorBody::new(
+                    ErrorCode::DeviceFailed,
+                    format!("the device at {path} changed; check it again"),
+                ));
+            }
+            let canonical = identity.canonical.clone();
+            let stale_open = {
+                let state = self.state.lock().expect("state lock");
+                state
+                    .devices
+                    .values()
+                    .find(|device| device.path == canonical)
+                    .map(|device| !device_matches_identity(device, &identity))
+            };
+            if stale_open == Some(true) {
+                return Err(ErrorBody::new(
+                    ErrorCode::DeviceFailed,
+                    "an open instance at this path is a different device; close it first",
+                ));
+            }
+            if seen.insert(canonical) {
+                identities.push(identity);
+            }
+        }
+        let (expired, removed) = session.replace(identities)?;
+        self.clear_shared_instances();
+        self.refresh_shared_instances(&session);
+        for path in expired.into_iter().chain(removed) {
+            self.revoke_path_everywhere(&path, &session);
+        }
+        Ok(ResponseData::Sharing(session.snapshot()))
+    }
+
     fn uncheck_shared_devices(
         &self,
         client_id: u64,
@@ -2012,6 +2063,7 @@ impl Engine {
             Request::ShareStart(_)
             | Request::ShareStop
             | Request::ShareCheck(_)
+            | Request::ShareReplace(_)
             | Request::ShareUncheck(_)
             | Request::ShareStatus => Err(ErrorBody::new(
                 ErrorCode::PermissionDenied,

@@ -128,6 +128,8 @@ pub enum Request {
     ShareStop,
     /// Add detected devices to the owner's session allowlist. Local owner only.
     ShareCheck(ShareDevicesParams),
+    /// Replace the whole allowlist atomically. Local owner only.
+    ShareReplace(ShareDevicesParams),
     /// Remove devices from the allowlist and revoke remote access at once.
     /// Local owner only.
     ShareUncheck(ShareDevicesParams),

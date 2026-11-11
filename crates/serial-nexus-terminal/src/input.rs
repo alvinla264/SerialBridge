@@ -121,7 +121,8 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
     if state.settings_editing && state.view == View::Settings && state.focus == Focus::Right {
         return match key {
             Key::Ctrl('s') => Action::SettingsSave,
-            Key::Enter | Key::Esc => Action::SettingsEditDone,
+            Key::Esc => Action::SettingsCancel,
+            Key::Enter => Action::SettingsEditDone,
             Key::Backspace => Action::SettingsEditBackspace,
             Key::Char(ch) if ch.is_ascii_graphic() => Action::SettingsEditChar(ch),
             Key::Tab | Key::BackTab => Action::SettingsEditDone,
@@ -623,7 +624,7 @@ mod sharing_input_tests {
             map_key(&state, Key::Backspace),
             Action::SettingsEditBackspace
         );
-        assert_eq!(map_key(&state, Key::Esc), Action::SettingsEditDone);
+        assert_eq!(map_key(&state, Key::Esc), Action::SettingsCancel);
         assert_eq!(map_key(&state, Key::Ctrl('s')), Action::SettingsSave);
     }
 }

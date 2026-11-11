@@ -249,7 +249,10 @@ impl App {
             // away; there is no listener or credential left to show.
             self.state.sharing.clear_session();
             if self.state.view == View::Pairing {
+                // A remote stream may still be attached in the right pane.
+                // Return the keys to the sidebar so `s` cannot become a write.
                 self.state.view = View::Stream;
+                self.state.focus = Focus::Sidebar;
             }
         }
         self.state.apply_endpoint_event(endpoint, &event);
@@ -670,21 +673,17 @@ impl App {
             return;
         };
         let active = self.state.sharing.active;
-        let core_checked = self.state.sharing.checked();
-        let to_check: Vec<String> = draft_checked.difference(&core_checked).cloned().collect();
-        let to_uncheck: Vec<String> = core_checked.difference(&draft_checked).cloned().collect();
-
+        let desired: Vec<String> = draft_checked.iter().cloned().collect();
         let previous_settings = self.state.settings.clone();
-        let previous_identities = self.state.sharing.pending_identities.clone();
 
-        // Every grant needs the identity the owner selected. Without one the
-        // core would fall back to the current node at that path, which could be
-        // a replacement; refuse instead of authorizing it.
-        let check_expected = self.expected_identities(&to_check, &self.state.draft_identities);
-        if active && check_expected.len() != to_check.len() {
+        // Every checked device needs the identity the owner selected. Without
+        // one the core would fall back to the current node at that path, which
+        // could be a replacement; refuse instead of authorizing it.
+        let expected = self.expected_identities(&desired, &self.state.draft_identities);
+        if active && expected.len() != desired.len() {
             self.state
                 .draft_checked
-                .retain(|path| check_expected.contains_key(path));
+                .retain(|path| expected.contains_key(path));
             self.state
                 .draft_identities
                 .retain(|path, _| self.state.draft_checked.contains(path));
@@ -702,55 +701,39 @@ impl App {
             return;
         }
 
-        if active && !to_uncheck.is_empty() {
-            if let Err(error) = self.client.uncheck_shared_devices(to_uncheck.clone()) {
-                let restored = store.save(&previous_settings).is_ok();
-                self.sync_share_status();
-                self.state.notice = Some(Notice::error(if restored {
-                    format!("settings not saved: {error}")
-                } else {
-                    format!(
-                        "settings not saved: {error}; the previous settings could not be restored"
-                    )
-                }));
-                return;
-            }
-            if let Ok(snapshot) = self.client.sharing_status() {
-                self.state.apply_sharing_snapshot(snapshot);
-            }
-        }
-
-        if active && !to_check.is_empty() {
+        if active {
             match self
                 .client
-                .check_shared_devices_expected(to_check.clone(), check_expected)
+                .replace_shared_devices_expected(desired.clone(), expected)
             {
                 Ok(snapshot) => self.state.apply_sharing_snapshot(snapshot),
                 Err(error) => {
-                    // The requested checklist was not applied. Re-check what
-                    // this Save had just removed, then put the old preferences
-                    // back, so a failed Save leaves the previous state.
-                    let old_expected = self.expected_identities(&to_uncheck, &previous_identities);
-                    let restored_checklist = if to_uncheck.is_empty() {
-                        true
-                    } else {
-                        self.client
-                            .check_shared_devices_expected(to_uncheck.clone(), old_expected)
-                            .is_ok()
-                    };
-                    let restored_file = store.save(&previous_settings).is_ok();
-                    self.sync_share_status();
-                    let suffix = match (restored_checklist, restored_file) {
-                        (true, true) => "",
-                        (false, true) => "; the previous checklist could not be restored",
-                        (true, false) => "; the previous settings file could not be restored",
-                        (false, false) => {
-                            "; the previous checklist and settings file could not be restored"
+                    // A timeout is not proof of failure: the core may have
+                    // applied the new list. Ask it; only a list that matches
+                    // the draft counts as success.
+                    let uncertain = matches!(
+                        error,
+                        ClientError::Timeout(_) | ClientError::WriteUncertain(_)
+                    );
+                    if uncertain {
+                        self.sync_share_status();
+                        if self.state.sharing.active
+                            && self.state.sharing.checked() == draft_checked
+                        {
+                            self.state.commit_settings();
+                            self.state.notice = Some(Notice::info("settings saved"));
+                            return;
                         }
-                    };
-                    self.state.notice = Some(Notice::error(format!(
-                        "settings not saved: {error}{suffix}"
-                    )));
+                    }
+                    let restored = store.save(&previous_settings).is_ok();
+                    self.sync_share_status();
+                    self.state.notice = Some(Notice::error(if restored {
+                        format!("settings not saved: {error}")
+                    } else {
+                        format!(
+                            "settings not saved: {error}; the previous settings could not be restored"
+                        )
+                    }));
                     return;
                 }
             }
@@ -844,6 +827,9 @@ impl App {
                         self.state.notice = Some(Notice::error(format!(
                             "sharing start is unknown: {error}; sharing may be on — press s to stop it"
                         )));
+                    } else {
+                        self.state.notice =
+                            Some(Notice::error(format!("sharing did not start: {error}")));
                     }
                 } else {
                     self.state.sharing.clear_session();
