@@ -2179,9 +2179,32 @@ fn a_remote_write_too_large_to_echo_is_accepted_and_trimmed() {
     let opened = human.open(&device.path, None, false).expect("open");
 
     // The write succeeds; the slightly larger remote echo is trimmed.
+    let events = human.subscribe();
     human
         .write_bytes(opened.device_id, &vec![b'x'; 49_100], None)
         .expect("write is accepted");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match events.recv_timeout(Duration::from_millis(200)) {
+            Ok(Event::Write {
+                truncated,
+                data_b64,
+                ..
+            }) => {
+                assert!(truncated, "oversized echo must be marked truncated");
+                assert!(
+                    serial_nexus_protocol::decode_bytes(&data_b64)
+                        .expect("echo bytes")
+                        .len()
+                        < 49_100
+                );
+                break;
+            }
+            Ok(_) => {}
+            Err(_) if Instant::now() >= deadline => panic!("no Write echo received"),
+            Err(_) => {}
+        }
+    }
 }
 
 #[test]

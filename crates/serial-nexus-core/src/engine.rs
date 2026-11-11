@@ -928,6 +928,7 @@ impl Engine {
                 ),
             ));
         }
+        refresh_control(device, client_id);
         let remote = self.remote_scope(client_id).is_some();
         if remote && device.shared.is_none() {
             return Err(ErrorBody::new(

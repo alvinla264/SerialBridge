@@ -259,7 +259,8 @@ impl SharingSession {
     ///
     /// A path that is not checked, or whose node changed since it was checked
     /// (unplugged, replaced, symlink retargeted), is refused. A changed node is
-    /// removed from the allowlist so it has to be checked again explicitly.
+    /// marked expired and kept only long enough for attached remotes to see
+    /// `DeviceClosed`; it must be checked again explicitly.
     pub fn authorize(&self, requested: &str) -> Result<DeviceIdentity, ErrorBody> {
         let canonical = match std::fs::canonicalize(requested) {
             Ok(canonical) => canonical.to_string_lossy().into_owned(),
@@ -318,6 +319,14 @@ impl SharingSession {
     /// Add one detected device to the allowlist (or refresh an expired entry).
     pub fn check(&self, identity: DeviceIdentity) -> Result<(), ErrorBody> {
         let mut state = self.state.lock().expect("share state lock");
+        // Mark vanished entries expired first, then drop them; otherwise a
+        // sequence of unplugged checks retains descriptors without bound.
+        for entry in state.devices.values_mut() {
+            if !entry.expired && !entry.identity.still_valid() {
+                entry.expired = true;
+            }
+        }
+        state.devices.retain(|_, entry| !entry.expired);
         let replacing = state
             .devices
             .get(&identity.canonical)

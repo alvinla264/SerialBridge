@@ -327,6 +327,18 @@ fixed with tests:
   PTY-recycling replacement test is `#[ignore]`d because path reuse is not
   guaranteed, with deterministic regular-file identity tests in its place.
 
+### Sixteenth iterative review fixes
+
+- **Writes refresh the AI control lease again**, restoring main's
+  `control_idle` semantics.
+- **ShareCheck expires and drops invalid entries before counting**, bounding
+  the checked list and pinned descriptors.
+- **The oversized-echo test now subscribes and asserts `truncated: true`** and
+  shortened bytes.
+- **`Event::Write.truncated` is omitted when false**, preserving the old local
+  JSON shape; only a trimmed remote echo carries the additive field.
+- The `authorize` rustdoc now matches the expired-entry retention behavior.
+
 ### Fifteenth iterative review fixes
 
 - **Writes are never rejected for echo size.** The full write is accepted and

@@ -439,7 +439,7 @@ pub enum Event {
         source: Source,
         data_b64: String,
         /// True when the echo was trimmed to fit a remote frame.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "is_false")]
         truncated: bool,
     },
     /// A device was closed. It must be opened again to be used.
@@ -474,6 +474,10 @@ pub enum Event {
     CoreShutdown { reason: String },
     /// Client-local: the connection ended. Never sent by the core.
     TransportClosed { reason: String },
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Event {
