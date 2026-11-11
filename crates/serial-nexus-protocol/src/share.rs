@@ -410,6 +410,69 @@ mod tests {
     }
 
     #[test]
+    fn zero_write_recovery_never_duplicates_plaintext() {
+        use std::collections::VecDeque;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Instant;
+
+        struct Scripted {
+            accepts: VecDeque<usize>,
+            written: Vec<u8>,
+        }
+        impl tlsio::TlsConnection for Scripted {
+            fn read_tls(&mut self, _reader: &mut dyn Read) -> std::io::Result<usize> {
+                Ok(0)
+            }
+            fn write_tls(&mut self, _writer: &mut dyn Write) -> std::io::Result<usize> {
+                Ok(0)
+            }
+            fn process_new_packets(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn is_handshaking(&self) -> bool {
+                false
+            }
+            fn read_plaintext(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+            fn write_plaintext(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+                let next = self.accepts.pop_front().unwrap_or(buffer.len());
+                let take = next.min(buffer.len());
+                self.written.extend_from_slice(&buffer[..take]);
+                Ok(take)
+            }
+        }
+
+        fn run(accepts: &[usize], frame: &[u8]) -> Vec<u8> {
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut tcp = TcpStream::connect(address).unwrap();
+            let (_peer, _) = listener.accept().unwrap();
+            let mut connection = Scripted {
+                accepts: accepts.iter().copied().collect(),
+                written: Vec::new(),
+            };
+            tlsio::write_frame(
+                &mut connection,
+                &mut tcp,
+                frame,
+                Instant::now() + std::time::Duration::from_secs(2),
+            )
+            .unwrap();
+            connection.written
+        }
+
+        let frame = b"0123456789abcdef";
+        // Zero, then the whole remaining frame in one retry.
+        assert_eq!(run(&[0, frame.len()], frame), frame);
+        // Zero, then a partial retry; the rest follows without duplication.
+        assert_eq!(run(&[0, 3], frame), frame);
+        // Ordinary short writes.
+        assert_eq!(run(&[2, 5, 9], frame), frame);
+    }
+
+    #[test]
     fn pairing_secret_debug_is_redacted() {
         let secret = PairingSecret {
             role: PairingRole::Human,
@@ -572,12 +635,15 @@ pub mod tlsio {
             match connection.write_plaintext(&frame[offset..end]) {
                 Ok(0) => {
                     flush(connection, tcp, deadline)?;
-                    // No progress after a flush means the peer is not draining.
-                    if connection.write_plaintext(&frame[offset..end])? == 0 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "the TLS stream accepted no plaintext after a flush",
-                        ));
+                    // Account for whatever the retry accepts, exactly once.
+                    match connection.write_plaintext(&frame[offset..end])? {
+                        0 => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "the TLS stream accepted no plaintext after a flush",
+                            ))
+                        }
+                        written => offset += written,
                     }
                 }
                 Ok(written) => {

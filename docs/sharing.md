@@ -213,7 +213,9 @@ Findings fixed after the additional focused review:
 - **TLS send boundary.** The transport now writes plaintext in bounded chunks
   and flushes whenever rustls's buffer is full, so a valid near-limit frame
   cannot close the connection after the device write executed. Tests:
-  `near_limit_waited_write_answers_survive_the_tls_send`.
+  `near_limit_waited_write_answers_survive_the_tls_send`. Zero-write
+  recovery accounts for the retry's accepted count exactly once (protocol
+  test `zero_write_recovery_never_duplicates_plaintext`).
 - **Seam replay observability.** The fake serial port now records every write
   attempt, including failed ones, and the test asserts the exact
   `write_all` remainder sequence with no later attempt.
