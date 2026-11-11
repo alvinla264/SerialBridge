@@ -236,9 +236,7 @@ impl App {
     /// Remove one remote host: its sessions, its devices and its link. Other
     /// endpoints are untouched.
     fn drop_remote(&mut self, id: EndpointId, reason: &str) {
-        self.state.remove_endpoint_sessions(id);
-        self.state.devices.retain(|device| device.endpoint != id);
-        self.state.remote_labels.remove(&id);
+        self.state.remove_endpoint(id);
         self.remotes.retain(|link| link.id != id);
         // An open Connect form belongs to a host that is not connected yet, so
         // an unrelated host going away must not close it (and redirect the
@@ -737,8 +735,8 @@ impl App {
         };
         let active = self.state.sharing.active;
         let desired: Vec<String> = draft_checked.iter().cloned().collect();
-        let previous_settings = self.state.settings.clone();
-        let previous_file = store.snapshot();
+        let previous_checked = self.state.sharing.checked();
+        let previous_identities = self.state.sharing.pending_identities.clone();
 
         // Every checked device needs the identity the owner selected. Without
         // one the core would fall back to the current node at that path, which
@@ -757,13 +755,17 @@ impl App {
             return;
         }
 
-        // Write the file before touching the core: a failed save grants and
-        // revokes nothing. A later core failure restores the file instead.
-        if let Err(error) = store.save(&draft) {
-            self.state.draft_checked = draft_checked;
-            self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
-            return;
-        }
+        // Stage the preferences but do not publish them until the core has
+        // accepted the checklist. A failed core step leaves the live file
+        // exactly as it was, with no restore write to fail.
+        let mut staged = Some(match store.stage(&draft) {
+            Ok(staged) => staged,
+            Err(error) => {
+                self.state.draft_checked = draft_checked;
+                self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
+                return;
+            }
+        });
 
         if active {
             match self
@@ -784,28 +786,44 @@ impl App {
                         if self.state.sharing.active
                             && self.state.sharing.checked() == draft_checked
                         {
+                            let staged = staged.take().expect("staged settings");
+                            if let Err(error) = store.publish(staged) {
+                                self.state.notice =
+                                    Some(Notice::error(format!("settings not saved: {error}")));
+                                return;
+                            }
                             self.state.commit_settings();
                             self.state.notice = Some(Notice::info("settings saved"));
                             return;
                         }
                     }
-                    let restored = match &previous_file {
-                        Ok(snapshot) => store.restore(snapshot.as_deref()).is_ok(),
-                        Err(_) => store.save(&previous_settings).is_ok(),
-                    };
+                    if let Some(staged) = staged.take() {
+                        store.discard(staged);
+                    }
                     self.sync_share_status();
-                    self.state.notice = Some(Notice::error(if restored {
-                        format!("settings not saved: {error}")
-                    } else {
-                        format!(
-                            "settings not saved: {error}; the previous settings could not be restored"
-                        )
-                    }));
+                    self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
                     return;
                 }
             }
         }
 
+        if let Err(error) = store.publish(staged.take().expect("staged settings")) {
+            // The live file is unchanged. Put the core back on the previous
+            // checklist so a failed Save leaves the previous sharing state.
+            if active {
+                let expected = self.expected_identities(
+                    &previous_checked.iter().cloned().collect::<Vec<_>>(),
+                    &previous_identities,
+                );
+                let _ = self.client.replace_shared_devices_expected(
+                    previous_checked.iter().cloned().collect(),
+                    expected,
+                );
+                self.sync_share_status();
+            }
+            self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
+            return;
+        }
         self.state.commit_settings();
         self.state.notice = Some(Notice::info("settings saved"));
     }

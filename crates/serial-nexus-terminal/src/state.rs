@@ -753,6 +753,17 @@ impl AppState {
             }
             rows.push(SidebarRow::Device(index));
         }
+        // A connected host with no approved devices still gets its heading,
+        // so the sidebar never hides an endpoint that is still connected.
+        for endpoint in self.remote_labels.keys() {
+            if !self
+                .devices
+                .iter()
+                .any(|device| device.endpoint == *endpoint)
+            {
+                rows.push(SidebarRow::Group(*endpoint));
+            }
+        }
         rows
     }
 
@@ -1021,6 +1032,13 @@ impl AppState {
                 .cmp(&right.endpoint)
                 .then_with(|| left.path.cmp(&right.path))
         });
+        // Device rows feed the settings checklist; keep the cursor on a real
+        // row when discovery removes one.
+        let settings_rows = self.settings_row_count();
+        if self.settings_row >= settings_rows {
+            self.settings_row = settings_rows.saturating_sub(1);
+            self.settings_editing = false;
+        }
         // A button keeps the highlight; a device row keeps its device by
         // endpoint and path when the list was re-sorted or grew.
         if self.selected_button.is_some() {
@@ -1167,6 +1185,32 @@ impl AppState {
             }
         }
         Some(session)
+    }
+
+    /// Remove a connected host and everything that belongs to it, keeping the
+    /// sidebar highlight on a remaining row.
+    pub fn remove_endpoint(&mut self, endpoint: EndpointId) {
+        let selected = self
+            .selected_device()
+            .map(|device| (device.endpoint, device.path.clone()));
+        self.remove_endpoint_sessions(endpoint);
+        self.devices.retain(|device| device.endpoint != endpoint);
+        self.remote_labels.remove(&endpoint);
+        if self.selected_button.is_none() {
+            let row = selected
+                .and_then(|(endpoint, path)| {
+                    self.devices
+                        .iter()
+                        .position(|device| device.endpoint == endpoint && device.path == path)
+                })
+                .unwrap_or_else(|| self.selected.min(self.devices.len().saturating_sub(1)));
+            self.select_index(row);
+        }
+        let settings_rows = self.settings_row_count();
+        if self.settings_row >= settings_rows {
+            self.settings_row = settings_rows.saturating_sub(1);
+            self.settings_editing = false;
+        }
     }
 
     /// Drop every session of one endpoint (its host disconnected).

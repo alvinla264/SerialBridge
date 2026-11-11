@@ -116,6 +116,31 @@ impl SettingsStore {
         write_atomic(&self.path, &staging_path(&self.path), &text)
     }
 
+    /// Write `settings` to a staging file and return it. The live file is
+    /// untouched until [`publish`] succeeds, so a Save that fails later leaves
+    /// the previous preferences in place.
+    pub fn stage(&self, settings: &TerminalSettings) -> Result<PathBuf, SettingsError> {
+        self.create_directory()?;
+        let text = serde_json::to_string_pretty(settings)? + "\n";
+        let staging = staging_path(&self.path);
+        write_staging(&staging, &text)?;
+        Ok(staging)
+    }
+
+    /// Rename a staged file onto the live settings file.
+    pub fn publish(&self, staging: PathBuf) -> Result<(), SettingsError> {
+        if let Err(error) = fs::rename(&staging, &self.path) {
+            let _ = fs::remove_file(&staging);
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    /// Drop a staged file without touching the live settings.
+    pub fn discard(&self, staging: PathBuf) {
+        let _ = fs::remove_file(staging);
+    }
+
     /// The file's current bytes, for restoring it if a later step of Save
     /// fails. `None` means there was no file.
     pub fn snapshot(&self) -> Result<Option<Vec<u8>>, SettingsError> {

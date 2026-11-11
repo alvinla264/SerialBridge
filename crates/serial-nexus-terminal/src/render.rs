@@ -536,7 +536,7 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u1
             SidebarRow::Group(endpoint) => {
                 let label = state.endpoint_label(*endpoint);
                 let tag = state.endpoint_tag(*endpoint);
-                put(buffer, line, 0, &format!(" {label} ({tag})"), dim());
+                put(buffer, line, 0, &format!(" {tag} {label}"), dim());
             }
             SidebarRow::Device(index) => {
                 let device = &state.devices[*index];
@@ -947,16 +947,37 @@ fn draw_connect(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u1
         let label = field.name();
         let marker = if selected { "▸" } else { " " };
         let line = Rect::new(area.x, area.y + offset as u16, area.width, 1);
-        draw_value_row(
-            buffer,
-            line,
-            &format!("{marker} {label}"),
-            &value,
-            highlighted(selected),
-        );
+        let width = area.width as usize;
+        let full_label = format!("{marker} {label}");
+        let value_width = display_width(&value) as usize;
+        let label_width = display_width(&full_label) as usize;
+        let (shown_label, shown_value) = if label_width + 1 + value_width < width {
+            (full_label, value)
+        } else {
+            // Long CA/fingerprint/credential values keep their label and show
+            // the newest characters, which is where the cursor is.
+            let room = width.saturating_sub(label_width + 1).max(1);
+            let value_room = if label_width + 1 + room > width {
+                width / 2
+            } else {
+                room
+            };
+            let tail: String = value
+                .chars()
+                .rev()
+                .take(value_room)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let label_room = width.saturating_sub(display_width(&tail) as usize + 1);
+            (fit(&full_label, label_room), tail)
+        };
+        let text = fit(&format!("{shown_label} {shown_value}"), width);
+        put(buffer, line, 0, &text, highlighted(selected));
         if selected {
-            let value_column = area.width.saturating_sub(display_width(&value));
-            cursor = (area.x + value_column, line.y);
+            let column = display_width(&text).min(width as u16).saturating_sub(1);
+            cursor = (area.x + column, line.y);
         }
     }
     if let Some(error) = &form.error {
