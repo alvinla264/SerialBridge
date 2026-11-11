@@ -465,26 +465,24 @@ impl App {
             self.state.focus = Focus::Right;
             if self.state.view == View::Settings {
                 match settings_hit_test(&self.state, right, column, row) {
-                    Some(SettingsHit::Flag(index)) => {
-                        if index < self.state.settings_row_count() {
-                            self.state.settings_row = index;
-                            self.state.end_settings_edit();
-                            match self.state.settings_kind(index) {
-                                Some(SettingsRow::Device(_))
-                                | Some(SettingsRow::LocalEcho)
-                                | Some(SettingsRow::Scrollback) => {
-                                    self.state.toggle_draft();
-                                }
-                                Some(SettingsRow::ShareAddress | SettingsRow::SharePort) => {
-                                    self.state.begin_settings_edit();
-                                }
-                                None => {}
+                    Some(SettingsHit::Flag(index)) if index < self.state.settings_row_count() => {
+                        self.state.settings_row = index;
+                        self.state.end_settings_edit();
+                        match self.state.settings_kind(index) {
+                            Some(SettingsRow::Device(_))
+                            | Some(SettingsRow::LocalEcho)
+                            | Some(SettingsRow::Scrollback) => {
+                                self.state.toggle_draft();
                             }
+                            Some(SettingsRow::ShareAddress | SettingsRow::SharePort) => {
+                                self.state.begin_settings_edit();
+                            }
+                            None => {}
                         }
                     }
                     Some(SettingsHit::Save) => self.save_settings(),
                     Some(SettingsHit::Cancel) => self.state.cancel_settings(),
-                    None => {}
+                    Some(SettingsHit::Flag(_)) | None => {}
                 }
             }
         }
