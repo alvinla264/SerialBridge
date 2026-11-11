@@ -337,8 +337,12 @@ impl RemoteClient {
         match rx.recv_timeout(timeout) {
             Ok(result) => result,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                let pending = self.inner.pending.lock().expect("pending lock").remove(&id);
-                if pending.is_some_and(|pending| pending.is_write) {
+                // Use the request kind captured before dispatch. The dispatcher
+                // may have removed the pending entry just before sending the
+                // answer; consulting only the removed entry would misclassify
+                // this write as an ordinary timeout.
+                let _ = self.inner.pending.lock().expect("pending lock").remove(&id);
+                if is_write {
                     Err(ClientError::WriteUncertain(format!(
                         "no answer within {timeout:?} (request id {id}); the bytes may already have reached the device and were not replayed"
                     )))
@@ -349,7 +353,13 @@ impl RemoteClient {
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                Err(ClientError::Disconnected("remote connection closed".into()))
+                if is_write {
+                    Err(ClientError::WriteUncertain(format!(
+                        "no answer (request id {id}); the bytes may already have reached the device and were not replayed"
+                    )))
+                } else {
+                    Err(ClientError::Disconnected("remote connection closed".into()))
+                }
             }
         }
     }
