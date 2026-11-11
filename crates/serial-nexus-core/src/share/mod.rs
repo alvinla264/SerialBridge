@@ -423,14 +423,23 @@ impl SharingSession {
             .remove(path);
     }
 
-    pub fn snapshot(&self) -> SharingSnapshot {
+    /// Expire checked entries whose pinned node is no longer valid and return
+    /// their paths, so callers can perform engine-side revocation.
+    pub fn expire_invalid(&self) -> Vec<String> {
         let mut state = self.state.lock().expect("share state lock");
-        // A checked device that is never opened is not otherwise revalidated.
+        let mut expired = Vec::new();
         for entry in state.devices.values_mut() {
             if !entry.expired && !entry.identity.still_valid() {
                 entry.expired = true;
+                expired.push(entry.identity.canonical.clone());
             }
         }
+        expired
+    }
+
+    pub fn snapshot(&self) -> SharingSnapshot {
+        let _ = self.expire_invalid();
+        let state = self.state.lock().expect("share state lock");
         SharingSnapshot {
             active: true,
             session_id: Some(self.id.clone()),

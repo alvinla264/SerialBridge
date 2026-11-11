@@ -1745,6 +1745,20 @@ impl Engine {
     fn sharing_status(&self, client_id: u64) -> Result<ResponseData, ErrorBody> {
         match self.sharing_session() {
             Some(session) if session.owner_client_id() == client_id => {
+                for path in session.expire_invalid() {
+                    let ids: Vec<u64> = self
+                        .state
+                        .lock()
+                        .expect("state lock")
+                        .devices
+                        .iter()
+                        .filter(|(_, device)| device.path == path)
+                        .map(|(id, _)| *id)
+                        .collect();
+                    for id in ids {
+                        self.revalidate_shared_instance(id, &session);
+                    }
+                }
                 Ok(ResponseData::Sharing(session.snapshot()))
             }
             Some(_) => Err(ErrorBody::new(
@@ -2008,9 +2022,15 @@ impl Engine {
             .filter(|(_, device)| device.path == target || device.path == path)
             .map(|(id, _)| *id)
             .collect();
-        if !ids.is_empty() {
-            self.detach_remote_clients(&ids, reason);
+        if ids.is_empty() {
+            return;
         }
+        if let Some(session) = self.sharing_session() {
+            for id in &ids {
+                self.revalidate_shared_instance(*id, &session);
+            }
+        }
+        self.detach_remote_clients(&ids, reason);
     }
 
     fn authorize_remote_device_only(
@@ -2043,6 +2063,7 @@ impl Engine {
             Ok(()) => Ok(()),
             Err(error) => {
                 // A changed device revokes access and fails remote work now.
+                self.revalidate_shared_instance(device_id, session);
                 self.detach_remote_clients(&[device_id], "device is no longer shared");
                 Err(error)
             }

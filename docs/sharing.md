@@ -103,14 +103,14 @@ type:
   is shared across local and remote clients on the same device.
 - **Unchecking.** `ShareUncheck` removes the entry, detaches every remote
   client from that device, releases any control it held, fails its pending
-  waited writes and bumps that client's write generation so its queued but not
-  yet started commands are dropped by the writer. Local clients and other
+  waited writes and bumps the device's write generation so queued but not yet
+  started remote commands are dropped by the writer. Local clients and other
   shared devices are untouched. A write already in progress can still finish or
   partially reach the device; there is no rollback and no automatic replay.
 - **Owner loss / stop.** The listener is closed, every remote socket is shut
-  down and every remote client's write generation is bumped, so queued but not
-  yet started remote writes are dropped, including writes from clients that
-  have since detached (a write already in progress may finish). Remote waits fail and the client reports uncertainty
+  down and every device's write generation is bumped, so queued but not yet
+  started remote writes are dropped, including writes from clients that have
+  since detached (a write already in progress may finish). Remote waits fail and the client reports uncertainty
   (`ClientError::WriteUncertain` / `may_have_reached_device: true`); nothing is
   retried.
 
@@ -326,6 +326,15 @@ fixed with tests:
   connection slots, and an unchecked later device instance; the engine-level
   PTY-recycling replacement test is `#[ignore]`d because path reuse is not
   guaranteed, with deterministic regular-file identity tests in its place.
+
+### Thirteenth iterative review fixes
+
+- **Owner status expiry revokes queued remote work.** `ShareStatus` expiration
+  revalidates affected open instances, bumping epochs, detaching remotes and
+  failing waiters instead of only hiding the entry.
+- **Request-triggered expiry announces `DeviceClosed`** to other attached
+  remotes by routing through the same revalidation path.
+- The write-generation documentation now consistently says per-device.
 
 ### Twelfth iterative review fixes
 
