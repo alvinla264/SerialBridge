@@ -2000,6 +2000,15 @@ impl Engine {
             .filter(|(_, device)| device.path == target || device.path == path)
             .map(|(id, _)| *id)
             .collect();
+        // A device may already have left the open map and still be draining.
+        {
+            let live = self.live_writes.lock().expect("live writes lock");
+            for (registered, epoch) in live.values() {
+                if *registered == target || *registered == path {
+                    epoch.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
         if ids.is_empty() {
             return;
         }

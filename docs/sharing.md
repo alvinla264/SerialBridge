@@ -107,6 +107,9 @@ type:
   started remote commands are dropped by the writer. Local clients and other
   shared devices are untouched. A write already in progress can still finish or
   partially reach the device; there is no rollback and no automatic replay.
+- **ShareStatus when off.** With no active session, `ShareStatus` returns the
+  inactive snapshot to any local client; when a session is active, only its
+  owner may inspect it. `ShareStop` when off returns `was_active: false`.
 - **Owner loss / stop.** The listener is closed, every remote socket is shut
   down and every device's write generation is bumped, so queued but not yet
   started remote writes are dropped, including writes from clients that have
@@ -326,6 +329,16 @@ fixed with tests:
   connection slots, and an unchecked later device instance; the engine-level
   PTY-recycling replacement test is `#[ignore]`d because path reuse is not
   guaranteed, with deterministic regular-file identity tests in its place.
+
+### Seventeenth iterative review fixes
+
+- **Request-triggered expiry bumps `live_writes` even when the device already
+  left the open map**, so draining queued remote writes are dropped.
+- **Queued local requests are processed after a write-half close**, restoring
+  main's half-close compatibility; a queued `ShareStart` is still refused by
+  the dead-connection guard.
+- **`ShareStop` when sharing is off returns `was_active: false`.** Docs clarify
+  inactive `ShareStatus` visibility.
 
 ### Sixteenth iterative review fixes
 
