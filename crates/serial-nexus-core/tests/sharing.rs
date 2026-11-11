@@ -2099,3 +2099,32 @@ fn local_writes_keep_the_legacy_unbounded_queue() {
     }
     assert!(!device.read_available(Duration::from_millis(300)).is_empty());
 }
+
+#[test]
+fn a_remote_read_fits_a_single_oversized_binary_line() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let mut device = SimulatedDevice::new();
+    owner
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![device.path.clone()])
+        .expect("start");
+    let human = remote(&info, PairingRole::Human, "remote").expect("pair");
+    let opened = human.open(&device.path, None, false).expect("open");
+
+    // One complete history line larger than a remote frame.
+    let mut bytes = vec![b'x'; 80 * 1024];
+    bytes.push(b'\n');
+    device.write(&bytes);
+    std::thread::sleep(Duration::from_millis(300));
+    let read = human
+        .read(opened.device_id, Some(1))
+        .expect("an oversized line must be trimmed, not rejected");
+    assert!(!read.lines.is_empty());
+    assert!(
+        read.truncated,
+        "the answer must report trimming to fit the remote frame"
+    );
+}

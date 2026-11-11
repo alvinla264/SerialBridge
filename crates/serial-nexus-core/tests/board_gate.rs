@@ -19,86 +19,11 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use serial_nexus_client::{Client, ClientInfo, ErrorCode, RemoteClient};
-use serial_nexus_protocol::PairingRole;
+use serial_nexus_protocol::{decode_bytes, Event, PairingRole};
 use tempfile::TempDir;
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
-}
-
-/// Every `needle` inside device-sourced text; human and AI writes never count
-/// as a firmware echo. A fresh echo requires more occurrences than before the
-/// probe, including a completion of an existing partial line.
-fn echo_is_fresh(
-    before: usize,
-    lines: &[serial_nexus_protocol::HistoryLine],
-    expected: &str,
-) -> bool {
-    occurrences(lines, expected) > before
-}
-
-fn occurrences(lines: &[serial_nexus_protocol::HistoryLine], needle: &str) -> usize {
-    lines
-        .iter()
-        .filter(|line| line.source == serial_nexus_protocol::Source::Device)
-        .map(|line| line.text.match_indices(needle).count())
-        .sum()
-}
-
-#[test]
-fn a_firmware_echo_must_be_new_device_output_not_the_probe_or_old_history() {
-    use serial_nexus_protocol::{HistoryLine, Source};
-    let lines = vec![
-        HistoryLine {
-            source: Source::Human,
-            text: "UNIQUE".into(),
-            partial: false,
-        },
-        HistoryLine {
-            source: Source::Device,
-            text: "OLD UNIQUE".into(),
-            partial: false,
-        },
-    ];
-    assert_eq!(occurrences(&lines, "UNIQUE"), 1, "old device output counts");
-    assert_eq!(
-        occurrences(&lines[..1], "UNIQUE"),
-        0,
-        "a human write is not echo"
-    );
-    assert!(
-        !echo_is_fresh(1, &lines, "UNIQUE"),
-        "unchanged old history is not a fresh echo"
-    );
-    let mut with_new = lines.clone();
-    with_new.push(HistoryLine {
-        source: Source::Device,
-        text: "NEW UNIQUE".into(),
-        partial: false,
-    });
-    assert!(
-        echo_is_fresh(1, &with_new, "UNIQUE"),
-        "new device output is a fresh echo"
-    );
-    // A fresh echo may complete an existing partial line rather than start a
-    // separate one; occurrences, not matching lines, decide freshness.
-    let completed = vec![
-        HistoryLine {
-            source: Source::Device,
-            text: "OK".into(),
-            partial: true,
-        },
-        HistoryLine {
-            source: Source::Device,
-            text: "OK OK".into(),
-            partial: false,
-        },
-    ];
-    assert_eq!(occurrences(&completed, "OK"), 3);
-    assert!(
-        echo_is_fresh(1, &completed, "OK"),
-        "an echo completing a partial line is fresh"
-    );
 }
 
 #[test]
@@ -211,32 +136,35 @@ fn board_gate_over_real_lan() {
     );
 
     if let Some(bytes) = &probe {
-        // Count existing device output before the probe: the probe itself is
-        // recorded as a human line, and old history must not satisfy the echo
-        // assertion. Only new device-sourced output counts.
-        let before = expect_echo.as_ref().map(|expected| {
-            human
-                .read(opened.device_id, Some(200))
-                .map(|read| occurrences(&read.lines, expected))
-                .unwrap_or(0)
-        });
+        let events = human.subscribe();
         let written = human
             .write_bytes(opened.device_id, bytes, None)
             .expect("remote write");
         assert_eq!(written.bytes_written, bytes.len());
         eprintln!("    probe sent: {} bytes", bytes.len());
-        if let (Some(expected), Some(before)) = (&expect_echo, before) {
+        if let Some(expected) = &expect_echo {
+            // Events are fresh output; a sliding history window can evict an
+            // old matching line and hide a genuine echo.
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut seen = String::new();
             loop {
-                let read = human.read(opened.device_id, Some(200)).expect("re-read");
-                if echo_is_fresh(before, &read.lines, expected) {
-                    eprintln!("    firmware echoed {expected:?}");
-                    break;
+                match events.recv_timeout(Duration::from_millis(200)) {
+                    Ok(Event::DeviceOutput { data_b64, .. }) => {
+                        let data = decode_bytes(&data_b64).expect("event bytes");
+                        seen.push_str(&String::from_utf8_lossy(&data));
+                        if seen.contains(expected) {
+                            eprintln!("    firmware echoed {expected:?}");
+                            break;
+                        }
+                    }
+                    Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        panic!("event stream ended while waiting for echo")
+                    }
                 }
                 if std::time::Instant::now() >= deadline {
                     panic!("firmware did not echo {expected:?} within 5s");
                 }
-                std::thread::sleep(Duration::from_millis(50));
             }
         }
     }

@@ -286,6 +286,10 @@ impl Engine {
             .lock()
             .expect("clients lock")
             .remove(&client_id);
+        self.dead_connections
+            .lock()
+            .expect("dead connections lock")
+            .remove(&client_id);
         let previous = self.client_count.fetch_sub(1, Ordering::SeqCst);
         let remaining = previous.saturating_sub(1);
 
@@ -578,7 +582,7 @@ impl Engine {
                     if !still_shared {
                         return Err(ErrorBody::new(
                             ErrorCode::DeviceFailed,
-                            format!("{port} is no longer shared; check it again"),
+                            "device is no longer shared; check it again",
                         ));
                     }
                 }
@@ -1209,6 +1213,10 @@ impl Engine {
             )
         };
         let path = removed.as_ref().map(|device| device.path.clone());
+        if let Some(device) = removed.as_ref() {
+            // Drop every queued remote command, not just the one in progress.
+            device.write_epoch.fetch_add(1, Ordering::SeqCst);
+        }
         if let Some(device) = removed {
             // A failed device's writer may never unblock; join it off the
             // dispatcher so healthy devices and timers keep running.
@@ -1832,8 +1840,10 @@ impl Engine {
         client_id: u64,
         params: WriteParams,
     ) -> Result<WriteStart, ErrorBody> {
-        // The sharing gate keeps admission atomic with stop/revocation.
-        let _gate = self.share_gate.read().expect("share gate");
+        // The sharing gate keeps admission atomic with stop/revocation, but
+        // never covers a blocking device drain: a failed authorization drops
+        // the gate before detaching.
+        let gate = self.share_gate.read().expect("share gate");
         let Some(session) = self.remote_scope(client_id) else {
             return Err(ErrorBody::new(
                 ErrorCode::PermissionDenied,
@@ -1843,11 +1853,15 @@ impl Engine {
         if session.is_stopped() {
             return Err(ErrorBody::new(ErrorCode::ShuttingDown, "sharing stopped"));
         }
-        self.authorize_remote_device(&session, params.device_id)?;
+        if let Err(error) = self.authorize_remote_device_only(&session, params.device_id) {
+            drop(gate);
+            self.detach_remote_clients(&[params.device_id], "device is no longer shared");
+            return Err(error);
+        }
         self.begin_write(client_id, params)
     }
 
-    fn authorize_remote_device(
+    fn authorize_remote_device_only(
         &self,
         session: &SharingSession,
         device_id: u64,
@@ -1865,8 +1879,16 @@ impl Engine {
                 format!("device {device_id} is not open"),
             ));
         };
-        match session.authorize(&path) {
-            Ok(_) => Ok(()),
+        session.authorize(&path).map(|_| ())
+    }
+
+    fn authorize_remote_device(
+        &self,
+        session: &SharingSession,
+        device_id: u64,
+    ) -> Result<(), ErrorBody> {
+        match self.authorize_remote_device_only(session, device_id) {
+            Ok(()) => Ok(()),
             Err(error) => {
                 // A changed device revokes access and fails remote work now.
                 self.detach_remote_clients(&[device_id], "device is no longer shared");

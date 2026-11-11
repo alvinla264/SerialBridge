@@ -616,6 +616,20 @@ fn discovery_and_events_revalidate_a_stale_shared_identity() {
     // Replace the pinned node. Discovery and event delivery must notice.
     std::fs::remove_file(&path).expect("unlink");
     std::fs::write(&path, b"replacement").expect("replacement");
+    // Event delivery must revalidate on its own, without a preceding
+    // discovery request expiring the instance first.
+    state
+        .incoming
+        .lock()
+        .expect("incoming lock")
+        .extend(b"POST-REPLACEMENT\n");
+    std::thread::sleep(Duration::from_millis(250));
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event, serial_nexus_protocol::Event::DeviceOutput { .. }),
+            "event delivery must not expose data after identity expiry: {event:?}"
+        );
+    }
     assert!(
         !remote
             .list_devices()
@@ -635,18 +649,6 @@ fn discovery_and_events_revalidate_a_stale_shared_identity() {
         started.elapsed() < Duration::from_millis(1_500),
         "the waiter was not cancelled by expiry: {wait_result:?}"
     );
-    state
-        .incoming
-        .lock()
-        .expect("incoming lock")
-        .extend(b"POST-REPLACEMENT\n");
-    std::thread::sleep(Duration::from_millis(250));
-    while let Ok(event) = events.try_recv() {
-        assert!(
-            !matches!(event, serial_nexus_protocol::Event::DeviceOutput { .. }),
-            "event delivery must not expose data after identity expiry: {event:?}"
-        );
-    }
     assert!(remote.write_bytes(opened.device_id, b"late", None).is_err());
     install_serial_factory(None);
     install_port_lister(None);
@@ -733,6 +735,9 @@ fn a_failed_devices_stalled_writer_does_not_block_healthy_output() {
     remote
         .write_bytes(first_open.device_id, b"stalled", None)
         .expect("queue stalled write");
+    remote
+        .write_bytes(first_open.device_id, b"QUEUED-MUST-DROP", None)
+        .expect("queue write behind the stalled one");
     first_state.fail_reads.store(true, Ordering::SeqCst);
     // Wait until the failed device has been removed; the dispatcher may still
     // be joining its stalled writer.
@@ -759,6 +764,12 @@ fn a_failed_devices_stalled_writer_does_not_block_healthy_output() {
             .unwrap_or(false)
     });
     first_state.block_writes.store(false, Ordering::SeqCst);
+    let written =
+        String::from_utf8_lossy(&first_state.written.lock().expect("written lock")).into_owned();
+    assert!(
+        !written.contains("QUEUED-MUST-DROP"),
+        "a queued remote write ran after reader failure: {written}"
+    );
     install_serial_factory(None);
     install_port_lister(None);
 }

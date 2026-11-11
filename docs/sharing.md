@@ -326,6 +326,24 @@ fixed with tests:
   PTY-recycling replacement test is `#[ignore]`d because path reuse is not
   guaranteed, with deterministic regular-file identity tests in its place.
 
+### Eighth iterative review fixes
+
+- **A failed write authorization no longer holds `share_gate` across a
+  blocking last-detach drain.** The gate is dropped before detaching, so
+  owner-loss/stop can revoke the listener and credentials immediately.
+- **Reader failure bumps the device write epoch** before async cleanup, so
+  queued remote commands are dropped instead of running after revocation.
+- **Remote `Read` answers are fitted to the remote frame.** Oversized lines
+  and partial tails are trimmed (with `truncated` set) instead of failing with
+  an impossible "request fewer lines" remedy.
+- **The post-open re-authorization error is fixed text**, with no canonical
+  path.
+- **`dead_connections` entries are pruned on unregister.**
+- **The stale-identity test delivers output before discovery**, so event-time
+  revalidation is independently exercised.
+- **Board-gate echo detection subscribes to fresh `DeviceOutput` events**,
+  removing the sliding-window false negative and the occurrence helper.
+
 ### Seventh iterative review fixes
 
 - **Expiry cancels pending remote waiters.** Discovery/event revalidation now
@@ -361,8 +379,8 @@ fixed with tests:
   `a_failed_devices_stalled_writer_does_not_block_healthy_output`.
 - **Expired entries still receive a closure mark**, so remotes attached before
   authorization expiry see `DeviceClosed`; the recycled-node test asserts it.
-- **Board-gate echo checks count occurrences**, including completion of a
-  partial line, and read at most 200 lines to stay within a remote frame.
+- **Board-gate echo checks use fresh device-output events**, not a sliding
+  history window, so rollover cannot hide a genuine echo.
 
 ### Fifth iterative review fixes
 

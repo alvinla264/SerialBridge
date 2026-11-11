@@ -713,8 +713,88 @@ fn fit_write_answer(
             high = middle - 1;
         }
     }
-    result.lines = result.lines[total - low..].to_vec();
+    let original = result.lines.clone();
+    result.lines = original[total - low..].to_vec();
+    if result.lines.is_empty() && total > 0 {
+        result.lines = original[total - 1..].to_vec();
+        // A single oversized line is trimmed to the frame by the caller's
+        // encoded-size check if needed; dropping it would lose the answer.
+        while !result.lines.is_empty() && !fits(id, &result) {
+            let last = result.lines.len() - 1;
+            if result.lines[last].text.is_empty() {
+                break;
+            }
+            let cut = result.lines[last].text.len() / 2;
+            let mut cut = cut;
+            while cut > 0 && !result.lines[last].text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            result.lines[last].text.truncate(cut);
+        }
+    }
     result.truncated = true;
+    result
+}
+
+fn fit_read_answer(
+    id: u64,
+    mut result: serial_nexus_protocol::ReadResult,
+) -> serial_nexus_protocol::ReadResult {
+    fn fits(id: u64, result: &serial_nexus_protocol::ReadResult) -> bool {
+        encode_frame(&ServerMessage::Response {
+            id,
+            result: ResponseData::Read(result.clone()),
+        })
+        .is_ok()
+    }
+    if fits(id, &result) {
+        return result;
+    }
+    let total = result.lines.len();
+    let mut low = 0usize;
+    let mut high = total;
+    while low < high {
+        let middle = (low + high).div_ceil(2);
+        let mut candidate = result.clone();
+        candidate.lines = result.lines[total - middle..].to_vec();
+        if fits(id, &candidate) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let original = result.lines.clone();
+    result.lines = original[total - low..].to_vec();
+    if result.lines.is_empty() && total > 0 {
+        // A single oversized line cannot be made to fit by dropping lines;
+        // keep the newest one and trim its text below.
+        result.lines = original[total - 1..].to_vec();
+    }
+    result.truncated = true;
+    if !result.lines.is_empty() && !fits(id, &result) {
+        // One line/tail can exceed the frame by itself; trim its tail.
+        let last = result.lines.len() - 1;
+        let mut low = 0usize;
+        let mut high = result.lines[last].text.len();
+        while low < high {
+            let middle = (low + high).div_ceil(2);
+            let mut cut = middle;
+            while cut > 0 && !result.lines[last].text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let mut candidate = result.clone();
+            candidate.lines[last].text.truncate(cut);
+            if fits(id, &candidate) {
+                low = middle;
+            } else {
+                high = middle.saturating_sub(1);
+            }
+        }
+        while low > 0 && !result.lines[last].text.is_char_boundary(low) {
+            low -= 1;
+        }
+        result.lines[last].text.truncate(low);
+    }
     result
 }
 
@@ -795,6 +875,7 @@ fn handle_remote_request(
     };
     let answer = answer.map(|result| match result {
         ResponseData::Written(result) => ResponseData::Written(fit_write_answer(id, result)),
+        ResponseData::Read(result) => ResponseData::Read(fit_read_answer(id, result)),
         other => other,
     });
     let message = match answer {
