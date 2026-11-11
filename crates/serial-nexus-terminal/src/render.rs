@@ -17,8 +17,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::screen::{Color, Style};
 use crate::state::{
-    AppState, ConnectForm, Focus, SettingsRow, Severity, SidebarButton, SidebarRow, View,
-    CONNECT_FIELDS,
+    AppState, ConnectField, Focus, SettingsRow, Severity, SidebarButton, SidebarRow, View,
 };
 
 /// The sidebar's preferred narrowest width when both panes are shown.
@@ -150,16 +149,24 @@ pub struct Sidebar {
 /// Where the sidebar puts its parts inside `rect`, or `None` when there is no
 /// room.
 pub fn sidebar(rect: Rect) -> Option<Sidebar> {
-    // A title and three buttons; the list may give way to the buttons, so a
-    // very short sidebar still shows every control.
-    if rect.height < 4 || rect.width < 8 {
+    if rect.height < 2 || rect.width < 8 {
         return None;
     }
+    let empty = Rect::new(rect.x, rect.y, 0, 0);
     let title = Rect::new(rect.x, rect.y, rect.width, 1);
-    let button = Rect::new(rect.x, rect.y + rect.height - 1, rect.width, 1);
-    let connect = Rect::new(rect.x, rect.y + rect.height - 2, rect.width, 1);
-    let share = Rect::new(rect.x, rect.y + rect.height - 3, rect.width, 1);
-    let list_height = rect.height - 4;
+    let bottom = rect.y + rect.height - 1;
+    let button = Rect::new(rect.x, bottom, rect.width, 1);
+    // Short sidebars give rows to the controls first. Settings survives at the
+    // old two-row minimum; Share and Connect appear once there is room.
+    let (share, connect, list_height) = if rect.height >= 4 {
+        (
+            Rect::new(rect.x, bottom - 2, rect.width, 1),
+            Rect::new(rect.x, bottom - 1, rect.width, 1),
+            rect.height - 4,
+        )
+    } else {
+        (empty, empty, rect.height - 2)
+    };
     let list = Rect::new(rect.x, rect.y + 1, rect.width, list_height);
     Some(Sidebar {
         title,
@@ -424,7 +431,11 @@ fn draw_header(state: &AppState, buffer: &mut Buffer, area: Rect) {
 
     let brand = " SerialNexus ";
     let brand_width = display_width(brand);
-    let details = format!("  {path}  {baud} baud  AI control: {control}  [{attached}]");
+    let endpoint = device
+        .map(|device| state.endpoint_tag(device.endpoint))
+        .unwrap_or_else(|| "local".to_string());
+    let details =
+        format!("  [{endpoint}] {path}  {baud} baud  AI control: {control}  [{attached}]");
     let right = format!("{view} ");
     let right_width = display_width(&right);
     let hint_fits = area.width.saturating_sub(right_width) >= brand_width + display_width(&details);
@@ -521,7 +532,8 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u1
         match row {
             SidebarRow::Group(endpoint) => {
                 let label = state.endpoint_label(*endpoint);
-                put(buffer, line, 0, &format!(" {label}"), dim());
+                let tag = state.endpoint_tag(*endpoint);
+                put(buffer, line, 0, &format!(" {label} ({tag})"), dim());
             }
             SidebarRow::Device(index) => {
                 let device = &state.devices[*index];
@@ -536,7 +548,12 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u1
                     (false, false) => " ",
                 };
                 let dot = if device.open { "●" } else { "○" };
-                let label = format!("{marker} {dot} {}", device.path);
+                let label = if state.remote_labels.is_empty() {
+                    format!("{marker} {dot} {}", device.path)
+                } else {
+                    let tag = state.endpoint_tag(device.endpoint);
+                    format!("{marker} {dot} {} ({tag})", device.path)
+                };
                 let attached = state.sessions.values().any(|session| {
                     session.endpoint == device.endpoint && session.path == device.path
                 });
@@ -885,14 +902,14 @@ fn draw_connect(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u1
     put(buffer, area, 0, " Connect to a remote host ", title_style);
     let error_rows = usize::from(form.error.is_some());
     let available = area.height as usize;
-    for field in 0..CONNECT_FIELDS {
-        let offset = field + 1;
+    for (index, field) in ConnectField::ALL.iter().enumerate() {
+        let offset = index + 1;
         if offset >= available.saturating_sub(error_rows) {
             break;
         }
-        let selected = field == form.field;
-        let value = form.value(field);
-        let label = ConnectForm::field_name(field).unwrap_or_default();
+        let selected = *field == form.field;
+        let value = form.value(*field);
+        let label = field.name();
         let marker = if selected { "▸" } else { " " };
         let line = Rect::new(area.x, area.y + offset as u16, area.width, 1);
         draw_value_row(
@@ -1463,6 +1480,15 @@ mod tests {
         let cursor = render(&state, &mut buffer, area).expect("cursor");
         let button = settings_button(area).expect("button");
         assert_eq!(cursor, (button.x + 1, button.y));
+    }
+
+    #[test]
+    fn a_two_row_sidebar_keeps_the_settings_button_reachable() {
+        let sidebar = sidebar(Rect::new(0, 0, 20, 2)).expect("compact sidebar");
+        assert_eq!(sidebar.button, Rect::new(0, 1, 20, 1));
+        assert_eq!(sidebar.share.height, 0);
+        assert_eq!(sidebar.connect.height, 0);
+        assert_eq!(sidebar.list.height, 0);
     }
 
     #[test]

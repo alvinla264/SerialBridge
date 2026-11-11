@@ -369,14 +369,9 @@ impl App {
         self.state.focus = Focus::Right;
     }
 
-    /// Show one attached session in the right pane and give it the keyboard.
-    fn show_session(&mut self, key: SessionKey) {
-        self.focus_session(key);
-    }
-
     /// Show one attached session (a test seam for a user switching streams).
     pub fn show_session_now(&mut self, key: SessionKey) {
-        self.show_session(key);
+        self.focus_session(key);
     }
 
     fn focus_session(&mut self, key: SessionKey) {
@@ -518,7 +513,15 @@ impl App {
                 });
                 if double {
                     let target = self.last_click.take().and_then(|last| last.target);
-                    self.activate_target(target);
+                    // A device needs the second click to open it, and Settings
+                    // is idempotent. Share and Connect acted on the first
+                    // click; running them again would undo or reset it.
+                    if !matches!(
+                        target,
+                        Some(ClickTarget::Share) | Some(ClickTarget::Connect)
+                    ) {
+                        self.activate_target(target);
+                    }
                 } else {
                     // Remember what this click landed on before it moves the
                     // sidebar's viewport; the second click of a double-click
@@ -671,83 +674,92 @@ impl App {
         let to_check: Vec<String> = draft_checked.difference(&core_checked).cloned().collect();
         let to_uncheck: Vec<String> = core_checked.difference(&draft_checked).cloned().collect();
 
-        // Grant first, write the file second, revoke last. A refused grant or a
-        // failed write therefore never unchecks anything, and a failed write
-        // takes back the grants it just made.
+        let previous_settings = self.state.settings.clone();
+        let previous_identities = self.state.sharing.pending_identities.clone();
+
+        // Every grant needs the identity the owner selected. Without one the
+        // core would fall back to the current node at that path, which could be
+        // a replacement; refuse instead of authorizing it.
+        let check_expected = self.expected_identities(&to_check, &self.state.draft_identities);
+        if active && check_expected.len() != to_check.len() {
+            self.state
+                .draft_checked
+                .retain(|path| check_expected.contains_key(path));
+            self.state
+                .draft_identities
+                .retain(|path, _| self.state.draft_checked.contains(path));
+            self.state.notice = Some(Notice::error(
+                "settings not saved: a checked device has no captured identity; refresh and check it again",
+            ));
+            return;
+        }
+
+        // Write the file before touching the core: a failed save grants and
+        // revokes nothing. A later core failure restores the file instead.
+        if let Err(error) = store.save(&draft) {
+            self.state.draft_checked = draft_checked;
+            self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
+            return;
+        }
+
+        if active && !to_uncheck.is_empty() {
+            if let Err(error) = self.client.uncheck_shared_devices(to_uncheck.clone()) {
+                let restored = store.save(&previous_settings).is_ok();
+                self.sync_share_status();
+                self.state.notice = Some(Notice::error(if restored {
+                    format!("settings not saved: {error}")
+                } else {
+                    format!(
+                        "settings not saved: {error}; the previous settings could not be restored"
+                    )
+                }));
+                return;
+            }
+            if let Ok(snapshot) = self.client.sharing_status() {
+                self.state.apply_sharing_snapshot(snapshot);
+            }
+        }
+
         if active && !to_check.is_empty() {
-            let expected = self.expected_identities(&to_check, &self.state.draft_identities);
             match self
                 .client
-                .check_shared_devices_expected(to_check.clone(), expected)
+                .check_shared_devices_expected(to_check.clone(), check_expected)
             {
                 Ok(snapshot) => self.state.apply_sharing_snapshot(snapshot),
                 Err(error) => {
-                    // The core checks a batch device by device. Take back any
-                    // grant it accepted before the failure, then report the
-                    // save as a whole as not applied.
+                    // The requested checklist was not applied. Re-check what
+                    // this Save had just removed, then put the old preferences
+                    // back, so a failed Save leaves the previous state.
+                    let old_expected = self.expected_identities(&to_uncheck, &previous_identities);
+                    let restored_checklist = if to_uncheck.is_empty() {
+                        true
+                    } else {
+                        self.client
+                            .check_shared_devices_expected(to_uncheck.clone(), old_expected)
+                            .is_ok()
+                    };
+                    let restored_file = store.save(&previous_settings).is_ok();
                     self.sync_share_status();
-                    let requested: BTreeSet<String> = to_check.iter().cloned().collect();
-                    let granted: Vec<String> = self
-                        .state
-                        .sharing
-                        .checked()
-                        .intersection(&requested)
-                        .cloned()
-                        .collect();
-                    if !granted.is_empty() {
-                        if let Ok(snapshot) = self.client.uncheck_shared_devices(granted) {
-                            self.state.apply_sharing_snapshot(snapshot);
+                    let suffix = match (restored_checklist, restored_file) {
+                        (true, true) => "",
+                        (false, true) => "; the previous checklist could not be restored",
+                        (true, false) => "; the previous settings file could not be restored",
+                        (false, false) => {
+                            "; the previous checklist and settings file could not be restored"
                         }
-                    }
-                    self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
+                    };
+                    self.state.notice = Some(Notice::error(format!(
+                        "settings not saved: {error}{suffix}"
+                    )));
                     return;
                 }
             }
         }
 
-        let previous = self.state.settings.clone();
-        match store.save(&draft) {
-            Ok(()) => {
-                if active && !to_uncheck.is_empty() {
-                    if let Err(error) = self.client.uncheck_shared_devices(to_uncheck) {
-                        // Keep the preferences and the draft together: put the
-                        // previous file back rather than persist a Save that
-                        // did not complete.
-                        let restored = store.save(&previous).is_ok();
-                        self.sync_share_status();
-                        self.state.notice = Some(Notice::error(if restored {
-                            format!("settings not saved: {error}")
-                        } else {
-                            format!(
-                                "settings not saved: {error}; the previous settings could not be restored"
-                            )
-                        }));
-                        return;
-                    }
-                    if let Ok(snapshot) = self.client.sharing_status() {
-                        self.state.apply_sharing_snapshot(snapshot);
-                    }
-                }
-                self.state.commit_settings();
-                self.state.notice = Some(Notice::info("settings saved"));
-            }
-            Err(error) => {
-                // The file is the settings' only home: a failed write must not
-                // leave a checklist applied that Save never completed.
-                if active && !to_check.is_empty() {
-                    if let Ok(snapshot) = self.client.uncheck_shared_devices(to_check) {
-                        self.state.apply_sharing_snapshot(snapshot);
-                    }
-                }
-                self.state.draft_checked = draft_checked;
-                self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
-                self.sync_share_status();
-            }
-        }
+        self.state.commit_settings();
+        self.state.notice = Some(Notice::info("settings saved"));
     }
 
-    /// Start or stop the local sharing session from the sidebar's Share button
-    /// or the `s` key.
     pub fn toggle_sharing(&mut self) {
         if self.state.sharing.active {
             self.stop_sharing();
@@ -769,14 +781,28 @@ impl App {
         }
         self.state.drop_replaced_checks();
         let detected = self.state.detected_local_identities();
-        let devices: Vec<String> = self
+        let missing: Vec<String> = self
             .state
             .sharing
             .pending_checked
             .iter()
-            .filter(|path| detected.contains_key(path.as_str()))
+            .filter(|path| !detected.contains_key(path.as_str()))
             .cloned()
             .collect();
+        if !missing.is_empty() {
+            for path in &missing {
+                self.state.sharing.pending_checked.remove(path);
+                self.state.draft_checked.remove(path);
+                self.state.sharing.pending_identities.remove(path);
+                self.state.draft_identities.remove(path);
+            }
+            self.state.notice = Some(Notice::error(format!(
+                "sharing not started: no captured identity for {}; refresh and check it again",
+                missing.join(", ")
+            )));
+            return;
+        }
+        let devices: Vec<String> = self.state.sharing.pending_checked.iter().cloned().collect();
         if devices.is_empty() {
             self.state.notice = Some(Notice::error(
                 "check at least one device in Settings before starting to share",
@@ -805,8 +831,25 @@ impl App {
                 ));
             }
             Err(error) => {
-                self.state.sharing.clear_session();
-                self.state.notice = Some(Notice::error(format!("sharing not started: {error}")));
+                if matches!(
+                    error,
+                    ClientError::Timeout(_) | ClientError::WriteUncertain(_)
+                ) {
+                    // The core may have accepted ShareStart before the answer
+                    // was lost. Keep the stop control available and ask the
+                    // core what is really true instead of claiming it is off.
+                    self.state.sharing.active = true;
+                    self.sync_share_status();
+                    if self.state.sharing.active {
+                        self.state.notice = Some(Notice::error(format!(
+                            "sharing start is unknown: {error}; sharing may be on — press s to stop it"
+                        )));
+                    }
+                } else {
+                    self.state.sharing.clear_session();
+                    self.state.notice =
+                        Some(Notice::error(format!("sharing not started: {error}")));
+                }
             }
         }
     }
@@ -1020,19 +1063,28 @@ impl App {
             .map(|link| &link.client)
     }
 
+    /// Resolve one endpoint to its transport. `None` means this machine's
+    /// client; an unknown remote endpoint is an error everywhere, never a
+    /// silent fallback to the local core.
+    fn endpoint_client(&self, endpoint: EndpointId) -> Result<Option<&RemoteClient>, ClientError> {
+        if endpoint == LOCAL_ENDPOINT {
+            return Ok(None);
+        }
+        self.remote_client(endpoint).map(Some).ok_or_else(|| {
+            ClientError::Disconnected("the remote host is no longer connected".into())
+        })
+    }
+
     fn open_on(
         &self,
         endpoint: EndpointId,
         path: &str,
         baud: Option<u32>,
     ) -> Result<serial_nexus_protocol::OpenResult, ClientError> {
-        if endpoint == LOCAL_ENDPOINT {
-            return self.client.open(path, baud, false);
+        match self.endpoint_client(endpoint)? {
+            None => self.client.open(path, baud, false),
+            Some(remote) => remote.open(path, baud, false),
         }
-        let remote = self.remote_client(endpoint).ok_or_else(|| {
-            ClientError::Disconnected("the remote host is no longer connected".into())
-        })?;
-        remote.open(path, baud, false)
     }
 
     /// Ask the core for the running session's state and take its answer as
@@ -1105,7 +1157,7 @@ impl App {
                 endpoint: session.endpoint,
                 device_id: session.device_id,
             };
-            self.show_session(key);
+            self.focus_session(key);
             self.state.notice = Some(Notice::info("already attached"));
             return;
         }
@@ -1154,7 +1206,7 @@ impl App {
             opened.baud,
             opened.control.holder.clone(),
         );
-        self.show_session(key);
+        self.focus_session(key);
         self.state.notice = Some(Notice::info(format!(
             "opened {} at {} baud",
             opened.port, opened.baud
@@ -1225,9 +1277,10 @@ impl App {
         } else if let Some(link) = self.remotes.iter_mut().find(|link| link.id == key.endpoint) {
             link.expected_closes.insert(key.device_id);
         }
-        let closed = match self.remote_client(key.endpoint) {
-            None => self.client.close(key.device_id),
-            Some(remote) => remote.close(key.device_id),
+        let closed = match self.endpoint_client(key.endpoint) {
+            Ok(None) => self.client.close(key.device_id),
+            Ok(Some(remote)) => remote.close(key.device_id),
+            Err(error) => Err(error),
         };
         match closed {
             Ok(()) => {
@@ -1265,9 +1318,10 @@ impl App {
         };
         let path = session.path.clone();
         let endpoint = session.endpoint;
-        let written = match self.remote_client(endpoint) {
-            None => self.client.write_bytes(session_key.device_id, bytes, None),
-            Some(remote) => remote.write_bytes(session_key.device_id, bytes, None),
+        let written = match self.endpoint_client(endpoint) {
+            Ok(None) => self.client.write_bytes(session_key.device_id, bytes, None),
+            Ok(Some(remote)) => remote.write_bytes(session_key.device_id, bytes, None),
+            Err(error) => Err(error),
         };
         if let Err(error) = written {
             if error.is_device_gone() {
@@ -1300,13 +1354,14 @@ impl App {
             self.state.sharing.clear_session();
         }
         for key in self.state.all_sessions() {
-            match self.remote_client(key.endpoint) {
-                None => {
+            match self.endpoint_client(key.endpoint) {
+                Ok(None) => {
                     let _ = self.client.close(key.device_id);
                 }
-                Some(remote) => {
+                Ok(Some(remote)) => {
                     let _ = remote.close(key.device_id);
                 }
+                Err(_) => {}
             }
             self.state.remove_session(key);
         }

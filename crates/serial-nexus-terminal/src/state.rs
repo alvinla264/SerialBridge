@@ -173,12 +173,51 @@ impl SessionKey {
     }
 }
 
+/// One field of the remote-connect form, in drawing order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectField {
+    Address,
+    Port,
+    Ca,
+    Fingerprint,
+    Credential,
+}
+
+impl ConnectField {
+    pub const ALL: [Self; 5] = [
+        Self::Address,
+        Self::Port,
+        Self::Ca,
+        Self::Fingerprint,
+        Self::Credential,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Address => "Host address",
+            Self::Port => "Port",
+            Self::Ca => "CA certificate (base64 DER)",
+            Self::Fingerprint => "Host certificate SHA-256",
+            Self::Credential => "Human pairing credential",
+        }
+    }
+
+    fn text_mut(self, form: &mut ConnectForm) -> &mut String {
+        match self {
+            Self::Address => &mut form.address,
+            Self::Port => &mut form.port,
+            Self::Ca => &mut form.ca,
+            Self::Fingerprint => &mut form.fingerprint,
+            Self::Credential => &mut form.credential,
+        }
+    }
+}
+
 /// The remote-connect form. Every value is memory-only: nothing here is
 /// written to the settings file, logged, or sent to a device.
 pub struct ConnectForm {
-    /// The field that takes typed text: address, port, CA, fingerprint,
-    /// credential.
-    pub field: usize,
+    /// The field that takes typed text.
+    pub field: ConnectField,
     pub address: String,
     pub port: String,
     pub ca: String,
@@ -187,13 +226,10 @@ pub struct ConnectForm {
     pub error: Option<String>,
 }
 
-/// The form fields, in drawing order.
-pub const CONNECT_FIELDS: usize = 5;
-
 impl ConnectForm {
     pub fn new() -> Self {
         Self {
-            field: 0,
+            field: ConnectField::Address,
             address: String::new(),
             port: String::new(),
             ca: String::new(),
@@ -203,32 +239,20 @@ impl ConnectForm {
         }
     }
 
-    pub fn field_name(field: usize) -> Option<&'static str> {
-        match field {
-            0 => Some("Host address"),
-            1 => Some("Port"),
-            2 => Some("CA certificate (base64 DER)"),
-            3 => Some("Host certificate SHA-256"),
-            4 => Some("Human pairing credential"),
-            _ => None,
-        }
-    }
-
     /// What the form shows for one field. The credential is masked.
-    pub fn value(&self, field: usize) -> String {
+    pub fn value(&self, field: ConnectField) -> String {
         match field {
-            0 => self.address.clone(),
-            1 => self.port.clone(),
-            2 => self.ca.clone(),
-            3 => self.fingerprint.clone(),
-            4 => {
+            ConnectField::Address => self.address.clone(),
+            ConnectField::Port => self.port.clone(),
+            ConnectField::Ca => self.ca.clone(),
+            ConnectField::Fingerprint => self.fingerprint.clone(),
+            ConnectField::Credential => {
                 if self.credential.is_empty() {
                     String::new()
                 } else {
                     "••••••••".to_string()
                 }
             }
-            _ => String::new(),
         }
     }
 
@@ -236,13 +260,7 @@ impl ConnectForm {
         if !ch.is_ascii_graphic() {
             return;
         }
-        let field = match self.field {
-            0 => &mut self.address,
-            1 => &mut self.port,
-            2 => &mut self.ca,
-            3 => &mut self.fingerprint,
-            _ => &mut self.credential,
-        };
+        let field = self.field.text_mut(self);
         if field.len() < 4096 {
             field.push(ch);
         }
@@ -250,20 +268,18 @@ impl ConnectForm {
     }
 
     pub fn backspace(&mut self) {
-        let field = match self.field {
-            0 => &mut self.address,
-            1 => &mut self.port,
-            2 => &mut self.ca,
-            3 => &mut self.fingerprint,
-            _ => &mut self.credential,
-        };
-        field.pop();
+        self.field.text_mut(self).pop();
         self.error = None;
     }
 
     pub fn next_field(&mut self, delta: i32) {
-        let last = CONNECT_FIELDS - 1;
-        self.field = (self.field as i32 + delta).clamp(0, last as i32) as usize;
+        let index = ConnectField::ALL
+            .iter()
+            .position(|field| *field == self.field)
+            .unwrap_or(0);
+        let last = ConnectField::ALL.len() - 1;
+        let next = (index as i32 + delta).clamp(0, last as i32) as usize;
+        self.field = ConnectField::ALL[next];
     }
 }
 
@@ -502,17 +518,16 @@ impl AppState {
 
     /// The label the settings view draws for one row.
     pub fn settings_row_label(&self, row: usize) -> String {
+        if let Some(name) = Self::settings_row_name(row) {
+            return name.to_string();
+        }
         match self.settings_kind(row) {
-            Some(SettingsRow::LocalEcho) => "Local echo".into(),
-            Some(SettingsRow::Scrollback) => "Scrollback".into(),
-            Some(SettingsRow::ShareAddress) => "Share address".into(),
-            Some(SettingsRow::SharePort) => "Share port".into(),
             Some(SettingsRow::Device(index)) => self
                 .devices
                 .get(index)
                 .map(|device| device.path.clone())
                 .unwrap_or_default(),
-            None => String::new(),
+            _ => String::new(),
         }
     }
 
@@ -739,6 +754,16 @@ impl AppState {
                 .get(&endpoint)
                 .cloned()
                 .unwrap_or_else(|| format!("Remote {}", endpoint.0))
+        }
+    }
+
+    /// A short stable discriminator for one endpoint, used beside device rows
+    /// and in the header when paths alone cannot tell two hosts apart.
+    pub fn endpoint_tag(&self, endpoint: EndpointId) -> String {
+        if endpoint == LOCAL_ENDPOINT {
+            "local".to_string()
+        } else {
+            format!("#{}", endpoint.0)
         }
     }
 
@@ -1141,6 +1166,7 @@ impl AppState {
             .collect();
         for path in previous.difference(&next) {
             self.draft_checked.remove(path);
+            self.draft_identities.remove(path);
         }
         self.sharing.active = snapshot.active;
         self.sharing.pending_checked = next;
@@ -1178,16 +1204,7 @@ impl AppState {
     /// between two refreshes is not authorized by stale UI state.
     pub fn drop_replaced_checks(&mut self) {
         let detected = self.detected_local_identities();
-        retain_checked(
-            &mut self.sharing.pending_checked,
-            &mut self.sharing.pending_identities,
-            &detected,
-        );
-        retain_checked(
-            &mut self.draft_checked,
-            &mut self.draft_identities,
-            &detected,
-        );
+        self.prune_share_checks(&detected);
     }
 
     /// The local devices the core currently detects, mapped to their identity.
@@ -1202,14 +1219,6 @@ impl AppState {
                     .map(|identity| (device.path.clone(), identity.clone()))
             })
             .collect()
-    }
-
-    /// Whether the settings draft checks at least one detected device.
-    pub fn draft_checks_any_device(&self) -> bool {
-        self.devices
-            .iter()
-            .filter(|device| device.endpoint == LOCAL_ENDPOINT)
-            .any(|device| self.draft_checked.contains(&device.path))
     }
 
     /// Apply one local core event.
@@ -1363,9 +1372,7 @@ fn retain_checked(
 ) {
     checked.retain(|path| match (identities.get(path), detected.get(path)) {
         (Some(recorded), Some(current)) => recorded == current,
-        (Some(_), None) => false,
-        (None, Some(_)) => true,
-        (None, None) => false,
+        (Some(_), None) | (None, Some(_)) | (None, None) => false,
     });
     identities.retain(|path, _| checked.contains(path));
 }
@@ -1875,7 +1882,14 @@ mod sharing_tests {
     fn an_unplugged_path_is_pruned_from_the_checks() {
         let mut state = state_with_devices();
         state.sharing.pending_checked.insert("/dev/ttyUSB0".into());
+        state
+            .sharing
+            .pending_identities
+            .insert("/dev/ttyUSB0".into(), "gone".into());
         state.draft_checked.insert("/dev/ttyUSB1".into());
+        state
+            .draft_identities
+            .insert("/dev/ttyUSB1".into(), "id1".into());
         let detected: BTreeMap<String, String> = [("/dev/ttyUSB1".to_string(), "id1".to_string())]
             .into_iter()
             .collect();

@@ -454,3 +454,68 @@ fn a_remote_host_stopping_sharing_removes_only_its_own_sessions() {
 
     terminal.app.shutdown();
 }
+
+#[test]
+fn two_connected_hosts_with_the_same_path_stay_separate_in_the_sidebar() {
+    let _guard = serial_test();
+    let (_local_core, local_socket) =
+        start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let shared = TempDir::new().expect("shared device");
+    let shared_path = shared.path().join("ttySHARED0");
+    std::fs::write(&shared_path, b"simulated").expect("shared node");
+    let shared_text = shared_path.to_string_lossy().into_owned();
+    let paths = Arc::new(Mutex::new(vec![shared_path.clone()]));
+
+    let first_host = start_host(&[&shared_text], Arc::clone(&paths));
+    let second_host = start_host(&[&shared_text], Arc::clone(&paths));
+    let mut terminal = Terminal::new(&local_socket);
+    terminal.connect(&first_host.info);
+    terminal.connect(&second_host.info);
+
+    let mut endpoints: Vec<EndpointId> = terminal
+        .app
+        .state
+        .devices
+        .iter()
+        .filter(|device| {
+            device.path == shared_text
+                && device.endpoint != serial_nexus_terminal::state::LOCAL_ENDPOINT
+        })
+        .map(|device| device.endpoint)
+        .collect();
+    endpoints.sort();
+    endpoints.dedup();
+    assert_eq!(endpoints.len(), 2, "both hosts list the same path");
+
+    let rows = terminal.app.state.sidebar_rows();
+    let second_row = rows
+        .iter()
+        .position(|row| {
+            matches!(
+                row,
+                serial_nexus_terminal::state::SidebarRow::Device(index)
+                    if terminal.app.state.devices[*index].endpoint == endpoints[1]
+                        && terminal.app.state.devices[*index].path == shared_text
+            )
+        })
+        .expect("the second host's row");
+    let area = ratatui::layout::Rect::new(0, 0, 100, 20);
+    let sidebar =
+        serial_nexus_terminal::render::sidebar(serial_nexus_terminal::render::panes(area).sidebar)
+            .expect("sidebar");
+    terminal
+        .app
+        .handle_double_click(area, sidebar.list.x + 2, sidebar.list.y + second_row as u16);
+    let selected = terminal.app.state.selected_device().expect("a device");
+    assert_eq!(
+        selected.endpoint, endpoints[1],
+        "the equal path resolved to the clicked host, not the first match"
+    );
+
+    // The header says which endpoint the shown row belongs to.
+    let shown = terminal.app.state.shown_device().map(|d| d.endpoint);
+    if let Some(endpoint) = shown {
+        assert!(!terminal.app.state.endpoint_tag(endpoint).is_empty());
+    }
+    terminal.app.shutdown();
+}
