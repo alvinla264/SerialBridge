@@ -116,7 +116,9 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
         // the sidebar stays visible beside them, and the draft is kept.
         return Action::ToggleFocus;
     }
-    if state.settings_editing {
+    // A text field belongs to the right pane. Once focus moves to the sidebar
+    // (Ctrl+]), its keys act on the sidebar, not on the hidden field.
+    if state.settings_editing && state.view == View::Settings && state.focus == Focus::Right {
         return match key {
             Key::Ctrl('s') => Action::SettingsSave,
             Key::Enter | Key::Esc => Action::SettingsEditDone,
@@ -587,6 +589,21 @@ mod sharing_input_tests {
             Action::Ignore,
             "nothing typed in the pairing view reaches a device"
         );
+    }
+
+    #[test]
+    fn moving_focus_leaves_the_settings_text_field() {
+        let mut state = state();
+        state.begin_settings();
+        state.settings_row = 2; // the share address
+        assert!(state.begin_settings_edit());
+        state.focus = Focus::Sidebar;
+        assert_eq!(
+            map_key(&state, Key::Char('s')),
+            Action::ShareToggle,
+            "the sidebar owns keys once focus moved there"
+        );
+        assert_eq!(map_key(&state, Key::Char('x')), Action::Ignore);
     }
 
     #[test]

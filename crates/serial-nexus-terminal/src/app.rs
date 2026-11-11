@@ -29,7 +29,9 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// hit-testing the second click at the same cell would find another row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ClickTarget {
-    Device(String),
+    /// A device by endpoint and path. The endpoint keeps equal paths on two
+    /// hosts apart, so a double-click never opens the wrong one.
+    Device(EndpointId, String),
     Share,
     Connect,
     Settings,
@@ -130,13 +132,7 @@ impl App {
                 let entries: Vec<DeviceEntry> =
                     result.devices.into_iter().map(device_entry).collect();
                 self.state.set_endpoint_devices(LOCAL_ENDPOINT, entries);
-                let detected: BTreeSet<String> = self
-                    .state
-                    .devices
-                    .iter()
-                    .filter(|device| device.endpoint == LOCAL_ENDPOINT)
-                    .map(|device| device.path.clone())
-                    .collect();
+                let detected = self.state.detected_local_identities();
                 self.state.prune_share_checks(&detected);
             }
             Err(error) => self.state.notice = Some(Notice::error(error.to_string())),
@@ -176,9 +172,9 @@ impl App {
         self.state.devices.retain(|device| device.endpoint != id);
         self.state.remote_labels.remove(&id);
         self.remotes.retain(|link| link.id != id);
-        if self.state.view == View::Connect {
-            self.state.view = View::Stream;
-        }
+        // An open Connect form belongs to a host that is not connected yet, so
+        // an unrelated host going away must not close it (and redirect the
+        // credentials being typed into the shown device's stream).
         self.state.notice = Some(Notice::error(reason.to_string()));
     }
 
@@ -537,7 +533,7 @@ impl App {
                 .state
                 .devices
                 .get(index)
-                .map(|device| ClickTarget::Device(device.path.clone())),
+                .map(|device| ClickTarget::Device(device.endpoint, device.path.clone())),
             Some(Hit::Share) => Some(ClickTarget::Share),
             Some(Hit::Connect) => Some(ClickTarget::Connect),
             Some(Hit::Settings) => Some(ClickTarget::Settings),
@@ -555,14 +551,14 @@ impl App {
 
     fn activate_target(&mut self, target: Option<ClickTarget>) {
         match target {
-            Some(ClickTarget::Device(path)) => {
+            Some(ClickTarget::Device(endpoint, path)) => {
                 self.state.prompt = None;
                 self.state.focus = Focus::Sidebar;
                 if let Some(index) = self
                     .state
                     .devices
                     .iter()
-                    .position(|device| device.path == path)
+                    .position(|device| device.endpoint == endpoint && device.path == path)
                 {
                     self.state.select_index(index);
                     self.open_selected();
@@ -647,24 +643,27 @@ impl App {
         self.state.draft.share_address = address.to_string();
         self.state.draft.share_port = port;
 
+        // A replacement at a reused path must be checked again; stale UI state
+        // is never turned into an authorization.
+        self.state.drop_replaced_checks();
+
         let draft = self.state.draft.clone();
         let draft_checked = self.state.draft_checked.clone();
         let Some(store) = self.settings_store.clone() else {
             self.state.notice = Some(Notice::error("settings not saved: no settings file"));
             return;
         };
+        let active = self.state.sharing.active;
+        let core_checked = self.state.sharing.checked();
+        let to_check: Vec<String> = draft_checked.difference(&core_checked).cloned().collect();
+        let to_uncheck: Vec<String> = core_checked.difference(&draft_checked).cloned().collect();
 
-        // A running session follows the checklist at once: unchecking revokes
-        // remote access, checking grants it. The core's snapshot, not the UI,
-        // says what is really shared.
-        let mut rollback: Option<(Vec<String>, Vec<String>)> = None;
-        if self.state.sharing.active {
-            let core_checked = self.state.sharing.checked();
-            let to_check: Vec<String> = draft_checked.difference(&core_checked).cloned().collect();
-            let to_uncheck: Vec<String> =
-                core_checked.difference(&draft_checked).cloned().collect();
-            match self.apply_checklist(&to_check, &to_uncheck) {
-                Ok(()) => rollback = Some((to_uncheck, to_check)),
+        // Grant first, write the file second, revoke last. A refused grant or a
+        // failed write therefore never unchecks anything, and a failed write
+        // takes back the grants it just made.
+        if active && !to_check.is_empty() {
+            match self.client.check_shared_devices(to_check.clone()) {
+                Ok(snapshot) => self.state.apply_sharing_snapshot(snapshot),
                 Err(error) => {
                     self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
                     self.sync_share_status();
@@ -676,38 +675,33 @@ impl App {
         match store.save(&draft) {
             Ok(()) => {
                 self.state.commit_settings();
+                if active && !to_uncheck.is_empty() {
+                    match self.client.uncheck_shared_devices(to_uncheck) {
+                        Ok(snapshot) => self.state.apply_sharing_snapshot(snapshot),
+                        Err(error) => {
+                            self.state.notice = Some(Notice::error(format!(
+                                "settings saved, but the checklist was not applied: {error}"
+                            )));
+                            self.sync_share_status();
+                            return;
+                        }
+                    }
+                }
                 self.state.notice = Some(Notice::info("settings saved"));
             }
             Err(error) => {
                 // The file is the settings' only home: a failed write must not
                 // leave a checklist applied that Save never completed.
-                if let Some((to_check, to_uncheck)) = rollback {
-                    let _ = self.apply_checklist(&to_check, &to_uncheck);
+                if active && !to_check.is_empty() {
+                    if let Ok(snapshot) = self.client.uncheck_shared_devices(to_check) {
+                        self.state.apply_sharing_snapshot(snapshot);
+                    }
                 }
                 self.state.draft_checked = draft_checked;
                 self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
                 self.sync_share_status();
             }
         }
-    }
-
-    /// Check and uncheck devices in the running session, taking the core's
-    /// snapshot after each call. Unchecking first revokes remote access before
-    /// any new grant.
-    fn apply_checklist(
-        &mut self,
-        to_check: &[String],
-        to_uncheck: &[String],
-    ) -> Result<(), ClientError> {
-        if !to_uncheck.is_empty() {
-            let snapshot = self.client.uncheck_shared_devices(to_uncheck.to_vec())?;
-            self.state.apply_sharing_snapshot(snapshot);
-        }
-        if !to_check.is_empty() {
-            let snapshot = self.client.check_shared_devices(to_check.to_vec())?;
-            self.state.apply_sharing_snapshot(snapshot);
-        }
-        Ok(())
     }
 
     /// Start or stop the local sharing session from the sidebar's Share button
@@ -731,18 +725,14 @@ impl App {
         if self.refuse_if_unsaved_settings() {
             return;
         }
-        let detected: BTreeSet<&str> = self
-            .state
-            .devices
-            .iter()
-            .map(|device| device.path.as_str())
-            .collect();
+        self.state.drop_replaced_checks();
+        let detected = self.state.detected_local_identities();
         let devices: Vec<String> = self
             .state
             .sharing
             .pending_checked
             .iter()
-            .filter(|path| detected.contains(path.as_str()))
+            .filter(|path| detected.contains_key(path.as_str()))
             .cloned()
             .collect();
         if devices.is_empty() {
@@ -958,7 +948,7 @@ impl App {
         let id = EndpointId(self.next_endpoint);
         self.next_endpoint += 1;
         let label = format!("Remote {}", paired.address);
-        let events = check.subscribe();
+        let events = check.subscribe_bounded(1024);
         self.remotes.push(RemoteLink {
             id,
             client: check,
@@ -1283,6 +1273,7 @@ fn device_entry_on(endpoint: EndpointId, device: DeviceSummary) -> DeviceEntry {
         endpoint,
         path: device.path,
         description: device.description,
+        identity: device.identity,
         open: device.open,
         device_id: device.device_id,
         baud: device.baud,

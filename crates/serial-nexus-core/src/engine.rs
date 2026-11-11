@@ -457,8 +457,11 @@ impl Engine {
                     devices.push(entry);
                 }
                 None => devices.push(DeviceSummary {
-                    path: port.path,
+                    path: port.path.clone(),
                     description: port.description,
+                    identity: DeviceIdentity::capture(&port.path)
+                        .ok()
+                        .map(|identity| identity.describe()),
                     open: false,
                     device_id: None,
                     baud: None,
@@ -2406,6 +2409,7 @@ fn summary(device: &Device) -> DeviceSummary {
     DeviceSummary {
         path: device.path.clone(),
         description: None,
+        identity: Some(device.identity.describe()),
         open: true,
         device_id: Some(device.id),
         baud: Some(device.baud),

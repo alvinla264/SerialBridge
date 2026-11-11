@@ -262,6 +262,13 @@ See [`crates/serial-nexus-mcp/README.md`](../crates/serial-nexus-mcp/README.md)
 for the tool reference, protocol notes and limitations (text only, one request at
 a time per session, bounded waits and reads, Linux only).
 
+This release's MCP server is local-only: it reaches the core on this machine and
+has no remote pairing option yet. A sharing session still issues a separate MCP
+credential for the follow-on remote MCP client. Keep it private — a file only
+your user can read (mode `0600`), outside the repository and never in shell
+history or a tool call — and do not add it to the local MCP host configuration,
+which would send it nowhere useful.
+
 ### Sharing devices on the LAN from the terminal
 
 Sharing is opt-in and off by default. The sidebar has `[ Share: off ]` between

@@ -106,6 +106,9 @@ pub struct SharingState {
     /// mirrors the core's authoritative checked list; before it starts it is
     /// the selection the host made in the settings.
     pub pending_checked: BTreeSet<String>,
+    /// The device identity each pending path was checked as. A different
+    /// device at the same path no longer matches and loses its check.
+    pub pending_identities: BTreeMap<String, String>,
 }
 
 impl SharingState {
@@ -115,6 +118,7 @@ impl SharingState {
             snapshot: None,
             pairing: None,
             pending_checked: BTreeSet::new(),
+            pending_identities: BTreeMap::new(),
         }
     }
 
@@ -283,6 +287,8 @@ pub struct DeviceEntry {
     pub endpoint: EndpointId,
     pub path: String,
     pub description: Option<String>,
+    /// Opaque device-node identity, when the core could capture it.
+    pub identity: Option<String>,
     pub open: bool,
     pub device_id: Option<u64>,
     pub baud: Option<u32>,
@@ -302,6 +308,7 @@ impl DeviceEntry {
             endpoint,
             path: path.into(),
             description: None,
+            identity: None,
             open: false,
             device_id: None,
             baud: None,
@@ -399,6 +406,8 @@ pub struct AppState {
     pub draft: TerminalSettings,
     /// The device checkboxes in the settings draft. Session-only.
     pub draft_checked: BTreeSet<String>,
+    /// The identity each checked draft path was selected as.
+    pub draft_identities: BTreeMap<String, String>,
     /// This terminal's sharing session (owner only).
     pub sharing: SharingState,
     /// Labels for connected remote hosts, keyed by endpoint. The local
@@ -436,6 +445,7 @@ impl AppState {
             settings: TerminalSettings::default(),
             draft: TerminalSettings::default(),
             draft_checked: BTreeSet::new(),
+            draft_identities: BTreeMap::new(),
             sharing: SharingState::new(),
             remote_labels: BTreeMap::new(),
             connect: None,
@@ -453,15 +463,30 @@ impl AppState {
             2 => Some(SettingsRow::ShareAddress),
             3 => Some(SettingsRow::SharePort),
             _ => {
-                let index = row.checked_sub(SETTINGS_FIXED_ROWS)?;
-                (index < self.devices.len()).then_some(SettingsRow::Device(index))
+                // Only this host's devices can be shared: another host's
+                // checklist is never ours to edit, and equal paths must not
+                // stand in for a local device.
+                let local = self.local_device_indices();
+                let index = *local.get(row.checked_sub(SETTINGS_FIXED_ROWS)?)?;
+                Some(SettingsRow::Device(index))
             }
         }
     }
 
-    /// How many settings rows there are, including one per detected device.
+    /// The device indices that belong to this machine's core, in list order.
+    fn local_device_indices(&self) -> Vec<usize> {
+        self.devices
+            .iter()
+            .enumerate()
+            .filter(|(_, device)| device.endpoint == LOCAL_ENDPOINT)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// How many settings rows there are, including one per detected local
+    /// device.
     pub fn settings_row_count(&self) -> usize {
-        SETTINGS_FIXED_ROWS + self.devices.len()
+        SETTINGS_FIXED_ROWS + self.local_device_indices().len()
     }
 
     /// The name of a fixed settings row. Device rows are labelled by path.
@@ -538,10 +563,15 @@ impl AppState {
                 Some(self.draft.scrollback)
             }
             SettingsRow::Device(index) => {
-                let path = self.devices.get(index)?.path.clone();
+                let device = self.devices.get(index)?;
+                let path = device.path.clone();
                 let checked = if self.draft_checked.remove(&path) {
+                    self.draft_identities.remove(&path);
                     false
                 } else {
+                    if let Some(identity) = &device.identity {
+                        self.draft_identities.insert(path.clone(), identity.clone());
+                    }
                     self.draft_checked.insert(path);
                     true
                 };
@@ -630,6 +660,7 @@ impl AppState {
         // The checklist starts from what the core currently shares, or from
         // the session-only selection made before sharing started.
         self.draft_checked = self.sharing.checked();
+        self.draft_identities = self.sharing.pending_identities.clone();
         self.port_text = self.draft.share_port.to_string();
         self.settings_row = 0;
         self.settings_editing = false;
@@ -641,6 +672,7 @@ impl AppState {
     pub fn cancel_settings(&mut self) {
         self.draft = self.settings.clone();
         self.draft_checked = self.sharing.checked();
+        self.draft_identities = self.sharing.pending_identities.clone();
         self.port_text = self.draft.share_port.to_string();
         self.settings_editing = false;
         self.leave_settings();
@@ -653,6 +685,7 @@ impl AppState {
         self.settings = self.draft.clone();
         self.port_text = self.settings.share_port.to_string();
         self.sharing.pending_checked = self.draft_checked.clone();
+        self.sharing.pending_identities = self.draft_identities.clone();
         self.settings_editing = false;
         self.apply_scrollback();
         self.leave_settings();
@@ -872,6 +905,7 @@ impl AppState {
                     endpoint,
                     path: session.path.clone(),
                     description: None,
+                    identity: None,
                     open: true,
                     device_id: Some(session.device_id),
                     baud: Some(session.baud),
@@ -980,6 +1014,7 @@ impl AppState {
                 endpoint,
                 path: path.clone(),
                 description: None,
+                identity: None,
                 open: true,
                 device_id: Some(device_id),
                 baud: Some(baud),
@@ -1083,6 +1118,11 @@ impl AppState {
         }
         self.sharing.active = snapshot.active;
         self.sharing.pending_checked = next;
+        self.sharing.pending_identities = snapshot
+            .checked
+            .iter()
+            .map(|device| (device.path.clone(), device.identity.clone()))
+            .collect();
         self.sharing.snapshot = snapshot.active.then_some(snapshot);
         if !self.sharing.active {
             self.sharing.pairing = None;
@@ -1094,17 +1134,55 @@ impl AppState {
 
     /// Drop checked devices that are no longer detected. The core revokes
     /// their authorization; the checkbox must not survive a replacement.
-    pub fn prune_share_checks(&mut self, detected: &BTreeSet<String>) {
-        self.sharing
-            .pending_checked
-            .retain(|path| detected.contains(path));
-        self.draft_checked.retain(|path| detected.contains(path));
+    pub fn prune_share_checks(&mut self, detected: &BTreeMap<String, String>) {
+        retain_checked(
+            &mut self.sharing.pending_checked,
+            &mut self.sharing.pending_identities,
+            detected,
+        );
+        retain_checked(
+            &mut self.draft_checked,
+            &mut self.draft_identities,
+            detected,
+        );
+    }
+
+    /// Drop a check whose recorded identity no longer matches the device at
+    /// that path. Called before granting or starting, so a replacement made
+    /// between two refreshes is not authorized by stale UI state.
+    pub fn drop_replaced_checks(&mut self) {
+        let detected = self.detected_local_identities();
+        retain_checked(
+            &mut self.sharing.pending_checked,
+            &mut self.sharing.pending_identities,
+            &detected,
+        );
+        retain_checked(
+            &mut self.draft_checked,
+            &mut self.draft_identities,
+            &detected,
+        );
+    }
+
+    /// The local devices the core currently detects, mapped to their identity.
+    pub fn detected_local_identities(&self) -> BTreeMap<String, String> {
+        self.devices
+            .iter()
+            .filter(|device| device.endpoint == LOCAL_ENDPOINT)
+            .filter_map(|device| {
+                device
+                    .identity
+                    .as_ref()
+                    .map(|identity| (device.path.clone(), identity.clone()))
+            })
+            .collect()
     }
 
     /// Whether the settings draft checks at least one detected device.
     pub fn draft_checks_any_device(&self) -> bool {
         self.devices
             .iter()
+            .filter(|device| device.endpoint == LOCAL_ENDPOINT)
             .any(|device| self.draft_checked.contains(&device.path))
     }
 
@@ -1247,6 +1325,23 @@ impl AppState {
             prompt.error = None;
         }
     }
+}
+
+/// Drop checks whose path is no longer detected or whose recorded identity no
+/// longer matches the device at that path. A replacement at a reused path must
+/// be checked again instead of inheriting the old selection.
+fn retain_checked(
+    checked: &mut BTreeSet<String>,
+    identities: &mut BTreeMap<String, String>,
+    detected: &BTreeMap<String, String>,
+) {
+    checked.retain(|path| match (identities.get(path), detected.get(path)) {
+        (Some(recorded), Some(current)) => recorded == current,
+        (Some(_), None) => false,
+        (None, Some(_)) => true,
+        (None, None) => false,
+    });
+    identities.retain(|path, _| checked.contains(path));
 }
 
 fn on_off(value: bool) -> String {
@@ -1707,11 +1802,57 @@ mod sharing_tests {
     }
 
     #[test]
+    fn the_host_checklist_lists_only_this_machines_devices() {
+        let mut state = AppState::new(10, 80);
+        let mut remote = DeviceEntry::on(EndpointId(7), "/dev/ttyREMOTE0");
+        remote.identity = Some("remote-id".into());
+        state.set_endpoint_devices(LOCAL_ENDPOINT, vec![DeviceEntry::new("/dev/ttyLOCAL0")]);
+        state.set_endpoint_devices(EndpointId(7), vec![remote]);
+        assert_eq!(state.settings_row_count(), SETTINGS_FIXED_ROWS + 1);
+        assert_eq!(
+            state.settings_kind(SETTINGS_FIXED_ROWS),
+            Some(SettingsRow::Device(0))
+        );
+        assert_eq!(state.settings_kind(SETTINGS_FIXED_ROWS + 1), None);
+        state.begin_settings();
+        state.settings_row = SETTINGS_FIXED_ROWS;
+        assert_eq!(state.toggle_draft(), Some(true));
+        assert!(state.draft_checked.contains("/dev/ttyLOCAL0"));
+        assert!(!state.draft_checked.contains("/dev/ttyREMOTE0"));
+    }
+
+    #[test]
+    fn a_replacement_identity_loses_its_check_before_sharing_starts() {
+        let mut state = state_with_devices();
+        let mut device = DeviceEntry::new("/dev/ttyUSB0");
+        device.identity = Some("old-node".into());
+        state.set_devices(vec![device, DeviceEntry::new("/dev/ttyUSB1")]);
+        state.begin_settings();
+        state.settings_row = SETTINGS_FIXED_ROWS;
+        assert_eq!(state.toggle_draft(), Some(true));
+        assert!(state.draft_checked.contains("/dev/ttyUSB0"));
+
+        let detected: BTreeMap<String, String> = [
+            ("/dev/ttyUSB0".to_string(), "new-node".to_string()),
+            ("/dev/ttyUSB1".to_string(), "other-node".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        state.prune_share_checks(&detected);
+        assert!(
+            !state.draft_checked.contains("/dev/ttyUSB0"),
+            "a different node at the reused path needs a new check"
+        );
+    }
+
+    #[test]
     fn an_unplugged_path_is_pruned_from_the_checks() {
         let mut state = state_with_devices();
         state.sharing.pending_checked.insert("/dev/ttyUSB0".into());
         state.draft_checked.insert("/dev/ttyUSB1".into());
-        let detected: BTreeSet<String> = ["/dev/ttyUSB1".to_string()].into_iter().collect();
+        let detected: BTreeMap<String, String> = [("/dev/ttyUSB1".to_string(), "id1".to_string())]
+            .into_iter()
+            .collect();
         state.prune_share_checks(&detected);
         assert!(!state.sharing.pending_checked.contains("/dev/ttyUSB0"));
         assert!(state.draft_checked.contains("/dev/ttyUSB1"));

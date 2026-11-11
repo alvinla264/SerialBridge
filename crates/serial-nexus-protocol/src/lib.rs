@@ -248,6 +248,11 @@ pub struct DeviceSummary {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Opaque device-node identity (dev/inode/rdev) when it could be captured.
+    /// It changes when a different device appears at the same path, so a
+    /// client can tell a replacement from the device the user selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
     pub open: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_id: Option<u64>,

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
 use rustls::pki_types::{CertificateDer, ServerName};
 use serial_nexus_protocol::share::tlsio;
 use serial_nexus_protocol::{
@@ -311,6 +311,20 @@ impl RemoteClient {
         rx
     }
 
+    /// Subscribe with a bounded queue. A peer that floods events fills the
+    /// queue; further events are dropped for this subscriber instead of growing
+    /// memory without limit or blocking the reader thread. The connection
+    /// itself is unaffected.
+    pub fn subscribe_bounded(&self, capacity: usize) -> Receiver<Event> {
+        let (tx, rx) = bounded(capacity.max(1));
+        self.inner
+            .subscribers
+            .lock()
+            .expect("subscribers lock")
+            .push(tx);
+        rx
+    }
+
     fn request(&self, request: Request, timeout: Duration) -> Result<ResponseData, ClientError> {
         if !self.is_connected() {
             return Err(ClientError::Disconnected("not connected".into()));
@@ -455,10 +469,16 @@ fn dispatch(
             }
         }
         ServerMessage::Event { event } => {
-            subscribers
-                .lock()
-                .expect("subscribers lock")
-                .retain(|tx| tx.send(event.clone()).is_ok());
+            subscribers.lock().expect("subscribers lock").retain(|tx| {
+                match tx.try_send(event.clone()) {
+                    Ok(()) => true,
+                    // A bounded subscriber that is full loses this event but
+                    // stays subscribed; dropping it would hide the eventual
+                    // TransportClosed notice.
+                    Err(TrySendError::Full(_)) => true,
+                    Err(TrySendError::Disconnected(_)) => false,
+                }
+            });
         }
     }
 }
@@ -486,7 +506,11 @@ fn fail(
     subscribers
         .lock()
         .expect("subscribers lock")
-        .retain(|tx| tx.send(event.clone()).is_ok());
+        .retain(|tx| match tx.try_send(event.clone()) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => true,
+            Err(TrySendError::Disconnected(_)) => false,
+        });
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -502,4 +526,37 @@ fn hex(bytes: &[u8]) -> String {
         text.push_str(&format!("{byte:02x}"));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_bounded_subscriber_drops_events_without_blocking_or_unsubscribing() {
+        let (tx, rx) = bounded(1);
+        let subscribers = Arc::new(Mutex::new(vec![tx]));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        for reason in ["first", "second"] {
+            dispatch(
+                ServerMessage::Event {
+                    event: Event::TransportClosed {
+                        reason: reason.into(),
+                    },
+                },
+                &pending,
+                &subscribers,
+            );
+        }
+        assert_eq!(
+            subscribers.lock().expect("subscribers lock").len(),
+            1,
+            "a full subscriber stays subscribed for the close notice"
+        );
+        match rx.try_recv().expect("the first event") {
+            Event::TransportClosed { reason } => assert_eq!(reason, "first"),
+            other => panic!("unexpected event {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "the overflowing event is dropped");
+    }
 }

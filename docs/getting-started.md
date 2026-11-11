@@ -180,14 +180,16 @@ The pairing view shows two separate credentials:
 
 - the **human credential** goes into another terminal's Connect form, together
   with the host address, port, CA certificate and certificate fingerprint;
-- the **MCP credential** goes into the AI host's private pairing file.
+- the **MCP credential** is for a remote MCP client. This release's
+  `serial-nexus-mcp` still talks only to the local core, so remote MCP pairing
+  is a follow-on; keep the credential private until it lands.
 
-For MCP, keep the credential in a file that only your user can read, for
-example `~/.config/serial-nexus/mcp-peers.json` with mode `0600`, and never put
-it in shell history, a repository or a synchronous tool call. The
-[MCP guide](clients.md#mcp-server-serial-nexus-mcp) documents the file's shape.
-Credentials are per sharing session: stopping or restarting sharing invalidates
-the old ones and new ones must be paired.
+Do not paste either credential into shell history, a repository, an issue or a
+tool call. If you write the MCP credential down, use a file only your user can
+read (mode `0600`) outside the repository, for example
+`~/.config/serial-nexus/remote-mcp-credential`. Credentials are per sharing
+session: stopping or restarting sharing invalidates the old ones and new ones
+must be paired.
 
 **Exposure.** The listener exists only on the chosen address, and only while
 the terminal that started sharing is running. Firewall rules and router/NAT
