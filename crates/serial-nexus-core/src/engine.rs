@@ -1640,6 +1640,11 @@ impl Engine {
     }
 
     fn stop_sharing_from_owner(&self, client_id: u64) -> Result<ResponseData, ErrorBody> {
+        if self.sharing_session().is_none() {
+            return Ok(ResponseData::ShareStopped(
+                serial_nexus_protocol::ShareStopped { was_active: false },
+            ));
+        }
         self.owner_session(client_id)?;
         self.stop_sharing();
         Ok(ResponseData::ShareStopped(
@@ -1682,7 +1687,10 @@ impl Engine {
                     "an open instance at this path is a different device; close it first",
                 ));
             }
-            session.check(identity)?;
+            let expired = session.check(identity)?;
+            for path in expired {
+                self.revoke_path_everywhere(&path, &session);
+            }
         }
         Ok(ResponseData::Sharing(session.snapshot()))
     }
@@ -1987,6 +1995,27 @@ impl Engine {
             return Err(error);
         }
         self.begin_write(client_id, params)
+    }
+
+    fn revoke_path_everywhere(&self, path: &str, session: &SharingSession) {
+        let ids: Vec<u64> = self
+            .state
+            .lock()
+            .expect("state lock")
+            .devices
+            .iter()
+            .filter(|(_, device)| device.path == path)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.revalidate_shared_instance(id, session);
+        }
+        let live = self.live_writes.lock().expect("live writes lock");
+        for (registered, epoch) in live.values() {
+            if *registered == path {
+                epoch.fetch_add(1, Ordering::SeqCst);
+            }
+        }
     }
 
     fn detach_remote_path(&self, path: &str, reason: &str) {

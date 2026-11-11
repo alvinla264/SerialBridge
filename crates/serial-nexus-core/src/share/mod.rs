@@ -317,13 +317,15 @@ impl SharingSession {
     }
 
     /// Add one detected device to the allowlist (or refresh an expired entry).
-    pub fn check(&self, identity: DeviceIdentity) -> Result<(), ErrorBody> {
+    pub fn check(&self, identity: DeviceIdentity) -> Result<Vec<String>, ErrorBody> {
         let mut state = self.state.lock().expect("share state lock");
         // Mark vanished entries expired first, then drop them; otherwise a
         // sequence of unplugged checks retains descriptors without bound.
+        let mut expired = Vec::new();
         for entry in state.devices.values_mut() {
             if !entry.expired && !entry.identity.still_valid() {
                 entry.expired = true;
+                expired.push(entry.identity.canonical.clone());
             }
         }
         state.devices.retain(|_, entry| !entry.expired);
@@ -353,7 +355,7 @@ impl SharingSession {
                 expired: false,
             },
         );
-        Ok(())
+        Ok(expired)
     }
 
     /// Remove one device from the allowlist and return it when it was checked.

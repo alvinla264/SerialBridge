@@ -330,6 +330,12 @@ fixed with tests:
   PTY-recycling replacement test is `#[ignore]`d because path reuse is not
   guaranteed, with deterministic regular-file identity tests in its place.
 
+### Eighteenth iterative review fixes
+
+- **ShareCheck returns the paths it expires** and the engine revokes each via
+  revalidation plus draining-registry epoch bumps.
+- **ShareStop while off returns `was_active: false`** as documented.
+
 ### Seventeenth iterative review fixes
 
 - **Request-triggered expiry bumps `live_writes` even when the device already
