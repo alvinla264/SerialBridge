@@ -330,6 +330,14 @@ fixed with tests:
   PTY-recycling replacement test is `#[ignore]`d because path reuse is not
   guaranteed, with deterministic regular-file identity tests in its place.
 
+### Twentieth iterative review fixes
+
+- **Remote authorization failures are uniform.** Expired, unchecked,
+  nonexistent paths and unknown/open device ids all return the same
+  `PermissionDenied "device is not open or not shared"`, removing remote
+  host-state and open-device-count oracles. Local owners keep descriptive
+  errors.
+
 ### Nineteenth iterative review fixes
 
 - **Write-triggered identity expiry runs full revalidation** before detaching,

@@ -1924,9 +1924,9 @@ impl Engine {
             Request::Open(params) => {
                 let identity = match session.authorize(&params.port) {
                     Ok(identity) => identity,
-                    Err(error) => {
+                    Err(_) => {
                         self.detach_remote_path(&params.port, "device is no longer shared");
-                        return Err(error);
+                        return Err(Self::remote_denied());
                     }
                 };
                 self.open_with_identity(
@@ -1995,7 +1995,8 @@ impl Engine {
             // already detached; detach alone only bumps attached clients.
             self.revalidate_shared_instance(params.device_id, &session);
             self.detach_remote_clients(&[params.device_id], "device is no longer shared");
-            return Err(error);
+            let _ = error;
+            return Err(Self::remote_denied());
         }
         self.begin_write(client_id, params)
     }
@@ -2052,6 +2053,13 @@ impl Engine {
         self.detach_remote_clients(&ids, reason);
     }
 
+    fn remote_denied() -> ErrorBody {
+        ErrorBody::new(
+            ErrorCode::PermissionDenied,
+            "device is not open or not shared",
+        )
+    }
+
     fn authorize_remote_device_only(
         &self,
         session: &SharingSession,
@@ -2065,12 +2073,12 @@ impl Engine {
             .get(&device_id)
             .map(|device| device.path.clone());
         let Some(path) = path else {
-            return Err(ErrorBody::new(
-                ErrorCode::NotFound,
-                format!("device {device_id} is not open"),
-            ));
+            return Err(Self::remote_denied());
         };
-        session.authorize(&path).map(|_| ())
+        session
+            .authorize(&path)
+            .map(|_| ())
+            .map_err(|_| Self::remote_denied())
     }
 
     fn authorize_remote_device(
