@@ -10,8 +10,8 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use serial_nexus_protocol::{
     encode_bytes, paths, ClientInfo, DeviceRef, DeviceStatus, DevicesResult, Event, HelloParams,
     HelloResult, Limits, OpenParams, OpenResult, ReadParams, ReadResult, Request, RequestMessage,
-    ResponseData, ServerMessage, WaitSpec, WriteParams, WriteResult, MAX_MESSAGE_BYTES,
-    PROTOCOL_VERSION,
+    ResponseData, ServerMessage, ShareBind, ShareDevicesParams, ShareSessionInfo, ShareStartParams,
+    SharingSnapshot, WaitSpec, WriteParams, WriteResult, MAX_MESSAGE_BYTES, PROTOCOL_VERSION,
 };
 
 use crate::autostart::{find_core_binary, spawn_core};
@@ -183,6 +183,16 @@ impl Client {
         Ok(client)
     }
 
+    /// Close the transport immediately. Pending requests fail; this is used
+    /// when a caller needs to drop a connection whose request is blocked.
+    #[doc(hidden)]
+    pub fn shutdown_transport(&self) {
+        self.inner.connected.store(false, Ordering::SeqCst);
+        if let Ok(writer) = self.inner.writer.lock() {
+            let _ = writer.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
     /// The core's hello answer: id, version and bounded limits.
     pub fn hello(&self) -> HelloResult {
         self.inner.hello.lock().expect("hello lock").clone()
@@ -281,6 +291,68 @@ impl Client {
     pub fn status(&self, device_id: u64) -> Result<DeviceStatus, ClientError> {
         match self.request(Request::Status(DeviceRef { device_id }), self.timeout())? {
             ResponseData::Status(status) => Ok(status),
+            other => Err(ClientError::UnexpectedResponse(format!("{other:?}"))),
+        }
+    }
+
+    /// Start sharing checked devices on one concrete bind address.
+    ///
+    /// Local owner only: the core refuses this from any other connection or
+    /// client kind. The answer carries the pairing secrets exactly once.
+    pub fn start_sharing(
+        &self,
+        bind: ShareBind,
+        devices: Vec<String>,
+    ) -> Result<ShareSessionInfo, ClientError> {
+        match self.request(
+            Request::ShareStart(ShareStartParams { bind, devices }),
+            self.timeout(),
+        )? {
+            ResponseData::ShareStarted(info) => Ok(info),
+            other => Err(ClientError::UnexpectedResponse(format!("{other:?}"))),
+        }
+    }
+
+    /// Stop sharing, disconnect every remote client and revoke its credentials.
+    pub fn stop_sharing(&self) -> Result<(), ClientError> {
+        match self.request(Request::ShareStop, self.timeout())? {
+            ResponseData::ShareStopped(_) => Ok(()),
+            other => Err(ClientError::UnexpectedResponse(format!("{other:?}"))),
+        }
+    }
+
+    /// Check more detected devices in the owner's session.
+    pub fn check_shared_devices(
+        &self,
+        devices: Vec<String>,
+    ) -> Result<SharingSnapshot, ClientError> {
+        match self.request(
+            Request::ShareCheck(ShareDevicesParams { devices }),
+            self.timeout(),
+        )? {
+            ResponseData::Sharing(snapshot) => Ok(snapshot),
+            other => Err(ClientError::UnexpectedResponse(format!("{other:?}"))),
+        }
+    }
+
+    /// Uncheck devices: remote access is revoked immediately.
+    pub fn uncheck_shared_devices(
+        &self,
+        devices: Vec<String>,
+    ) -> Result<SharingSnapshot, ClientError> {
+        match self.request(
+            Request::ShareUncheck(ShareDevicesParams { devices }),
+            self.timeout(),
+        )? {
+            ResponseData::Sharing(snapshot) => Ok(snapshot),
+            other => Err(ClientError::UnexpectedResponse(format!("{other:?}"))),
+        }
+    }
+
+    /// The session's state without secrets; `active == false` when off.
+    pub fn sharing_status(&self) -> Result<SharingSnapshot, ClientError> {
+        match self.request(Request::ShareStatus, self.timeout())? {
+            ResponseData::Sharing(snapshot) => Ok(snapshot),
             other => Err(ClientError::UnexpectedResponse(format!("{other:?}"))),
         }
     }

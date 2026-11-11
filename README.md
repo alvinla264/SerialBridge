@@ -80,7 +80,7 @@ configuration details.
 - **serial-nexus-terminal** provides the human terminal: a device sidebar
   beside the live stream of the device you are watching.
 - **serial-nexus-client** and **serial-nexus-protocol** share the core interface
-  and communication types.
+  and communication types, including the opt-in LAN sharing seam.
 
 The first client opening a device chooses its baud rate; later clients share
 that rate. See [Behaviour and defaults](docs/getting-started.md#behaviour-and-defaults)
@@ -91,6 +91,7 @@ for control, history, and lifecycle details.
 - [Installation, running, and device behavior](docs/getting-started.md)
 - [Client library, human terminal, and MCP server](docs/clients.md)
 - [Security, building, and testing](docs/development.md)
+- [LAN sharing internal contract](docs/sharing.md)
 - [MCP tool reference](crates/serial-nexus-mcp/README.md)
 
 ## Contributing

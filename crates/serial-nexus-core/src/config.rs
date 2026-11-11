@@ -20,6 +20,14 @@ pub struct CoreConfig {
     pub write_max_timeout: Duration,
     /// Baud rate used when a new device is opened without one.
     pub default_baud: u32,
+    /// Time allowed for a remote TLS handshake.
+    pub share_handshake_timeout: Duration,
+    /// Time allowed to send the pairing credential after the handshake.
+    pub share_auth_timeout: Duration,
+    /// Most simultaneous remote connections, authenticated or handshaking.
+    pub share_max_connections: usize,
+    /// Most writes one remote connection may have waiting for device output.
+    pub share_max_pending_writes: usize,
 }
 
 impl Default for CoreConfig {
@@ -35,6 +43,12 @@ impl Default for CoreConfig {
             write_default_timeout: Duration::from_millis(1_000),
             write_max_timeout: Duration::from_secs(30),
             default_baud: DEFAULT_BAUD,
+            share_handshake_timeout: Duration::from_secs(
+                serial_nexus_protocol::HANDSHAKE_TIMEOUT_SECS,
+            ),
+            share_auth_timeout: Duration::from_secs(serial_nexus_protocol::AUTH_TIMEOUT_SECS),
+            share_max_connections: serial_nexus_protocol::MAX_REMOTE_CONNECTIONS,
+            share_max_pending_writes: serial_nexus_protocol::MAX_PENDING_REMOTE_WRITES,
         }
     }
 }

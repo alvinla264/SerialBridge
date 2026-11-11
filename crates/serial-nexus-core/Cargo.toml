@@ -24,6 +24,10 @@ crossbeam-channel = { workspace = true }
 serialport = { workspace = true }
 nix = { workspace = true }
 libc = { workspace = true }
+rustls = { workspace = true }
+rcgen = { workspace = true }
+ring = { workspace = true }
+subtle = { workspace = true }
 
 [dev-dependencies]
 serial-nexus-client = { path = "../serial-nexus-client" }

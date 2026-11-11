@@ -10,7 +10,8 @@
 //! - [`engine`]: devices, clients, write control, history and timers;
 //! - [`enumerate`]: serial device discovery without libudev;
 //! - [`history`]: bounded in-memory line history;
-//! - [`server`]: the socket server and its one-core-per-user lock.
+//! - [`server`]: the socket server and its one-core-per-user lock;
+//! - [`share`]: opt-in TLS sharing, its allowlist and pairing credentials.
 
 pub mod config;
 pub mod device;
@@ -18,5 +19,6 @@ pub mod engine;
 pub mod enumerate;
 pub mod history;
 pub mod server;
+pub mod share;
 
 pub use config::CoreConfig;

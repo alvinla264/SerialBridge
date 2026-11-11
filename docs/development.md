@@ -2,10 +2,23 @@
 
 ## Security
 
-The first version is local-only: a Unix socket, no network listener. The socket
-directory is created 0700, the socket file is 0600, and every accepted
-connection is checked with `SO_PEERCRED` against the core's effective uid. A
-caller-provided socket directory is not chmodded; the uid check still applies.
+Local clients use a Unix socket: the socket directory is created 0700, the
+socket file is 0600, and every accepted connection is checked with `SO_PEERCRED`
+against the core's effective uid. A caller-provided socket directory is not
+chmodded; the uid check still applies.
+
+LAN sharing is opt-in and off by default: no network listener exists until the
+local owner terminal starts a sharing session for one concrete address. Each
+session generates a fresh certificate authority, host certificate and two
+distinct high-entropy pairing credentials with `rustls` (ring provider) and
+`rcgen`. Remote clients trust only the pairing CA and pin the host leaf
+certificate's SHA-256, so a different certificate is refused. The core derives
+the remote role from the matched credential, applies the checked-device
+allowlist and device identity to every request and event, and enforces bounded
+frames, handshake/pairing deadlines, connection counts and pending-write
+limits. Stopping sharing or losing the owner connection closes the listener,
+disconnects every remote client and revokes credentials. See
+[LAN sharing](sharing.md) for the internal contract.
 
 ## Building and testing
 
@@ -62,6 +75,19 @@ path as a real serial port and the test drives the master. Covered end to end:
   write not blocking other requests, close and immediate reopen;
 - multiple devices per client, last-client close, close draining accepted
   writes, pipelined writes keeping arrival order, unplug notification;
+- LAN sharing over real loopback TLS: default off, fresh per-session human and
+  AI credentials only to the local owner, owner-only control, ACL on list/open/
+  read/write/status/close and on events, role from credential (AI role spoofing
+  refused, one AI controller across local and remote, humans writing beside it),
+  loopback IPv4 and IPv6 where available, host certificate pinning and wrong-CA
+  refusal, wrong credentials, oversized frames, stalled TLS handshake deadline,
+  unauthenticated handshake connection slots, waited-write admission limits,
+  bind failure leaving sharing off, unchecking
+  revoking access and failing pending work while local and other devices keep
+  working, owner loss stopping the listener and revoking credentials, stopping
+  during a waited write without replay, path replacement not inheriting
+  authorization, secrets absent from responses/events/history, and existing
+  Unix-socket clients still working while sharing is active;
 - core grace-period shutdown and client auto-start (including an explicit core
   path, a missing binary, and the started core owning a separate session);
 - the terminal's side-by-side layout at a usable width and focused-pane layout
@@ -116,5 +142,7 @@ and missing devices, an unplugged device, and auto-start.
 Not proven here: real hardware and drivers, PTY behaviour that differs from
 USB serial adapters, platforms other than Linux, terminals other than what the
 `vt100` emulator models in the PTY tests (truecolour, unusual key encodings),
-and `libudev`-based enumeration (device discovery reads `/dev/serial/by-id`
-and `/sys/class/tty`).
+`libudev`-based enumeration (device discovery reads `/dev/serial/by-id` and
+`/sys/class/tty`), and real LAN peers (sharing tests use loopback). PTY fixtures
+are not enumerated, so sharing tests open them locally first; real enumerated
+devices need not be open locally.

@@ -1,6 +1,22 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+/// Test-only enumeration seam. Production never installs one.
+#[doc(hidden)]
+pub type PortLister = dyn Fn() -> Vec<PortInfo> + Send + Sync;
+
+static PORT_LISTER: Mutex<Option<Arc<PortLister>>> = Mutex::new(None);
+
+/// Install or clear the process-wide test port lister.
+///
+/// Only an automated test calls this. Authorization still validates the real
+/// device node, so an injected list cannot grant access to a missing device.
+#[doc(hidden)]
+pub fn install_port_lister(lister: Option<Arc<PortLister>>) {
+    *PORT_LISTER.lock().expect("port lister lock") = lister;
+}
 
 /// A serial device the system can see but the core may not have open.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,6 +36,13 @@ pub struct PortInfo {
 /// libraries. Pseudo-terminals (used by tests) are not enumerated; they are
 /// opened by explicit path.
 pub fn list_ports() -> Vec<PortInfo> {
+    if let Some(lister) = PORT_LISTER.lock().expect("port lister lock").clone() {
+        return lister();
+    }
+    list_ports_real()
+}
+
+fn list_ports_real() -> Vec<PortInfo> {
     let mut ports: BTreeMap<String, PortInfo> = BTreeMap::new();
 
     if let Ok(entries) = fs::read_dir("/dev/serial/by-id") {

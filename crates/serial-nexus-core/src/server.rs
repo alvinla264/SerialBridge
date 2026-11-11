@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossbeam_channel::{bounded, unbounded, Sender};
+use crossbeam_channel::{unbounded, Sender};
 use serial_nexus_protocol::{
     encode_line, paths, ErrorBody, ErrorCode, ProtocolError, Request, RequestMessage, ResponseData,
     ServerMessage, MAX_MESSAGE_BYTES,
@@ -125,7 +125,9 @@ fn handle_connection(engine: Arc<Engine>, stream: UnixStream, uid: u32) {
     // Responses, events and waited-write results all go through the handler
     // thread, so writes to the socket stay ordered and interleaving-free.
     let (response_tx, response_rx) = unbounded::<ServerMessage>();
-    let (request_tx, request_rx): (RequestSender, _) = bounded(64);
+    // Local clients have always been allowed to pipeline requests; keep that
+    // behavior and let the reader reach EOF without queue backpressure.
+    let (request_tx, request_rx): (RequestSender, _) = unbounded();
     let reader_stream = match stream.try_clone() {
         Ok(reader) => reader,
         Err(_) => {
@@ -133,9 +135,10 @@ fn handle_connection(engine: Arc<Engine>, stream: UnixStream, uid: u32) {
             return;
         }
     };
+    let reader_engine = Arc::clone(&engine);
     if std::thread::Builder::new()
         .name("serial-nexus-core-reader".into())
-        .spawn(move || read_requests(reader_stream, request_tx))
+        .spawn(move || read_requests(reader_engine, client_id, reader_stream, request_tx))
         .is_err()
     {
         engine.unregister_client(client_id);
@@ -173,9 +176,12 @@ fn handle_connection(engine: Arc<Engine>, stream: UnixStream, uid: u32) {
                                     ServerMessage::Error {
                                         id,
                                         error: ErrorBody::new(
-                                            ErrorCode::Internal,
-                                            "could not await the write's response lines",
-                                        ),
+                                            ErrorCode::DeviceFailed,
+                                            "could not await the write's response lines; the bytes may already have reached the device",
+                                        )
+                                        .with_details(serde_json::json!({
+                                            "may_have_reached_device": true
+                                        })),
                                     }
                                 } else {
                                     // The worker sends the answer.
@@ -224,7 +230,7 @@ fn response(result: Result<ResponseData, ErrorBody>, id: u64) -> ServerMessage {
     }
 }
 
-fn read_requests(stream: UnixStream, tx: RequestSender) {
+fn read_requests(engine: Arc<Engine>, client_id: u64, stream: UnixStream, tx: RequestSender) {
     let mut reader = BufReader::new(stream);
     loop {
         let line = match serial_nexus_protocol::read_line(&mut reader, MAX_MESSAGE_BYTES) {
@@ -248,6 +254,9 @@ fn read_requests(stream: UnixStream, tx: RequestSender) {
             }
         }
     }
+    // The owning local terminal is gone; revoke sharing even if this
+    // connection's handler is still blocked in a device close.
+    engine.owner_connection_lost(client_id);
     let _ = tx.send(None);
 }
 

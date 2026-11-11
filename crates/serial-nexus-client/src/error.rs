@@ -35,6 +35,22 @@ pub enum ClientError {
 
     #[error("unexpected response from core: {0}")]
     UnexpectedResponse(String),
+
+    #[error("TLS error: {0}")]
+    Tls(String),
+
+    /// The host's certificate did not match the pairing information.
+    #[error("host authentication failed: {0}")]
+    HostRejected(String),
+
+    /// The pairing credential was refused or never answered.
+    #[error("authentication failed: {0}")]
+    Authentication(String),
+
+    /// A write request may have reached the device but its answer was lost.
+    /// The adapter never replays such a write.
+    #[error("write outcome uncertain: {0}")]
+    WriteUncertain(String),
 }
 
 impl ClientError {
@@ -51,6 +67,21 @@ impl ClientError {
         self.code() == Some(ErrorCode::ControlHeld)
     }
 
+    /// True when a write may have reached the device and must not be replayed,
+    /// whether the uncertainty came from the transport or a server answer.
+    pub fn is_write_uncertain(&self) -> bool {
+        match self {
+            Self::WriteUncertain(_) => true,
+            Self::Server(body) => body
+                .details
+                .as_ref()
+                .and_then(|details| details.get("may_have_reached_device"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
     /// True when the device is gone (unplugged, closed, or failed).
     pub fn is_device_gone(&self) -> bool {
         matches!(
@@ -64,8 +95,16 @@ impl ClientError {
 
 impl From<ErrorBody> for ClientError {
     fn from(error: ErrorBody) -> Self {
+        let uncertain = error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("may_have_reached_device"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         if error.code == ErrorCode::Timeout {
             Self::Timeout(error.message)
+        } else if uncertain {
+            Self::WriteUncertain(error.message)
         } else {
             Self::Server(error)
         }

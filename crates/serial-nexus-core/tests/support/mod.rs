@@ -84,6 +84,30 @@ impl SimulatedDevice {
         }
     }
 
+    /// Drain everything the core writes until the device has been quiet for
+    /// `quiet`. Large buffered backlogs are read in 64 KiB chunks.
+    pub fn read_available(&mut self, quiet: Duration) -> Vec<u8> {
+        let mut got = Vec::new();
+        let mut last_data = Instant::now();
+        loop {
+            let mut buffer = [0u8; 64 * 1024];
+            match self.master.read(&mut buffer) {
+                Ok(0) => {}
+                Ok(read) => {
+                    got.extend_from_slice(&buffer[..read]);
+                    last_data = Instant::now();
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return got,
+            }
+            if last_data.elapsed() >= quiet {
+                return got;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     /// Read the master side until `needle` appears, else panic after timeout.
     pub fn read_until(&mut self, needle: &[u8], timeout: Duration) -> Vec<u8> {
         let deadline = Instant::now() + timeout;

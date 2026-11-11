@@ -32,8 +32,10 @@ these words in their tool names and user-facing text.
   started, so an old prompt does not appear newer than later writes.
 - **Grace period**: the 30-second default during which the core stays alive
   after its last client disconnects.
-- **Close**: detaching the last client. Accepted writes are drained first, then
-  the serial handle is released and `DeviceClosed` is announced.
+- **Close**: detaching the last client. A local close drains accepted writes
+  before releasing the handle and announcing `DeviceClosed`; a remote close
+  announces and returns before that asynchronous drain, so `DeviceClosed` is
+  not a release/drain barrier for remotes.
 - **Truncated**: a read or waited-write result trimmed to the IPC frame budget.
   The newest lines are kept; `truncated` says older ones were left out.
 - **MCP session**: one run of `serial-nexus-mcp`, launched by the AI host and
@@ -79,4 +81,42 @@ these words in their tool names and user-facing text.
   unsaved changes, opening a device is refused and the draft is kept.
 - **Event**: an unsolicited notification from the core (device output, write
   echo, client joined/left, control granted/released/denied, device closed,
-  core shutdown). Clients receive all events from their subscription onward.
+  core shutdown). Local clients receive events from their subscription onward;
+  remote clients receive only authorized device events, from a bounded
+  best-effort queue.
+- **Sharing session**: opt-in LAN access to a set of **checked devices**,
+  started by a **local owner** and alive only while that owner's local terminal
+  connection is. It has its own TLS certificate authority, host certificate and
+  pairing credentials; stopping it, or losing the owner connection, closes the
+  listener, disconnects every **remote client** and revokes the credentials.
+  Off by default; there is no listener until one is started.
+- **Local owner**: the local human terminal connection that started a sharing
+  session. Only it may check, uncheck, inspect or stop sharing.
+- **Checked device**: a detected device the owner added to the session's
+  in-memory allowlist. The checked list is the whole of what remote clients may
+  see or use; a checked device need not be open locally.
+- **Device identity**: the concrete device node behind a path, captured as
+  `(st_dev, st_ino, st_rdev)` and an `O_PATH` descriptor that pins the node,
+  captured when the device is checked. It is revalidated at authorization,
+  open time and before a checked device is listed to remote clients; an
+  unplugged, replaced, or relinked device (link count changed) loses its
+  authorization (the entry expires and must be checked again) instead of
+  letting a replacement inherit it. An
+  ordinary last-detach close keeps the entry while the pinned node is still
+  the same live device.
+- **Unchecked**: a device removed from the allowlist. Remote access to it is
+  revoked immediately, remote work pending on it fails, and local clients and
+  other checked devices keep working. Checking it again is explicit.
+- **Pairing credential**: a random, high-entropy secret generated fresh for each
+  sharing session, one for human clients and a distinct one for AI clients. Its
+  role is decided by the core from which credential matched, never by the
+  client. Returned once, only to the local owner.
+- **Paired host**: the host information a remote client needs to authenticate
+  the core: the session certificate authority, the host certificate's SHA-256
+  fingerprint and the exact address to dial. A different certificate is never
+  accepted silently.
+- **Remote client**: a client connected over TLS to a sharing session, using a
+  pairing credential. It sees only checked devices and cannot control sharing.
+- **Remote frame**: one length-prefixed JSON message on a remote connection
+  (4-byte big-endian length, then that many bytes), bounded to keep one peer
+  from exhausting memory.
