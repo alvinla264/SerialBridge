@@ -26,10 +26,9 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-/// Device-sourced lines containing `needle`; human writes and AI writes never
-/// count as a firmware echo.
-/// A fresh echo requires more device-sourced occurrences than existed before
-/// the probe; old output and the probe's own human write never count.
+/// Every `needle` inside device-sourced text; human and AI writes never count
+/// as a firmware echo. A fresh echo requires more occurrences than before the
+/// probe, including a completion of an existing partial line.
 fn echo_is_fresh(
     before: usize,
     lines: &[serial_nexus_protocol::HistoryLine],
@@ -41,10 +40,9 @@ fn echo_is_fresh(
 fn occurrences(lines: &[serial_nexus_protocol::HistoryLine], needle: &str) -> usize {
     lines
         .iter()
-        .filter(|line| {
-            line.source == serial_nexus_protocol::Source::Device && line.text.contains(needle)
-        })
-        .count()
+        .filter(|line| line.source == serial_nexus_protocol::Source::Device)
+        .map(|line| line.text.match_indices(needle).count())
+        .sum()
 }
 
 #[test]
@@ -81,6 +79,25 @@ fn a_firmware_echo_must_be_new_device_output_not_the_probe_or_old_history() {
     assert!(
         echo_is_fresh(1, &with_new, "UNIQUE"),
         "new device output is a fresh echo"
+    );
+    // A fresh echo may complete an existing partial line rather than start a
+    // separate one; occurrences, not matching lines, decide freshness.
+    let completed = vec![
+        HistoryLine {
+            source: Source::Device,
+            text: "OK".into(),
+            partial: true,
+        },
+        HistoryLine {
+            source: Source::Device,
+            text: "OK OK".into(),
+            partial: false,
+        },
+    ];
+    assert_eq!(occurrences(&completed, "OK"), 3);
+    assert!(
+        echo_is_fresh(1, &completed, "OK"),
+        "an echo completing a partial line is fresh"
     );
 }
 
@@ -199,7 +216,7 @@ fn board_gate_over_real_lan() {
         // assertion. Only new device-sourced output counts.
         let before = expect_echo.as_ref().map(|expected| {
             human
-                .read(opened.device_id, Some(2_000))
+                .read(opened.device_id, Some(200))
                 .map(|read| occurrences(&read.lines, expected))
                 .unwrap_or(0)
         });
@@ -211,7 +228,7 @@ fn board_gate_over_real_lan() {
         if let (Some(expected), Some(before)) = (&expect_echo, before) {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {
-                let read = human.read(opened.device_id, Some(2_000)).expect("re-read");
+                let read = human.read(opened.device_id, Some(200)).expect("re-read");
                 if echo_is_fresh(before, &read.lines, expected) {
                     eprintln!("    firmware echoed {expected:?}");
                     break;

@@ -396,7 +396,9 @@ impl SharingSession {
     /// reach remote clients. A later open of the path clears it.
     pub fn mark_vacated(&self, path: &str) {
         let mut state = self.state.lock().expect("share state lock");
-        if state.devices.get(path).is_some_and(|entry| !entry.expired) {
+        // Expired entries still get the closure mark: remotes attached before
+        // expiry must learn that the instance closed.
+        if state.devices.contains_key(path) {
             state.vacated.insert(path.to_string());
         }
     }

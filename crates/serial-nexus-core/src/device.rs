@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -788,6 +788,7 @@ pub fn spawn_io(
     mut write_port: Box<dyn serialport::SerialPort>,
     write_rx: Receiver<WriteCommand>,
     write_epoch: WriteEpoch,
+    remote_queued: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     events: Sender<DeviceEvent>,
 ) -> io::Result<IoThreads> {
@@ -841,6 +842,9 @@ pub fn spawn_io(
             // not silently drop bytes that already have a successful answer.
             // (On a device failure the write below reports the error.)
             while let Ok(command) = write_rx.recv() {
+                if command.remote {
+                    remote_queued.fetch_sub(1, Ordering::SeqCst);
+                }
                 // Revoked remote work is dropped before it touches the device;
                 // the write already in progress finishes.
                 if command.remote && write_epoch.load(Ordering::SeqCst) != command.epoch {

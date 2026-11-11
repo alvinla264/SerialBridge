@@ -4,7 +4,7 @@
 
 mod support;
 
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 
 use serial_nexus_client::{Client, ClientError, ClientInfo, RemoteClient};
 use serial_nexus_protocol::{
-    ErrorCode, Event, PairedHost, PairingRole, ReadResult, ResponseData, ServerMessage, ShareBind,
-    ShareSessionInfo, WaitSpec,
+    encode_line, read_line, ErrorCode, Event, HelloParams, PairedHost, PairingRole, ReadResult,
+    Request, RequestMessage, ResponseData, ServerMessage, ShareBind, ShareSessionInfo, WaitSpec,
+    PROTOCOL_VERSION,
 };
 use support::{connect, wait_until, SimulatedDevice};
 use tempfile::TempDir;
@@ -1268,6 +1269,11 @@ fn a_checked_but_never_opened_device_rejects_a_recycled_node() {
         "a recycled node must not inherit authorization"
     );
     assert!(prepared.session.snapshot().checked.is_empty());
+    // An already-expired entry still gets the closure mark, so remotes that
+    // were attached before expiry receive DeviceClosed.
+    prepared.session.revoke_path(&path_text);
+    prepared.session.mark_vacated(&path_text);
+    assert!(prepared.session.is_vacated(&path_text));
 }
 
 #[test]
@@ -2017,4 +2023,74 @@ fn a_stalled_uncheck_still_revokes_later_devices_in_the_batch() {
     first.read_available(Duration::from_millis(500));
     uncheck.join().expect("uncheck thread").expect("uncheck");
     second.read_available(Duration::from_millis(100));
+}
+
+#[test]
+fn local_clients_can_pipeline_more_requests_than_the_old_queue_bound() {
+    let core = shared_core();
+    let mut stream = std::os::unix::net::UnixStream::connect(&core.socket).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+    let hello = RequestMessage {
+        id: 0,
+        request: Request::Hello(HelloParams {
+            client: ClientInfo::human("burst"),
+            protocol: PROTOCOL_VERSION,
+        }),
+    };
+    stream
+        .write_all(&encode_line(&hello).expect("hello line"))
+        .expect("hello");
+    let line = read_line(&mut reader, 1 << 20)
+        .expect("read hello")
+        .expect("hello present");
+    let _: ServerMessage = serde_json::from_slice(&line).expect("hello answer");
+
+    for id in 1..=256 {
+        let message = RequestMessage {
+            id,
+            request: Request::Ping,
+        };
+        stream
+            .write_all(&encode_line(&message).expect("ping line"))
+            .expect("pipeline ping");
+    }
+    stream.flush().expect("flush");
+    let mut answered = 0;
+    for _ in 0..256 {
+        let line = read_line(&mut reader, 1 << 20)
+            .expect("read response")
+            .expect("response present");
+        let message: ServerMessage = serde_json::from_slice(&line).expect("response");
+        if matches!(
+            message,
+            ServerMessage::Response {
+                result: ResponseData::Pong,
+                ..
+            }
+        ) {
+            answered += 1;
+        }
+    }
+    assert_eq!(answered, 256, "every pipelined request must be answered");
+}
+
+#[test]
+fn local_writes_keep_the_legacy_unbounded_queue() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let mut device = SimulatedDevice::new();
+    owner
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    // Fill the PTY; local clients must not see the remote queue limit or a
+    // new error code that existing protocol-v1 clients cannot decode.
+    for _ in 0..200 {
+        owner
+            .write_bytes(1, &[b'x'; 8 * 1024], None)
+            .expect("local write is accepted");
+    }
+    assert!(!device.read_available(Duration::from_millis(300)).is_empty());
 }

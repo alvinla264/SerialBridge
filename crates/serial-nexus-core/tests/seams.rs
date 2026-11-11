@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -143,6 +143,8 @@ fn an_enumerated_device_can_be_shared_and_opened_remotely_without_a_host_open() 
 
 struct FakeState {
     incoming: Mutex<VecDeque<u8>>,
+    fail_reads: AtomicBool,
+    block_writes: AtomicBool,
     written: Mutex<Vec<u8>>,
     /// Every buffer passed to `write`, including calls that then fail, so a
     /// replay attempt is visible even when it writes nothing.
@@ -164,6 +166,9 @@ impl FakePort {
 
 impl Read for FakePort {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.state.fail_reads.load(Ordering::SeqCst) {
+            return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+        }
         let mut incoming = self.state.incoming.lock().expect("incoming lock");
         if incoming.is_empty() {
             drop(incoming);
@@ -180,6 +185,9 @@ impl Read for FakePort {
 
 impl Write for FakePort {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        while self.state.block_writes.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         self.state
             .attempts
             .lock()
@@ -287,6 +295,8 @@ fn a_partial_serial_write_reports_uncertainty_and_is_never_replayed() {
     let owner = connect(&core.socket, ClientInfo::human("owner"));
     let state = Arc::new(FakeState {
         incoming: Mutex::new(VecDeque::new()),
+        fail_reads: AtomicBool::new(false),
+        block_writes: AtomicBool::new(false),
         written: Mutex::new(Vec::new()),
         attempts: Mutex::new(Vec::new()),
         writes: AtomicUsize::new(0),
@@ -553,6 +563,8 @@ fn discovery_and_events_revalidate_a_stale_shared_identity() {
     install_port_lister(Some(lister));
     let state = Arc::new(FakeState {
         incoming: Mutex::new(VecDeque::new()),
+        fail_reads: AtomicBool::new(false),
+        block_writes: AtomicBool::new(false),
         written: Mutex::new(Vec::new()),
         attempts: Mutex::new(Vec::new()),
         writes: AtomicUsize::new(0),
@@ -613,6 +625,117 @@ fn discovery_and_events_revalidate_a_stale_shared_identity() {
         );
     }
     assert!(remote.write_bytes(opened.device_id, b"late", None).is_err());
+    install_serial_factory(None);
+    install_port_lister(None);
+}
+
+#[test]
+fn a_failed_devices_stalled_writer_does_not_block_healthy_output() {
+    use std::collections::HashMap;
+
+    let _guard = seam_lock().lock().expect("seam lock");
+    let core = core();
+    let first = SimulatedDevice::new();
+    let second = SimulatedDevice::new();
+    let paths = vec![first.path.clone(), second.path.clone()];
+    let lister_paths = paths.clone();
+    let lister: Arc<serial_nexus_core::enumerate::PortLister> = Arc::new(move || {
+        lister_paths
+            .iter()
+            .map(|path| PortInfo {
+                path: path.clone(),
+                description: Some("injected isolation node".into()),
+            })
+            .collect()
+    });
+    install_port_lister(Some(lister));
+
+    let make_state = || {
+        Arc::new(FakeState {
+            incoming: Mutex::new(VecDeque::new()),
+            fail_reads: AtomicBool::new(false),
+            block_writes: AtomicBool::new(false),
+            written: Mutex::new(Vec::new()),
+            attempts: Mutex::new(Vec::new()),
+            writes: AtomicUsize::new(0),
+            fail_after: usize::MAX,
+            baud: 115_200,
+        })
+    };
+    let first_state = make_state();
+    let second_state = make_state();
+    let mut states: HashMap<String, Arc<FakeState>> = HashMap::new();
+    states.insert(first.path.clone(), Arc::clone(&first_state));
+    states.insert(second.path.clone(), Arc::clone(&second_state));
+    let factory: Arc<serial_nexus_core::device::SerialFactory> = Arc::new(move |path, baud| {
+        let _ = baud;
+        let state = states.get(path).expect("known test device");
+        Ok(FakePort::boxed(Arc::clone(state)))
+    });
+    install_serial_factory(Some(factory));
+
+    let owner = connect(&core.socket, ClientInfo::human("owner"));
+    let info = owner
+        .start_sharing(bind(), paths.clone())
+        .expect("share two devices");
+    let remote = RemoteClient::connect(
+        &info.host,
+        &info.human,
+        Some("isolation".into()),
+        Duration::from_secs(5),
+    )
+    .expect("pair");
+    let first_open = remote
+        .open(&first.path, Some(115_200), false)
+        .expect("first");
+    let second_open = remote
+        .open(&second.path, Some(115_200), false)
+        .expect("second");
+
+    second_state
+        .incoming
+        .lock()
+        .expect("incoming lock")
+        .extend(b"BEFORE\n");
+    wait_until(Duration::from_secs(2), || {
+        remote
+            .read(second_open.device_id, Some(10))
+            .map(|read| read.lines.iter().any(|line| line.text.contains("BEFORE")))
+            .unwrap_or(false)
+    });
+
+    // Stall the first writer, then fail its reader. The dispatcher must not
+    // wait for that writer before processing the healthy device.
+    first_state.block_writes.store(true, Ordering::SeqCst);
+    remote
+        .write_bytes(first_open.device_id, b"stalled", None)
+        .expect("queue stalled write");
+    first_state.fail_reads.store(true, Ordering::SeqCst);
+    // Wait until the failed device has been removed; the dispatcher may still
+    // be joining its stalled writer.
+    wait_until(Duration::from_secs(2), || {
+        owner
+            .list_devices()
+            .map(|devices| {
+                devices
+                    .devices
+                    .iter()
+                    .all(|device| !(device.path == first.path && device.open))
+            })
+            .unwrap_or(false)
+    });
+    second_state
+        .incoming
+        .lock()
+        .expect("incoming lock")
+        .extend(b"AFTER\n");
+    wait_until(Duration::from_secs(3), || {
+        remote
+            .read(second_open.device_id, Some(10))
+            .map(|read| read.lines.iter().any(|line| line.text.contains("AFTER")))
+            .unwrap_or(false)
+    });
+    first_state.block_writes.store(false, Ordering::SeqCst);
     install_serial_factory(None);
     install_port_lister(None);
 }

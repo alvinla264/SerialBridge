@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossbeam_channel::{bounded, unbounded, Sender};
+use crossbeam_channel::{unbounded, Sender};
 use serial_nexus_protocol::{
     encode_line, paths, ErrorBody, ErrorCode, ProtocolError, Request, RequestMessage, ResponseData,
     ServerMessage, MAX_MESSAGE_BYTES,
@@ -125,7 +125,9 @@ fn handle_connection(engine: Arc<Engine>, stream: UnixStream, uid: u32) {
     // Responses, events and waited-write results all go through the handler
     // thread, so writes to the socket stay ordered and interleaving-free.
     let (response_tx, response_rx) = unbounded::<ServerMessage>();
-    let (request_tx, request_rx): (RequestSender, _) = bounded(64);
+    // Local clients have always been allowed to pipeline requests; keep that
+    // behavior and let the reader reach EOF without queue backpressure.
+    let (request_tx, request_rx): (RequestSender, _) = unbounded();
     let reader_stream = match stream.try_clone() {
         Ok(reader) => reader,
         Err(_) => {
@@ -236,19 +238,18 @@ fn read_requests(engine: Arc<Engine>, client_id: u64, stream: UnixStream, tx: Re
             // EOF between messages.
             Ok(None) => break,
             Err(error) => {
-                let _ = tx.try_send(Some(Err(error.to_string())));
+                let _ = tx.send(Some(Err(error.to_string())));
                 break;
             }
         };
         match serial_nexus_protocol::decode_line::<RequestMessage>(&line) {
-            Ok(request) => match tx.try_send(Some(Ok(request))) {
-                Ok(()) => {}
-                // A full queue disconnects this client instead of stalling the
-                // reader, so EOF and owner loss stay observable.
-                Err(_) => break,
-            },
+            Ok(request) => {
+                if tx.send(Some(Ok(request))).is_err() {
+                    break;
+                }
+            }
             Err(error) => {
-                let _ = tx.try_send(Some(Err(error.to_string())));
+                let _ = tx.send(Some(Err(error.to_string())));
                 break;
             }
         }
@@ -256,7 +257,7 @@ fn read_requests(engine: Arc<Engine>, client_id: u64, stream: UnixStream, tx: Re
     // The owning local terminal is gone; revoke sharing even if this
     // connection's handler is still blocked in a device close.
     engine.owner_connection_lost(client_id);
-    let _ = tx.try_send(None);
+    let _ = tx.send(None);
 }
 
 fn write_message(writer: &mut BufWriter<UnixStream>, message: &ServerMessage) -> io::Result<()> {

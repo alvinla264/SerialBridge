@@ -119,8 +119,9 @@ type:
   fit becomes a request-level `BadRequest` ("response too large"), not a
   dropped connection; a successful waited write is trimmed and stays a
   successful `WriteResult`, never an error.
-- A bounded per-device write queue (64 accepted writes). A full queue answers
-  `LimitExceeded` before accepting bytes, so a slow device cannot accumulate
+- A bounded per-device remote write queue (64 accepted remote writes). A full
+  queue answers `LimitExceeded` before accepting bytes, so a slow device cannot
+  accumulate
   unbounded work from any client.
 - TLS handshake deadline (`share_handshake_timeout`) and pairing deadline
   (`share_auth_timeout`).
@@ -325,6 +326,25 @@ fixed with tests:
   PTY-recycling replacement test is `#[ignore]`d because path reuse is not
   guaranteed, with deterministic regular-file identity tests in its place.
 
+### Sixth iterative review fixes
+
+- **Legacy local pipelining is restored.** Local request queues are unbounded
+  again, so a 256-request burst is answered instead of disconnecting the
+  client. Test: `local_clients_can_pipeline_more_requests_than_the_old_queue_bound`.
+- **Local writes keep the historical unbounded queue.** Only remote writes are
+  bounded by `MAX_REMOTE_SERIAL_QUEUE`; local writes cannot produce the new
+  `LimitExceeded` variant that protocol-v1 clients cannot decode. Test:
+  `local_writes_keep_the_legacy_unbounded_queue`.
+- **Failed-device cleanup is off the dispatcher.** A failed device is removed,
+  reported and revoked immediately, then its I/O threads are joined on a
+  dedicated cleanup thread, so a stalled writer does not block healthy-device
+  data or timers. Test:
+  `a_failed_devices_stalled_writer_does_not_block_healthy_output`.
+- **Expired entries still receive a closure mark**, so remotes attached before
+  authorization expiry see `DeviceClosed`; the recycled-node test asserts it.
+- **Board-gate echo checks count occurrences**, including completion of a
+  partial line, and read at most 200 lines to stay within a remote frame.
+
 ### Fifth iterative review fixes
 
 - **Connection EOF is remembered, not only acted on.** Every local connection
@@ -340,9 +360,9 @@ fixed with tests:
 
 ### Fourth iterative review fixes
 
-- **Owner liveness no longer depends on request-queue backpressure.** The
-  local reader uses non-blocking queue inserts and disconnects a client whose
-  bounded queue is full, so EOF and `owner_connection_lost` are always reached.
+- **Owner liveness no longer depends on request-queue backpressure.** Local
+  request pipelining keeps the historical unbounded queue, so the reader can
+  always reach EOF; no valid local burst is disconnected.
 - **Batch uncheck revokes every requested device before blocking cleanup.**
   `begin_detach_remote_clients` performs authorization, waiter and detach
   changes for the whole batch, then `finish_devices` joins I/O threads once.

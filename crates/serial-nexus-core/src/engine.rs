@@ -25,6 +25,10 @@ pub enum WriteStart {
     Pending(PendingWrite),
 }
 
+/// Remote writes queued per device. Local clients keep the historical
+/// unbounded queue for compatibility.
+const MAX_REMOTE_SERIAL_QUEUE: usize = 64;
+
 /// A write already enqueued in arrival order, waiting for device response
 /// lines. Safe to move to another thread.
 pub struct PendingWrite {
@@ -84,6 +88,8 @@ struct Device {
     control: Option<Control>,
     write_tx: Option<Sender<device::WriteCommand>>,
     write_epoch: device::WriteEpoch,
+    /// Remote commands accepted but not yet dequeued by the writer.
+    remote_queued: Arc<AtomicUsize>,
     /// The node identity of this actual open descriptor.
     identity: DeviceIdentity,
     /// Identity authorized for sharing when this instance was opened, if any.
@@ -229,7 +235,7 @@ impl Engine {
         }
     }
 
-    fn on_device_event(&self, event: DeviceEvent) {
+    fn on_device_event(self: &Arc<Self>, event: DeviceEvent) {
         match event {
             DeviceEvent::Data { device_id, bytes } => self.on_device_data(device_id, bytes),
             DeviceEvent::Written { .. } => {}
@@ -582,10 +588,11 @@ impl Engine {
                 })?;
                 let device_id = state.next_device_id;
                 state.next_device_id += 1;
-                // Bounded so a slow device cannot accumulate unbounded queued
-                // write bytes from any client.
-                let (write_tx, write_rx) = crossbeam_channel::bounded(64);
+                // Local clients retain their historical unbounded queue; remote
+                // work is bounded by `remote_queued` before enqueue.
+                let (write_tx, write_rx) = crossbeam_channel::unbounded();
                 let write_epoch: device::WriteEpoch = Arc::new(AtomicU64::new(0));
+                let remote_queued = Arc::new(AtomicUsize::new(0));
                 let stop = Arc::new(AtomicBool::new(false));
                 let io = device::spawn_io(
                     device_id,
@@ -594,6 +601,7 @@ impl Engine {
                     write_port,
                     write_rx,
                     Arc::clone(&write_epoch),
+                    Arc::clone(&remote_queued),
                     Arc::clone(&stop),
                     self.events_tx.clone(),
                 )
@@ -625,6 +633,7 @@ impl Engine {
                     control: None,
                     write_tx: Some(write_tx),
                     write_epoch,
+                    remote_queued,
                     identity,
                     shared: shared_identity,
                     stop,
@@ -872,7 +881,20 @@ impl Engine {
         refresh_control(device, client_id);
         let remote = self.remote_scope(client_id).is_some();
         let epoch = device.write_epoch.load(Ordering::SeqCst);
-        device
+        if remote {
+            let queued = device.remote_queued.fetch_add(1, Ordering::SeqCst) + 1;
+            if queued > MAX_REMOTE_SERIAL_QUEUE {
+                device.remote_queued.fetch_sub(1, Ordering::SeqCst);
+                return Err(ErrorBody::new(
+                    ErrorCode::LimitExceeded,
+                    format!(
+                        "device {} has too much queued remote work; retry shortly",
+                        params.device_id
+                    ),
+                ));
+            }
+        }
+        let sent = device
             .write_tx
             .as_ref()
             .ok_or_else(|| {
@@ -881,25 +903,21 @@ impl Engine {
                     format!("device {} was closed", params.device_id),
                 )
             })?
-            .try_send(device::WriteCommand {
+            .send(device::WriteCommand {
                 device_id: params.device_id,
                 remote,
                 epoch,
                 bytes: data.clone(),
-            })
-            .map_err(|error| match error {
-                crossbeam_channel::TrySendError::Full(_) => ErrorBody::new(
-                    ErrorCode::LimitExceeded,
-                    format!(
-                        "device {} has too much queued work; retry shortly",
-                        params.device_id
-                    ),
-                ),
-                crossbeam_channel::TrySendError::Disconnected(_) => ErrorBody::new(
-                    ErrorCode::DeviceClosed,
-                    format!("device {} was closed", params.device_id),
-                ),
-            })?;
+            });
+        if sent.is_err() {
+            if remote {
+                device.remote_queued.fetch_sub(1, Ordering::SeqCst);
+            }
+            return Err(ErrorBody::new(
+                ErrorCode::DeviceClosed,
+                format!("device {} was closed", params.device_id),
+            ));
+        }
         record_written_lines(device, source, &data);
 
         let pending = params.wait.and_then(|spec| {
@@ -1164,7 +1182,7 @@ impl Engine {
         self.emit(vec![event]);
     }
 
-    fn on_device_failed(&self, device_id: u64, reason: String) {
+    fn on_device_failed(self: &Arc<Self>, device_id: u64, reason: String) {
         let session = self.sharing_session();
         let mut events = Vec::new();
         let reason_text = format!("device failed: {reason}");
@@ -1180,7 +1198,20 @@ impl Engine {
         };
         let path = removed.as_ref().map(|device| device.path.clone());
         if let Some(device) = removed {
-            self.finish_devices(vec![device]);
+            // A failed device's writer may never unblock; join it off the
+            // dispatcher so healthy devices and timers keep running.
+            let engine = Arc::clone(self);
+            let id = device.id;
+            let _ = std::thread::Builder::new()
+                .name(format!("serial-cleanup-{id}"))
+                .spawn(move || {
+                    join_devices(vec![device]);
+                    engine
+                        .live_writes
+                        .lock()
+                        .expect("live writes lock")
+                        .remove(&id);
+                });
         }
         // Tell clients (including remote ones) first: the vacated mark still
         // names the path, so a shared device's failure is reported rather than
