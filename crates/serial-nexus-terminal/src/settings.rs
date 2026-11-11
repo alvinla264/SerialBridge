@@ -116,6 +116,33 @@ impl SettingsStore {
         write_atomic(&self.path, &staging_path(&self.path), &text)
     }
 
+    /// The file's current bytes, for restoring it if a later step of Save
+    /// fails. `None` means there was no file.
+    pub fn snapshot(&self) -> Result<Option<Vec<u8>>, SettingsError> {
+        match fs::read(&self.path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Put back exactly the bytes captured by [`snapshot`], or remove the file
+    /// when there was none.
+    pub fn restore(&self, snapshot: Option<&[u8]>) -> Result<(), SettingsError> {
+        match snapshot {
+            Some(bytes) => {
+                self.create_directory()?;
+                let text = String::from_utf8_lossy(bytes);
+                write_atomic(&self.path, &staging_path(&self.path), &text)
+            }
+            None => match fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            },
+        }
+    }
+
     /// Write the defaults only when no file exists yet: a concurrent launch
     /// that created one first wins, and is never replaced.
     fn save_defaults(&self, settings: &TerminalSettings) -> Result<(), SettingsError> {

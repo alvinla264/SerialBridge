@@ -686,6 +686,7 @@ impl AppState {
         // the session-only selection made before sharing started.
         self.draft_checked = self.sharing.checked();
         self.draft_identities = self.sharing.pending_identities.clone();
+        self.sync_checked_identities();
         self.port_text = self.draft.share_port.to_string();
         self.settings_row = 0;
         self.settings_editing = false;
@@ -1203,11 +1204,7 @@ impl AppState {
                 self.draft_identities.remove(path);
             }
             self.sharing.pending_checked = next;
-            self.sharing.pending_identities = snapshot
-                .checked
-                .iter()
-                .map(|device| (device.path.clone(), device.identity.clone()))
-                .collect();
+            self.sync_checked_identities();
         }
         // An inactive snapshot says only that sharing is off; the session-only
         // checked selection stays for this launch, as an explicit stop does.
@@ -1250,6 +1247,19 @@ impl AppState {
     pub fn drop_replaced_checks(&mut self) {
         let detected = self.detected_local_identities();
         self.prune_share_checks(&detected);
+    }
+
+    /// Refresh the identity tokens of checked devices from current discovery.
+    /// The claimed device paths stay; a path without a current token is left
+    /// for pruning to remove.
+    pub fn sync_checked_identities(&mut self) {
+        let detected = self.detected_local_identities();
+        sync_identities(
+            &self.sharing.pending_checked,
+            &mut self.sharing.pending_identities,
+            &detected,
+        );
+        sync_identities(&self.draft_checked, &mut self.draft_identities, &detected);
     }
 
     /// The local devices the core currently detects, mapped to their identity.
@@ -1403,6 +1413,21 @@ impl AppState {
         if let Some(prompt) = &mut self.prompt {
             prompt.input.pop();
             prompt.error = None;
+        }
+    }
+}
+
+/// Keep the identity map in step with the checked paths and the current
+/// discovery tokens.
+fn sync_identities(
+    checked: &BTreeSet<String>,
+    identities: &mut BTreeMap<String, String>,
+    detected: &BTreeMap<String, String>,
+) {
+    identities.retain(|path, _| checked.contains(path));
+    for path in checked {
+        if let Some(identity) = detected.get(path) {
+            identities.insert(path.clone(), identity.clone());
         }
     }
 }

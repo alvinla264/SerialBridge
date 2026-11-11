@@ -97,13 +97,14 @@ these words in their tool names and user-facing text.
   see or use; a checked device need not be open locally.
 - **Device identity**: the concrete device node behind a path, captured as
   `(st_dev, st_ino, st_rdev)` and an `O_PATH` descriptor that pins the node,
-  captured when the device is checked. It is revalidated at authorization,
-  open time and before a checked device is listed to remote clients; an
-  unplugged, replaced, or relinked device (link count changed) loses its
-  authorization (the entry expires and must be checked again) instead of
-  letting a replacement inherit it. An
-  ordinary last-detach close keeps the entry while the pinned node is still
-  the same live device.
+  captured when the device is checked. Discovery reports an opaque token for
+  the pinned node, so a refreshed list never hands a recycled inode the old
+  selection. It is revalidated at authorization, open time and before a
+  checked device is listed to remote clients; an unplugged, replaced, or
+  relinked device (link count changed) loses its authorization (the entry
+  expires and must be checked again) instead of letting a replacement inherit
+  it. An ordinary last-detach close keeps the entry while the pinned node is
+  still the same live device.
 - **Unchecked**: a device removed from the allowlist. Remote access to it is
   revoked immediately, remote work pending on it fails, and local clients and
   other checked devices keep working. Checking it again is explicit.

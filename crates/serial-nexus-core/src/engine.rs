@@ -181,6 +181,11 @@ pub struct Engine {
     /// keyed by device id with its canonical path. Kept until the I/O threads
     /// exit so revocation also reaches a device that already left the state.
     live_writes: Mutex<HashMap<u64, (String, device::WriteEpoch)>>,
+    /// The pinned node behind each currently listed device, keyed by path and
+    /// carrying the opaque token the terminal selected. Holding the identity
+    /// keeps the kernel from recycling its inode before a later ShareStart.
+    detected_tokens: Mutex<HashMap<String, (String, DeviceIdentity)>>,
+    next_identity_token: AtomicU64,
 }
 
 impl Engine {
@@ -207,6 +212,8 @@ impl Engine {
             sharing: Mutex::new(None),
             share_gate: RwLock::new(()),
             live_writes: Mutex::new(HashMap::new()),
+            detected_tokens: Mutex::new(HashMap::new()),
+            next_identity_token: AtomicU64::new(1),
         })
     }
 
@@ -454,6 +461,9 @@ impl Engine {
         let state = self.state.lock().expect("state lock");
         let mut devices: Vec<DeviceSummary> = Vec::new();
         let mut seen = HashSet::new();
+        let previous =
+            std::mem::take(&mut *self.detected_tokens.lock().expect("detected tokens lock"));
+        let mut tokens: HashMap<String, (String, DeviceIdentity)> = HashMap::new();
         for port in ports {
             seen.insert(port.path.clone());
             match state
@@ -464,29 +474,70 @@ impl Engine {
                 Some(device) => {
                     let mut entry = summary(device);
                     entry.description = port.description;
+                    entry.identity = Some(self.detected_token(
+                        &port.path,
+                        device.identity.clone(),
+                        &previous,
+                        &mut tokens,
+                    ));
                     devices.push(entry);
                 }
-                None => devices.push(DeviceSummary {
-                    path: port.path.clone(),
-                    description: port.description,
-                    identity: DeviceIdentity::capture(&port.path)
-                        .ok()
-                        .map(|identity| identity.describe()),
-                    open: false,
-                    device_id: None,
-                    baud: None,
-                    client_count: 0,
-                    control_holder: None,
-                }),
+                None => {
+                    let captured = DeviceIdentity::capture(&port.path).ok();
+                    let token = captured.as_ref().map(|identity| {
+                        self.detected_token(&port.path, identity.clone(), &previous, &mut tokens)
+                    });
+                    devices.push(DeviceSummary {
+                        path: port.path.clone(),
+                        description: port.description,
+                        identity: token,
+                        open: false,
+                        device_id: None,
+                        baud: None,
+                        client_count: 0,
+                        control_holder: None,
+                    });
+                }
             }
         }
         for device in state.devices.values() {
             if !seen.contains(&device.path) {
-                devices.push(summary(device));
+                let mut entry = summary(device);
+                entry.identity = Some(self.detected_token(
+                    &device.path,
+                    device.identity.clone(),
+                    &previous,
+                    &mut tokens,
+                ));
+                devices.push(entry);
             }
         }
+        *self.detected_tokens.lock().expect("detected tokens lock") = tokens;
         devices.sort_by(|a, b| a.path.cmp(&b.path));
         serial_nexus_protocol::DevicesResult { devices }
+    }
+
+    /// Reuse a live node's token so a device the terminal checked keeps the
+    /// same identity across discovery; a different node gets a fresh token.
+    fn detected_token(
+        &self,
+        path: &str,
+        identity: DeviceIdentity,
+        previous: &HashMap<String, (String, DeviceIdentity)>,
+        tokens: &mut HashMap<String, (String, DeviceIdentity)>,
+    ) -> String {
+        let token = previous
+            .get(path)
+            .filter(|(_, cached)| cached.still_valid() && cached.canonical == identity.canonical)
+            .map(|(token, _)| token.clone())
+            .unwrap_or_else(|| {
+                format!(
+                    "snx-{}",
+                    self.next_identity_token.fetch_add(1, Ordering::SeqCst)
+                )
+            });
+        tokens.insert(path.to_string(), (token.clone(), identity));
+        token
     }
 
     fn open(&self, client_id: u64, params: OpenParams) -> Result<ResponseData, ErrorBody> {
@@ -1524,13 +1575,37 @@ impl Engine {
         let mut identities = Vec::new();
         let mut seen = HashSet::new();
         for path in paths {
-            let identity = self.detected_device(path)?;
-            if !identity_matches_expected(&identity, expected.get(path)) {
-                return Err(ErrorBody::new(
-                    ErrorCode::DeviceFailed,
-                    format!("the device at {path} changed; check it again"),
-                ));
-            }
+            let expected_token = expected.get(path);
+            let identity = if expected_token.is_some_and(|token| token.starts_with("snx-")) {
+                // The token names the pinned node from the last discovery. An
+                // invalid pin means the node was replaced, even if the kernel
+                // recycled its inode numbers for the new one.
+                let cached = self
+                    .detected_tokens
+                    .lock()
+                    .expect("detected tokens lock")
+                    .get(path)
+                    .filter(|(token, _)| Some(token) == expected_token)
+                    .map(|(_, identity)| identity.clone());
+                match cached {
+                    Some(identity) if identity.still_valid() => identity,
+                    _ => {
+                        return Err(ErrorBody::new(
+                            ErrorCode::DeviceFailed,
+                            format!("the device at {path} changed; check it again"),
+                        ))
+                    }
+                }
+            } else {
+                let identity = self.detected_device(path)?;
+                if !identity_matches_expected(&identity, expected_token) {
+                    return Err(ErrorBody::new(
+                        ErrorCode::DeviceFailed,
+                        format!("the device at {path} changed; check it again"),
+                    ));
+                }
+                identity
+            };
             let canonical = identity.canonical.clone();
             let stale_open = {
                 let state = self.state.lock().expect("state lock");
@@ -1913,9 +1988,31 @@ impl Engine {
             // expired instance, so no stale controller remains attached.
             let removed =
                 self.begin_detach_remote_clients(&[device_id], "device is no longer shared");
+            let removed_device = !removed.is_empty();
             self.cleanup_devices_async(removed);
-            // Local clients still attached to the device keep it open: a
-            // revocation must not look like an unplug to them.
+            if !removed_device {
+                // The device stays open for local clients, so only the remote
+                // clients that were attached get the closure. Sending it to
+                // everyone would look like an unplug locally.
+                let event = ServerMessage::Event {
+                    event: Event::DeviceClosed {
+                        device_id,
+                        path: path.clone(),
+                        reason: "device is no longer shared".into(),
+                    },
+                };
+                let receivers: Vec<Sender<ServerMessage>> = self
+                    .clients
+                    .lock()
+                    .expect("clients lock")
+                    .iter()
+                    .filter(|(id, _)| remote_ids.contains(id))
+                    .map(|(_, record)| record.tx.clone())
+                    .collect();
+                for tx in receivers {
+                    let _ = tx.send(event.clone());
+                }
+            }
             session.clear_vacated(&path);
         }
         false

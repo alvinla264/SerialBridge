@@ -134,6 +134,7 @@ impl App {
                 self.state.set_endpoint_devices(LOCAL_ENDPOINT, entries);
                 let detected = self.state.detected_local_identities();
                 self.state.prune_share_checks(&detected);
+                self.state.sync_checked_identities();
             }
             Err(error) => self.state.notice = Some(Notice::error(error.to_string())),
         }
@@ -670,6 +671,7 @@ impl App {
         let active = self.state.sharing.active;
         let desired: Vec<String> = draft_checked.iter().cloned().collect();
         let previous_settings = self.state.settings.clone();
+        let previous_file = store.snapshot();
 
         // Every checked device needs the identity the owner selected. Without
         // one the core would fall back to the current node at that path, which
@@ -720,7 +722,10 @@ impl App {
                             return;
                         }
                     }
-                    let restored = store.save(&previous_settings).is_ok();
+                    let restored = match &previous_file {
+                        Ok(snapshot) => store.restore(snapshot.as_deref()).is_ok(),
+                        Err(_) => store.save(&previous_settings).is_ok(),
+                    };
                     self.sync_share_status();
                     self.state.notice = Some(Notice::error(if restored {
                         format!("settings not saved: {error}")
@@ -758,6 +763,7 @@ impl App {
             return;
         }
         self.state.drop_replaced_checks();
+        self.state.sync_checked_identities();
         let detected = self.state.detected_local_identities();
         let missing: Vec<String> = self
             .state
@@ -928,7 +934,7 @@ impl App {
 
     fn leave_connect(&mut self) {
         self.state.connect = None;
-        self.state.view = View::Stream;
+        self.show_live_stream();
         self.state.focus = Focus::Sidebar;
     }
 
@@ -962,7 +968,7 @@ impl App {
             Ok((id, label)) => {
                 self.state.remote_labels.insert(id, label.clone());
                 self.state.connect = None;
-                self.state.view = View::Stream;
+                self.show_live_stream();
                 self.state.focus = Focus::Sidebar;
                 self.refresh_remotes();
                 self.state.notice = Some(Notice::info(format!(
