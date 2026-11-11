@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -304,8 +304,23 @@ impl Client {
         bind: ShareBind,
         devices: Vec<String>,
     ) -> Result<ShareSessionInfo, ClientError> {
+        self.start_sharing_expected(bind, devices, BTreeMap::new())
+    }
+
+    /// Start sharing and require each path's current node to match the device
+    /// identity the owner selected. A replacement is refused, not shared.
+    pub fn start_sharing_expected(
+        &self,
+        bind: ShareBind,
+        devices: Vec<String>,
+        expected: BTreeMap<String, String>,
+    ) -> Result<ShareSessionInfo, ClientError> {
         match self.request(
-            Request::ShareStart(ShareStartParams { bind, devices }),
+            Request::ShareStart(ShareStartParams {
+                bind,
+                devices,
+                expected,
+            }),
             self.timeout(),
         )? {
             ResponseData::ShareStarted(info) => Ok(info),
@@ -326,8 +341,18 @@ impl Client {
         &self,
         devices: Vec<String>,
     ) -> Result<SharingSnapshot, ClientError> {
+        self.check_shared_devices_expected(devices, BTreeMap::new())
+    }
+
+    /// Check devices and require each current node to match the identity the
+    /// owner selected.
+    pub fn check_shared_devices_expected(
+        &self,
+        devices: Vec<String>,
+        expected: BTreeMap<String, String>,
+    ) -> Result<SharingSnapshot, ClientError> {
         match self.request(
-            Request::ShareCheck(ShareDevicesParams { devices }),
+            Request::ShareCheck(ShareDevicesParams { devices, expected }),
             self.timeout(),
         )? {
             ResponseData::Sharing(snapshot) => Ok(snapshot),
@@ -341,7 +366,10 @@ impl Client {
         devices: Vec<String>,
     ) -> Result<SharingSnapshot, ClientError> {
         match self.request(
-            Request::ShareUncheck(ShareDevicesParams { devices }),
+            Request::ShareUncheck(ShareDevicesParams {
+                devices,
+                expected: BTreeMap::new(),
+            }),
             self.timeout(),
         )? {
             ResponseData::Sharing(snapshot) => Ok(snapshot),

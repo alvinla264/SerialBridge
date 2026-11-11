@@ -290,8 +290,8 @@ Nothing listens on the network until it is started deliberately.
    footer and sharing stays off. Once on, the pairing view shows the bound
    address and what a remote client needs.
 
-The pairing view (`p`, or `Enter` on the running Share button) shows the host
-name, the host certificate's SHA-256 fingerprint, the session's CA certificate
+The pairing view (`p` while the sidebar has focus; `Enter` on the Share button
+turns sharing off, so use `p` to inspect it) shows the host name, the host certificate's SHA-256 fingerprint, the session's CA certificate
 (base64 DER) and two separate credentials: one for the human terminal, one for
 MCP/AI clients. The credentials are shown only to the owner, are never written
 to the settings file or a device, and disappear when sharing stops. Use `↑`/`↓`

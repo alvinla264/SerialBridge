@@ -1242,6 +1242,7 @@ fn a_checked_but_never_opened_device_rejects_a_recycled_node() {
         &serial_nexus_protocol::ShareStartParams {
             bind: localhost_bind(),
             devices: vec![path_text.clone()],
+            expected: std::collections::BTreeMap::new(),
         },
         vec![identity],
         serial_nexus_core::share::ShareLimits {
@@ -1646,6 +1647,7 @@ fn remote_sharing_administration_requests_are_refused_on_the_wire() {
             3,
             serial_nexus_protocol::Request::ShareCheck(serial_nexus_protocol::ShareDevicesParams {
                 devices: vec![device.path.clone()],
+                expected: std::collections::BTreeMap::new(),
             }),
         ),
     ] {

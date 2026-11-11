@@ -10,6 +10,7 @@
 //! that many bytes), bounded by [`MAX_REMOTE_FRAME_BYTES`]. The Unix socket
 //! keeps its newline-delimited framing, so existing clients are unaffected.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, Read};
 use std::net::{IpAddr, SocketAddr};
@@ -153,12 +154,20 @@ pub struct ShareStartParams {
     /// open locally.
     #[serde(default)]
     pub devices: Vec<String>,
+    /// The device identity the owner selected for each path, when it had one.
+    /// The core refuses a path whose current node no longer matches, so a
+    /// replacement cannot inherit a check made against its predecessor.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub expected: BTreeMap<String, String>,
 }
 
 /// Check or uncheck specific devices in the owner's running session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareDevicesParams {
     pub devices: Vec<String>,
+    /// Expected device identity per path, as captured when it was selected.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub expected: BTreeMap<String, String>,
 }
 
 /// Which kind of pairing credential a secret is.

@@ -472,11 +472,11 @@ fn dispatch(
             subscribers.lock().expect("subscribers lock").retain(|tx| {
                 match tx.try_send(event.clone()) {
                     Ok(()) => true,
-                    // A bounded subscriber that is full loses this event but
-                    // stays subscribed; dropping it would hide the eventual
-                    // TransportClosed notice.
-                    Err(TrySendError::Full(_)) => true,
-                    Err(TrySendError::Disconnected(_)) => false,
+                    // A bounded subscriber that cannot keep up is dropped
+                    // instead of silently losing a revocation or close event.
+                    // Its receiver then reports disconnection, so the client
+                    // can drop that host visibly rather than trust stale rows.
+                    Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
                 }
             });
         }
@@ -508,8 +508,7 @@ fn fail(
         .expect("subscribers lock")
         .retain(|tx| match tx.try_send(event.clone()) {
             Ok(()) => true,
-            Err(TrySendError::Full(_)) => true,
-            Err(TrySendError::Disconnected(_)) => false,
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
         });
 }
 
@@ -533,7 +532,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_full_bounded_subscriber_drops_events_without_blocking_or_unsubscribing() {
+    fn a_full_bounded_subscriber_is_dropped_without_blocking() {
         let (tx, rx) = bounded(1);
         let subscribers = Arc::new(Mutex::new(vec![tx]));
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
@@ -550,13 +549,19 @@ mod tests {
         }
         assert_eq!(
             subscribers.lock().expect("subscribers lock").len(),
-            1,
-            "a full subscriber stays subscribed for the close notice"
+            0,
+            "a full subscriber is dropped so its client sees the overflow"
         );
         match rx.try_recv().expect("the first event") {
             Event::TransportClosed { reason } => assert_eq!(reason, "first"),
             other => panic!("unexpected event {other:?}"),
         }
-        assert!(rx.try_recv().is_err(), "the overflowing event is dropped");
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(crossbeam_channel::TryRecvError::Disconnected)
+            ),
+            "the receiver reports the dropped subscription"
+        );
     }
 }

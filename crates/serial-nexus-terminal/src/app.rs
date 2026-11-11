@@ -1,7 +1,7 @@
 //! The event-driven app: client calls behind small state transitions that do
 //! not depend on a real terminal.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
@@ -184,13 +184,21 @@ impl App {
         while let Ok(event) = self.events.try_recv() {
             self.handle_event(LOCAL_ENDPOINT, event, None);
         }
+        let mut overflowed = Vec::new();
         let pending: Vec<(EndpointId, Vec<Event>)> = self
             .remotes
             .iter()
             .map(|link| {
                 let mut events = Vec::new();
-                while let Ok(event) = link.events.try_recv() {
-                    events.push(event);
+                loop {
+                    match link.events.try_recv() {
+                        Ok(event) => events.push(event),
+                        Err(crossbeam_channel::TryRecvError::Empty) => break,
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                            overflowed.push(link.id);
+                            break;
+                        }
+                    }
                 }
                 (link.id, events)
             })
@@ -198,6 +206,11 @@ impl App {
         for (id, events) in pending {
             for event in events {
                 self.handle_event(id, event, Some(id));
+            }
+        }
+        for id in overflowed {
+            if self.remotes.iter().any(|link| link.id == id) {
+                self.drop_remote(id, "remote host disconnected: its event queue overflowed");
             }
         }
     }
@@ -662,11 +675,31 @@ impl App {
         // failed write therefore never unchecks anything, and a failed write
         // takes back the grants it just made.
         if active && !to_check.is_empty() {
-            match self.client.check_shared_devices(to_check.clone()) {
+            let expected = self.expected_identities(&to_check, &self.state.draft_identities);
+            match self
+                .client
+                .check_shared_devices_expected(to_check.clone(), expected)
+            {
                 Ok(snapshot) => self.state.apply_sharing_snapshot(snapshot),
                 Err(error) => {
-                    self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
+                    // The core checks a batch device by device. Take back any
+                    // grant it accepted before the failure, then report the
+                    // save as a whole as not applied.
                     self.sync_share_status();
+                    let requested: BTreeSet<String> = to_check.iter().cloned().collect();
+                    let granted: Vec<String> = self
+                        .state
+                        .sharing
+                        .checked()
+                        .intersection(&requested)
+                        .cloned()
+                        .collect();
+                    if !granted.is_empty() {
+                        if let Ok(snapshot) = self.client.uncheck_shared_devices(granted) {
+                            self.state.apply_sharing_snapshot(snapshot);
+                        }
+                    }
+                    self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
                     return;
                 }
             }
@@ -748,7 +781,8 @@ impl App {
                 return;
             }
         };
-        match self.client.start_sharing(bind, devices) {
+        let expected = self.expected_identities(&devices, &self.state.sharing.pending_identities);
+        match self.client.start_sharing_expected(bind, devices, expected) {
             Ok(info) => {
                 self.state.sharing.active = true;
                 self.state.sharing.pairing = Some(info);
@@ -766,6 +800,18 @@ impl App {
                 self.state.notice = Some(Notice::error(format!("sharing not started: {error}")));
             }
         }
+    }
+
+    /// The recorded identity per path, for the paths still being granted.
+    fn expected_identities(
+        &self,
+        paths: &[String],
+        identities: &BTreeMap<String, String>,
+    ) -> BTreeMap<String, String> {
+        paths
+            .iter()
+            .filter_map(|path| identities.get(path).map(|id| (path.clone(), id.clone())))
+            .collect()
     }
 
     /// The saved sharing endpoint, validated as one concrete address.

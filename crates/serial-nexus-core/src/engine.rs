@@ -108,6 +108,15 @@ struct State {
 
 /// Resolve a device path to one identity: aliases and `..` must name the same
 /// open device. Falls back to the original string if resolution fails.
+/// A path may only be authorized for the node the owner selected. An absent
+/// expectation (older client) keeps the previous path-based behaviour.
+fn identity_matches_expected(identity: &DeviceIdentity, expected: Option<&String>) -> bool {
+    match expected {
+        Some(expected) => *expected == identity.describe(),
+        None => true,
+    }
+}
+
 fn identity_path(path: &str) -> String {
     std::fs::canonicalize(path)
         .map(|resolved| resolved.to_string_lossy().into_owned())
@@ -1544,6 +1553,12 @@ impl Engine {
         let mut seen = HashSet::new();
         for path in &params.devices {
             let identity = self.detected_device(path)?;
+            if !identity_matches_expected(&identity, params.expected.get(path)) {
+                return Err(ErrorBody::new(
+                    ErrorCode::DeviceFailed,
+                    format!("the device at {path} changed; check it again"),
+                ));
+            }
             if let Some(device) = self
                 .state
                 .lock()
@@ -1669,6 +1684,12 @@ impl Engine {
         }
         for path in &params.devices {
             let identity = self.detected_device(path)?;
+            if !identity_matches_expected(&identity, params.expected.get(path)) {
+                return Err(ErrorBody::new(
+                    ErrorCode::DeviceFailed,
+                    format!("the device at {path} changed; check it again"),
+                ));
+            }
             let canonical = identity.canonical.clone();
             let stale_open = {
                 let mut state = self.state.lock().expect("state lock");
@@ -2574,6 +2595,26 @@ fn record_written_lines(device: &mut Device, source: Source, data: &[u8]) {
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+
+    #[test]
+    fn an_expected_identity_rejects_a_replacement_node() {
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let path = directory.path().join("node");
+        std::fs::write(&path, b"a").expect("node");
+        let path_text = path.to_string_lossy().into_owned();
+        let old = DeviceIdentity::capture(&path_text).expect("old");
+        let expected = old.describe();
+        assert!(identity_matches_expected(&old, Some(&expected)));
+
+        std::fs::remove_file(&path).expect("unlink old node");
+        std::fs::write(&path, b"b").expect("replacement node");
+        let new = DeviceIdentity::capture(&path_text).expect("new");
+        assert!(
+            !identity_matches_expected(&new, Some(&expected)),
+            "a replacement must not inherit the selected identity"
+        );
+        assert!(identity_matches_expected(&new, None));
+    }
 
     #[test]
     fn an_open_instance_only_matches_its_own_live_node() {
