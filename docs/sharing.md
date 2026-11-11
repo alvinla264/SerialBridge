@@ -86,11 +86,12 @@ type:
   itself: the serial descriptor's `fstat` and the canonical path must both
   still be that node, and the pinned node's link count must still equal the
   captured value (so an added hard link also expires it).
-  A changed node or an unplug expires the entry: access stops at once and the
-  path stays only long enough for attached remote clients to receive
-  `DeviceClosed`. An ordinary last-detach close keeps the checked entry (the
-  pinned node proves it is the same device), so reopening the same device does
-  not need a recheck. Expired entries are not "checked", are not listed, and
+  A changed node or an unplug expires the entry: access stops at once and
+  attached remote clients receive `DeviceClosed`. The expired path remains as
+  a non-authorizing tombstone, retaining its pinned descriptor, until the next
+  `ShareCheck` prunes it, the owner unchecks it, or the session ends. An
+  ordinary last-detach close keeps the checked entry (the pinned node proves it
+  is the same device), so reopening the same device does not need a recheck. Expired entries are not "checked", are not listed, and
   never grant access; an explicit `ShareCheck` with a live identity is required
   again.
 - **Every operation.** `ListDevices` is filtered to checked devices. Remote
