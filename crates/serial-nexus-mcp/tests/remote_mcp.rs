@@ -26,6 +26,10 @@ struct SharedHost {
 
 impl SharedHost {
     fn start(devices: &[String]) -> Self {
+        Self::start_on(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), devices)
+    }
+
+    fn start_on(address: IpAddr, devices: &[String]) -> Self {
         let (directory, socket) = start_core(Duration::from_secs(30));
         let owner = Client::connect_to_socket(&socket, ClientInfo::human("owner-terminal"))
             .expect("owner connects");
@@ -37,10 +41,7 @@ impl SharedHost {
                 .expect("host opens the device to share");
         }
         let info = owner
-            .start_sharing(
-                ShareBind::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
-                devices.to_vec(),
-            )
+            .start_sharing(ShareBind::new(address, 0), devices.to_vec())
             .expect("start sharing");
         Self {
             directory,
@@ -712,4 +713,168 @@ fn the_transport_dials_only_the_paired_endpoint_and_the_paired_role() {
     .expect_err("a role mismatch must be refused");
     assert!(matches!(error, ClientError::Authentication(_)), "{error}");
     assert!(!error.to_string().contains(&host.info.ai.credential));
+}
+
+#[test]
+fn a_remote_device_path_is_never_resolved_on_this_machine() {
+    // The alias exists only on the client here and points at a different PTY
+    // than the path the host shared. Resolving it locally would address the
+    // wrong device; the transport must refuse instead.
+    let mut device_a = SimulatedDevice::new();
+    let mut device_b = SimulatedDevice::new();
+    let host = SharedHost::start(&[device_a.path.clone(), device_b.path.clone()]);
+    let peers = write_peers(&host.directory, vec![peer_entry(&host.info, &host.info.ai)]);
+    let mut session = spawn(&host.socket, &peers);
+
+    for path in [&device_a.path, &device_b.path] {
+        let connected = session.call_tool(
+            "connect",
+            remote_args(&host, json!({ "path": path, "request_control": true })),
+        );
+        assert!(!connected.is_error, "{}", connected.text);
+    }
+
+    let alias = host.directory.path().join("client-only-alias");
+    std::os::unix::fs::symlink(&device_b.path, &alias).expect("symlink");
+    let alias = alias.to_string_lossy().into_owned();
+    let reply = session.call_tool(
+        "send",
+        remote_args(
+            &host,
+            json!({ "device": alias, "text": "WRONG", "lines": 0 }),
+        ),
+    );
+    assert!(reply.is_error, "{}", reply.text);
+    assert!(reply.text.contains(&alias), "{}", reply.text);
+    assert!(
+        device_b.read_for(Duration::from_millis(300)).is_empty(),
+        "the write must not reach the locally resolved device"
+    );
+    assert!(device_a.read_for(Duration::from_millis(100)).is_empty());
+}
+
+#[test]
+fn a_misplaced_credential_in_the_pairing_file_is_not_echoed() {
+    let host = SharedHost::start(&[]);
+    let (address, port) = host.endpoint();
+    let credential = host.info.ai.credential.clone();
+
+    // The bearer pasted into the wrong field: serde's own message would quote
+    // it, so the loader must not forward that message.
+    let mut entry = peer_entry(&host.info, &host.info.ai);
+    entry["secret"]["role"] = json!(credential);
+    let peers = write_peers(&host.directory, vec![entry]);
+    let mut session = spawn(&host.socket, &peers);
+    let reply = session.call_tool(
+        "list_devices",
+        json!({ "ip": address.to_string(), "port": port }),
+    );
+    assert!(reply.is_error, "{}", reply.text);
+    assert!(!reply.text.contains(&credential), "credential leaked");
+    assert_no_secret(&session, &reply.text, &host.info);
+}
+
+#[test]
+fn a_credential_pasted_as_the_host_name_is_not_echoed() {
+    let host = SharedHost::start(&[]);
+    let (address, port) = host.endpoint();
+    let credential = host.info.ai.credential.clone();
+    let mut entry = peer_entry(&host.info, &host.info.ai);
+    entry["paired"]["host_name"] = json!(credential);
+    let peers = write_peers(&host.directory, vec![entry]);
+    let mut session = spawn(&host.socket, &peers);
+    let reply = session.call_tool(
+        "list_devices",
+        json!({ "ip": address.to_string(), "port": port }),
+    );
+    assert!(reply.is_error, "{}", reply.text);
+    assert!(!reply.text.contains(&credential), "credential leaked");
+}
+
+#[test]
+fn losing_the_owner_connection_stops_a_pending_write_without_replay() {
+    let mut device = SimulatedDevice::new();
+    let host = SharedHost::start(std::slice::from_ref(&device.path));
+    let peers = write_peers(&host.directory, vec![peer_entry(&host.info, &host.info.ai)]);
+    let mut session = spawn(&host.socket, &peers);
+    let connected = session.call_tool(
+        "connect",
+        remote_args(
+            &host,
+            json!({ "path": device.path, "request_control": true }),
+        ),
+    );
+    assert!(!connected.is_error, "{}", connected.text);
+    let id = connected.device_id();
+
+    let request = session.start_request(
+        "tools/call",
+        json!({
+            "name": "send",
+            "arguments": remote_args(&host, json!({
+                "device": id,
+                "text": "OWNER-LOSS",
+                "lines": 1,
+                "timeout_ms": 30_000,
+            })),
+        }),
+    );
+    assert_eq!(
+        device.read_n(10, Duration::from_secs(5)),
+        b"OWNER-LOSS",
+        "the write reaches the device before the owner goes away"
+    );
+    // The owning terminal's connection dies: the session, listener and
+    // credentials go with it.
+    drop(host.owner);
+    let response = session.response_for(&request);
+    let (text, is_error) = reply(&response);
+    assert!(is_error, "{text}");
+    assert!(
+        text.to_lowercase().contains("uncertain")
+            || text.to_lowercase().contains("may have reached"),
+        "{}",
+        text
+    );
+    assert_no_secret(&session, &text, &host.info);
+    assert!(
+        device.read_for(Duration::from_millis(300)).is_empty(),
+        "the write must not be replayed"
+    );
+}
+
+#[test]
+fn an_ipv6_endpoint_is_reached_with_the_same_pair() {
+    let mut device = SimulatedDevice::new();
+    let host = SharedHost::start_on(
+        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        std::slice::from_ref(&device.path),
+    );
+    let peers = write_peers(&host.directory, vec![peer_entry(&host.info, &host.info.ai)]);
+    let mut session = spawn(&host.socket, &peers);
+
+    let connected = session.call_tool(
+        "connect",
+        remote_args(
+            &host,
+            json!({ "path": device.path, "request_control": true }),
+        ),
+    );
+    assert!(!connected.is_error, "{}", connected.text);
+    assert!(
+        connected
+            .text
+            .contains(&format!("[::1]:{}", host.endpoint().1)),
+        "{}",
+        connected.text
+    );
+    let sent = session.call_tool(
+        "send",
+        remote_args(
+            &host,
+            json!({ "device": connected.device_id(), "text": "V6", "lines": 0 }),
+        ),
+    );
+    assert!(!sent.is_error, "{}", sent.text);
+    assert_eq!(device.read_n(2, Duration::from_secs(5)), b"V6");
 }

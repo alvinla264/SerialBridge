@@ -179,6 +179,11 @@ set, `port` is the host's TCP port and `path` is the device path on that host:
 { "name": "connect", "arguments": { "ip": "192.0.2.10", "port": 7000, "path": "/dev/ttyUSB0", "request_control": true } }
 ```
 
+A device path for a remote endpoint is the path **on the host**. It is never
+resolved against this machine's filesystem, because a client-side symlink of
+the same name could point at a different device. A path this client cannot
+match to a remote connection is an error, not a guess.
+
 Results from a remote endpoint say so (`on remote 192.0.2.10:7000`) and carry
 `structuredContent.remote_endpoint`; local results are unchanged. Device ids,
 control and history are kept separately per endpoint, so two hosts that both
@@ -258,5 +263,7 @@ endpoint and address validation, an unknown endpoint, a human credential
 refused for the AI role, a host that cannot prove the pinned certificate, an
 unreadable pairing file, two hosts with equal device ids kept apart, one AI
 writer across local and remote, concurrent whole writes, unchecking a device,
-owner termination stopping a write without replay, and a rotated credential
-recovered by updating the file. No physical hardware is used.
+owner termination stopping a write without replay, an IPv6 endpoint, a
+credential misplaced into a file field and never echoed, a remote path not
+resolved locally, and a rotated credential recovered by updating the file. No
+physical hardware is used.

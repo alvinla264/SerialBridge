@@ -127,16 +127,13 @@ impl RemotePeer {
             .host_name
             .parse::<std::net::IpAddr>()
             .map_err(|_| {
-                format!(
-                    "the pairing host name {:?} is not the IP address the host reported",
-                    self.paired.host_name
-                )
+                "the pairing host_name is not the IP address the host reported".to_string()
             })?;
         if RemoteEndpoint::canonical_ip(name) != RemoteEndpoint::canonical_ip(self.endpoint.address)
         {
             return Err(format!(
-                "the pairing host name {:?} does not match the endpoint address {}",
-                self.paired.host_name, self.endpoint.address
+                "the pairing host_name does not match the endpoint address {}",
+                self.endpoint.address
             ));
         }
         let fingerprint = &self.paired.host_cert_fingerprint_sha256;
@@ -229,9 +226,16 @@ impl Peers {
                     source,
                 })?;
         }
+        // Serde's own message can quote the offending input, and a misconfigured
+        // file may hold a credential in the wrong field. Report only where the
+        // problem is, never what was there.
         let parsed: PeerFile = serde_json::from_str(&text).map_err(|error| PeerError::Format {
             path: path.clone(),
-            reason: format!("{error}"),
+            reason: format!(
+                "invalid JSON at line {} column {}",
+                error.line(),
+                error.column()
+            ),
         })?;
         if parsed.version != PEERS_VERSION {
             return Err(PeerError::Version {

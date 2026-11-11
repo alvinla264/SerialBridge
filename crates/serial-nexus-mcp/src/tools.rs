@@ -331,9 +331,15 @@ impl Session {
         if let Ok(id) = device.parse::<u64>() {
             return Ok(id);
         }
-        let canonical = std::fs::canonicalize(device)
-            .ok()
-            .map(|path| path.to_string_lossy().into_owned());
+        // A remote path names a device on the host; resolving it here would
+        // compare against this machine's filesystem and could pick the wrong
+        // device. Only a local path is canonicalized.
+        let canonical = match target {
+            Target::Local => std::fs::canonicalize(device)
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned()),
+            Target::Remote(_) => None,
+        };
         let matches = |path: &str| path == device || canonical.as_deref() == Some(path);
         let known = {
             let connections = self.connections.lock().expect("connections lock");
@@ -804,7 +810,7 @@ fn parse_endpoint(ip: &Value, port: &Value) -> Result<RemoteEndpoint, Failure> {
         .ok_or_else(|| Failure::Params("port must be a TCP port number".into()))?;
     let port = u16::try_from(number)
         .map_err(|_| Failure::Params(format!("port {number} is not between 1 and 65535")))?;
-    let endpoint = RemoteEndpoint::new(address, port);
+    let endpoint = RemoteEndpoint::new(address, port).canonical();
     endpoint.validate().map_err(Failure::Params)?;
     Ok(endpoint)
 }
@@ -1306,6 +1312,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(parsed.to_string(), "[::1]:7000");
+        // The two spellings of one IPv4 endpoint are one session.
+        let mapped = endpoint_argument(&json!({ "ip": "::ffff:127.0.0.1", "port": 7000 }))
+            .unwrap()
+            .unwrap();
+        let plain = endpoint_argument(&json!({ "ip": "127.0.0.1", "port": 7000 }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(mapped, plain);
+        assert_eq!(mapped.to_string(), "127.0.0.1:7000");
         assert!(endpoint_argument(&json!({ "ip": "127.0.0.1", "port": 0 })).is_err());
         assert!(endpoint_argument(&json!({ "ip": "0.0.0.0", "port": 7000 })).is_err());
         assert!(endpoint_argument(&json!({ "ip": "host.example", "port": 7000 })).is_err());
