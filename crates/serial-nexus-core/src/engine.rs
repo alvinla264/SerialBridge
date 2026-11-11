@@ -1682,6 +1682,10 @@ impl Engine {
                 "sharing is stopping",
             ));
         }
+        // Validate every path first, then add the whole batch at once. A
+        // failed batch leaves the allowlist exactly as it was.
+        let mut identities = Vec::new();
+        let mut seen = HashSet::new();
         for path in &params.devices {
             let identity = self.detected_device(path)?;
             if !identity_matches_expected(&identity, params.expected.get(path)) {
@@ -1692,18 +1696,12 @@ impl Engine {
             }
             let canonical = identity.canonical.clone();
             let stale_open = {
-                let mut state = self.state.lock().expect("state lock");
+                let state = self.state.lock().expect("state lock");
                 state
                     .devices
-                    .values_mut()
+                    .values()
                     .find(|device| device.path == canonical)
-                    .map(|device| {
-                        let matches = device_matches_identity(device, &identity);
-                        if matches {
-                            device.shared = Some(identity.clone());
-                        }
-                        !matches
-                    })
+                    .map(|device| !device_matches_identity(device, &identity))
             };
             if stale_open == Some(true) {
                 return Err(ErrorBody::new(
@@ -1711,10 +1709,27 @@ impl Engine {
                     "an open instance at this path is a different device; close it first",
                 ));
             }
-            let expired = session.check(identity)?;
-            for path in expired {
-                self.revoke_path_everywhere(&path, &session);
+            if seen.insert(canonical) {
+                identities.push(identity);
             }
+        }
+        let expired = session.check_many(identities.clone())?;
+        {
+            let mut state = self.state.lock().expect("state lock");
+            for identity in &identities {
+                if let Some(device) = state
+                    .devices
+                    .values_mut()
+                    .find(|device| device.path == identity.canonical)
+                {
+                    if device_matches_identity(device, identity) {
+                        device.shared = Some(identity.clone());
+                    }
+                }
+            }
+        }
+        for path in expired {
+            self.revoke_path_everywhere(&path, &session);
         }
         Ok(ResponseData::Sharing(session.snapshot()))
     }

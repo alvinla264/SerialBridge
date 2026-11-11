@@ -319,6 +319,13 @@ impl SharingSession {
 
     /// Add one detected device to the allowlist (or refresh an expired entry).
     pub fn check(&self, identity: DeviceIdentity) -> Result<Vec<String>, ErrorBody> {
+        self.check_many(vec![identity])
+    }
+
+    /// Add several devices as one batch. The whole batch is refused before any
+    /// entry is inserted when it would exceed the limit, so a failed batch
+    /// never leaves a partial authorization behind.
+    pub fn check_many(&self, identities: Vec<DeviceIdentity>) -> Result<Vec<String>, ErrorBody> {
         let mut state = self.state.lock().expect("share state lock");
         // Mark vanished entries expired first, then drop them; otherwise a
         // sequence of unplugged checks retains descriptors without bound.
@@ -330,26 +337,31 @@ impl SharingSession {
             }
         }
         state.devices.retain(|_, entry| !entry.expired);
-        if !state.devices.contains_key(&identity.canonical) {
-            let live = state
-                .devices
-                .values()
-                .filter(|entry| !entry.expired && entry.identity.still_valid())
-                .count();
-            if live >= MAX_SHARED_DEVICES {
-                return Err(ErrorBody::new(
-                    ErrorCode::LimitExceeded,
-                    format!("at most {MAX_SHARED_DEVICES} devices may be shared"),
-                ));
+        let live = state.devices.len();
+        let mut additions = 0;
+        let mut seen = std::collections::HashSet::new();
+        for identity in &identities {
+            if !state.devices.contains_key(&identity.canonical)
+                && seen.insert(identity.canonical.clone())
+            {
+                additions += 1;
             }
         }
-        state.devices.insert(
-            identity.canonical.clone(),
-            AuthorizedDevice {
-                identity,
-                expired: false,
-            },
-        );
+        if live.saturating_add(additions) > MAX_SHARED_DEVICES {
+            return Err(ErrorBody::new(
+                ErrorCode::LimitExceeded,
+                format!("at most {MAX_SHARED_DEVICES} devices may be shared"),
+            ));
+        }
+        for identity in identities {
+            state.devices.insert(
+                identity.canonical.clone(),
+                AuthorizedDevice {
+                    identity,
+                    expired: false,
+                },
+            );
+        }
         Ok(expired)
     }
 

@@ -357,29 +357,33 @@ fn unchecking_one_remote_device_keeps_the_other_and_the_local_core() {
         .expect("open second");
 
     // The host revokes the first device. The terminal sees it at the next
-    // refresh and its session stops being writable; the second stays.
+    // refresh, detaches that session and says so; the second stays usable.
     host.owner
         .uncheck_shared_devices(vec![first_path.clone()])
         .expect("uncheck");
     terminal.app.refresh_devices();
-
-    terminal.app.show_session_now(second_key);
-    terminal.app.write_shown(b"still", Key::Char('s'));
-    second.read_until(b"still", Duration::from_secs(5));
+    assert!(
+        !terminal.app.state.sessions.contains_key(&first_key),
+        "the revoked remote session is detached"
+    );
+    let notice = terminal.app.state.notice.as_ref().expect("notice");
+    assert!(
+        notice.text.contains("no longer shared"),
+        "the revocation is visible: {}",
+        notice.text
+    );
     assert!(
         first.try_read().is_empty(),
         "the revoked device got no bytes"
     );
 
-    // A write to the revoked session fails visibly and is not retried.
+    terminal.app.show_session_now(second_key);
+    terminal.app.write_shown(b"still", Key::Char('s'));
+    second.read_until(b"still", Duration::from_secs(5));
+
+    // A write aimed at the detached device reaches nothing and is not retried.
     terminal.app.show_session_now(first_key);
     terminal.app.write_shown(b"never", Key::Char('n'));
-    let notice = terminal.app.state.notice.as_ref().expect("notice");
-    assert!(
-        notice.text.contains("write to"),
-        "the failure is visible: {}",
-        notice.text
-    );
     assert!(
         first.try_read().is_empty(),
         "the failed write was not replayed"

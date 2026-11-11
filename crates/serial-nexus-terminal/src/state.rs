@@ -897,6 +897,32 @@ impl AppState {
         for device in &mut devices {
             device.endpoint = endpoint;
         }
+        // A remote host's list is authoritative: a session whose device it no
+        // longer lists was revoked or unplugged, so drop it rather than
+        // resurrect the row from the local session cache.
+        if endpoint != LOCAL_ENDPOINT {
+            let missing: Vec<(SessionKey, String)> = self
+                .sessions
+                .iter()
+                .filter(|(_, session)| {
+                    session.endpoint == endpoint
+                        && devices
+                            .iter()
+                            .all(|device| device.device_id != Some(session.device_id))
+                })
+                .map(|(key, session)| (*key, session.path.clone()))
+                .collect();
+            if !missing.is_empty() {
+                let paths: Vec<String> = missing.iter().map(|(_, path)| path.clone()).collect();
+                for (key, _) in missing {
+                    self.remove_session(key);
+                }
+                self.notice = Some(Notice::error(format!(
+                    "no longer shared by the remote host: {}",
+                    paths.join(", ")
+                )));
+            }
+        }
         for session in self.sessions.values() {
             if session.endpoint == endpoint
                 && devices.iter().all(|device| device.path != session.path)

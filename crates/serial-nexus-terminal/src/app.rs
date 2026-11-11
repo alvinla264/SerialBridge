@@ -705,21 +705,30 @@ impl App {
             }
         }
 
+        let previous = self.state.settings.clone();
         match store.save(&draft) {
             Ok(()) => {
-                self.state.commit_settings();
                 if active && !to_uncheck.is_empty() {
-                    match self.client.uncheck_shared_devices(to_uncheck) {
-                        Ok(snapshot) => self.state.apply_sharing_snapshot(snapshot),
-                        Err(error) => {
-                            self.state.notice = Some(Notice::error(format!(
-                                "settings saved, but the checklist was not applied: {error}"
-                            )));
-                            self.sync_share_status();
-                            return;
-                        }
+                    if let Err(error) = self.client.uncheck_shared_devices(to_uncheck) {
+                        // Keep the preferences and the draft together: put the
+                        // previous file back rather than persist a Save that
+                        // did not complete.
+                        let restored = store.save(&previous).is_ok();
+                        self.sync_share_status();
+                        self.state.notice = Some(Notice::error(if restored {
+                            format!("settings not saved: {error}")
+                        } else {
+                            format!(
+                                "settings not saved: {error}; the previous settings could not be restored"
+                            )
+                        }));
+                        return;
+                    }
+                    if let Ok(snapshot) = self.client.sharing_status() {
+                        self.state.apply_sharing_snapshot(snapshot);
                     }
                 }
+                self.state.commit_settings();
                 self.state.notice = Some(Notice::info("settings saved"));
             }
             Err(error) => {
@@ -1048,11 +1057,12 @@ impl App {
                 }
             }
             Err(error) => {
+                // A timeout says only that we do not know the state. Keep the
+                // owner view (and the credentials in memory) so another `s`
+                // still sends ShareStop; never claim the listener is gone.
                 let ended = matches!(
                     error,
-                    ClientError::Disconnected(_)
-                        | ClientError::Timeout(_)
-                        | ClientError::WriteUncertain(_)
+                    ClientError::Disconnected(_) | ClientError::WriteUncertain(_)
                 ) || matches!(
                     error.code(),
                     Some(
@@ -1065,6 +1075,10 @@ impl App {
                         self.state.view = View::Stream;
                     }
                     self.state.notice = Some(Notice::error(format!("sharing stopped: {error}")));
+                } else {
+                    self.state.notice = Some(Notice::error(format!(
+                        "sharing status is unknown: {error}; sharing may still be on — press s to stop it"
+                    )));
                 }
             }
         }
