@@ -148,6 +148,9 @@ pub struct Engine {
     socket: PathBuf,
     state: Mutex<State>,
     clients: Mutex<HashMap<u64, ClientRecord>>,
+    /// Local connections whose reader has observed EOF. Persisted so a queued
+    /// request cannot act after its connection ended.
+    dead_connections: Mutex<HashSet<u64>>,
     client_count: AtomicUsize,
     next_client_id: AtomicU64,
     next_waiter_id: AtomicU64,
@@ -178,6 +181,7 @@ impl Engine {
                 shutting_down: false,
             }),
             clients: Mutex::new(HashMap::new()),
+            dead_connections: Mutex::new(HashSet::new()),
             client_count: AtomicUsize::new(0),
             next_client_id: AtomicU64::new(1),
             next_waiter_id: AtomicU64::new(1),
@@ -1400,6 +1404,16 @@ impl Engine {
         client_id: u64,
         params: ShareStartParams,
     ) -> Result<ResponseData, ErrorBody> {
+        // Hold the liveness guard until the session is registered: an EOF
+        // notification either arrives before this check or waits and then
+        // stops the newly registered session.
+        let dead = self.dead_connections.lock().expect("dead connections lock");
+        if dead.contains(&client_id) {
+            return Err(ErrorBody::new(
+                ErrorCode::BadRequest,
+                "the enabling terminal connection has closed",
+            ));
+        }
         let (kind, _) = self.identity(client_id);
         if kind != ClientKind::Human {
             return Err(ErrorBody::new(
@@ -1445,6 +1459,7 @@ impl Engine {
             ));
         }
         drop(guard);
+        drop(dead);
         // Only the new session's checked devices may be visible.
         self.clear_shared_instances();
         self.refresh_shared_instances(&prepared.session);
@@ -1455,6 +1470,10 @@ impl Engine {
     /// session, revoke immediately instead of waiting for the request handler
     /// (which may be blocked draining a device).
     pub fn owner_connection_lost(&self, client_id: u64) {
+        self.dead_connections
+            .lock()
+            .expect("dead connections lock")
+            .insert(client_id);
         let owns = self
             .sharing
             .lock()
@@ -1464,6 +1483,15 @@ impl Engine {
         if owns {
             self.stop_sharing();
         }
+    }
+
+    /// Whether this local connection's reader has ended. Queued requests are
+    /// refused so they cannot mutate state after the client is gone.
+    pub fn connection_is_dead(&self, client_id: u64) -> bool {
+        self.dead_connections
+            .lock()
+            .expect("dead connections lock")
+            .contains(&client_id)
     }
 
     /// Stop sharing: close the listener, disconnect every remote client and

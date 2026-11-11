@@ -322,6 +322,19 @@ fixed with tests:
   PTY-recycling replacement test is `#[ignore]`d because path reuse is not
   guaranteed, with deterministic regular-file identity tests in its place.
 
+### Fifth iterative review fixes
+
+- **Connection EOF is remembered, not only acted on.** Every local connection
+  whose reader ends is recorded; queued requests are refused and `ShareStart`
+  cannot register a session after EOF. The liveness guard is held through
+  session registration, so a late notification stops the new session.
+- **Exclusive cleanup owns its own descriptor.** The shared token duplicates
+  the descriptor, so either drop order clears `TIOCEXCL` on the right tty and
+  never on a reused descriptor. The regression test covers both orders.
+- **Changing speed preserves framing and flow control**, and break start/stop
+  use `TIOCSBRK`/`TIOCCBRK` rather than a pulse and a no-op. Tests extend
+  `framing_setters_are_reflected_by_getters`.
+
 ### Fourth iterative review fixes
 
 - **Owner liveness no longer depends on request-queue backpressure.** The

@@ -148,6 +148,9 @@ fn handle_connection(engine: Arc<Engine>, stream: UnixStream, uid: u32) {
         crossbeam_channel::select! {
             recv(request_rx) -> message => match message {
                 Ok(Some(Ok(request))) => {
+                    if engine.connection_is_dead(client_id) {
+                        break;
+                    }
                     let id = request.id;
                     let message = match request.request {
                         // Enqueue the write on this thread (arrival order) and

@@ -16,7 +16,9 @@ use serialport::{DataBits, FlowControl, Parity, StopBits};
 /// configuration are done here so the descriptor's identity is known before
 /// termios is touched.
 struct ExclusiveToken {
-    fd: std::os::unix::io::RawFd,
+    // Owns a duplicate descriptor, so cleanup never targets a closed or
+    // reused number after the original handle goes away.
+    file: File,
 }
 
 impl Drop for ExclusiveToken {
@@ -24,7 +26,7 @@ impl Drop for ExclusiveToken {
         // Only the last serial handle (original or clone) drops this token.
         // SAFETY: TIOCNXCL takes no argument for this valid descriptor.
         let _ = unsafe {
-            libc::ioctl(self.fd, 0x540D /* TIOCNXCL */)
+            libc::ioctl(self.file.as_raw_fd(), 0x540D /* TIOCNXCL */)
         };
     }
 }
@@ -207,7 +209,7 @@ impl serialport::SerialPort for PosixSerial {
         self.timeout
     }
     fn set_baud_rate(&mut self, baud: u32) -> serialport::Result<()> {
-        configure_termios(&self.file, baud).map_err(|error| {
+        set_speed(&self.file, baud).map_err(|error| {
             serialport::Error::new(
                 serialport::ErrorKind::Io(io::ErrorKind::Other),
                 error.to_string(),
@@ -344,14 +346,23 @@ impl serialport::SerialPort for PosixSerial {
         }))
     }
     fn set_break(&self) -> serialport::Result<()> {
-        // SAFETY: tcsendbreak on this valid descriptor.
-        if unsafe { libc::tcsendbreak(self.file.as_raw_fd(), 0) } != 0 {
+        // SAFETY: TIOCSBRK takes no argument for this valid descriptor.
+        if unsafe {
+            libc::ioctl(self.file.as_raw_fd(), 0x5427 /* TIOCSBRK */)
+        } != 0
+        {
             return Err(to_serial_error(io::Error::last_os_error()));
         }
         Ok(())
     }
     fn clear_break(&self) -> serialport::Result<()> {
-        // A sent break ends by itself; there is no separate clear operation.
+        // SAFETY: TIOCCBRK takes no argument for this valid descriptor.
+        if unsafe {
+            libc::ioctl(self.file.as_raw_fd(), 0x5428 /* TIOCCBRK */)
+        } != 0
+        {
+            return Err(to_serial_error(io::Error::last_os_error()));
+        }
         Ok(())
     }
 }
@@ -600,6 +611,22 @@ struct Termios2 {
     c_ospeed: u32,
 }
 
+fn set_speed(file: &File, baud: u32) -> io::Result<()> {
+    use nix::sys::termios::{cfsetispeed, cfsetospeed, tcgetattr, tcsetattr, SetArg};
+    if let Some(rate) = baud_rate(baud) {
+        let mut settings =
+            tcgetattr(file).map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+        cfsetispeed(&mut settings, rate)
+            .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+        cfsetospeed(&mut settings, rate)
+            .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+        tcsetattr(file, SetArg::TCSANOW, &settings)
+            .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+        return Ok(());
+    }
+    set_arbitrary_baud(file, baud)
+}
+
 fn set_arbitrary_baud(file: &File, baud: u32) -> io::Result<()> {
     const TCGETS2: libc::c_ulong = 0x802C_542A;
     const TCSETS2: libc::c_ulong = 0x402C_542B;
@@ -710,7 +737,7 @@ pub fn open_serial_checked(
     }
     let port = PosixSerial {
         exclusive: Arc::new(ExclusiveToken {
-            fd: file.as_raw_fd(),
+            file: file.try_clone()?,
         }),
         file: Arc::new(file),
         baud,
@@ -920,6 +947,20 @@ mod tests {
         assert!(second.is_err(), "a live handle must stay exclusive");
         drop(port);
         open_serial(&path, 115_200).expect("reopen after all handles drop");
+
+        // Reverse drop order: the original goes first and the clone's token
+        // must still own a valid descriptor for cleanup.
+        let original = open_serial(&path, 115_200).expect("reopen");
+        let clone = original.port.try_clone().expect("clone");
+        drop(original);
+        let second = nix::fcntl::open(
+            path.as_str(),
+            nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NOCTTY,
+            nix::sys::stat::Mode::empty(),
+        );
+        assert!(second.is_err(), "the clone must remain exclusive");
+        drop(clone);
+        open_serial(&path, 115_200).expect("reopen after reverse drop order");
         drop(slave);
     }
 
@@ -973,6 +1014,13 @@ mod tests {
             port.data_bits().expect("bits getter"),
             serialport::DataBits::Eight
         );
+        // Changing speed must not silently reset framing.
+        port.set_baud_rate(9_600).expect("baud");
+        assert_eq!(port.stop_bits().expect("stop getter"), StopBits::Two);
+
+        // Break start/stop reach the device instead of being a pulse/no-op.
+        port.set_break().expect("start break");
+        port.clear_break().expect("clear break");
     }
 
     #[test]
