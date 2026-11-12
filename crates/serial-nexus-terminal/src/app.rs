@@ -756,7 +756,15 @@ impl App {
         // Stage the preferences but do not publish them until the core has
         // accepted the checklist. A failed core step leaves the live file
         // exactly as it was, with no restore write to fail.
-        let previous_file = store.snapshot().ok().flatten();
+        let previous_file = match store.snapshot() {
+            Ok(file) => file,
+            Err(error) => {
+                self.state.notice = Some(Notice::error(format!(
+                    "settings not saved: the current settings could not be read: {error}"
+                )));
+                return;
+            }
+        };
         let mut staged = Some(match store.stage(&draft) {
             Ok(staged) => staged,
             Err(error) => {

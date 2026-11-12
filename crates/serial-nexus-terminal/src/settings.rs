@@ -219,19 +219,7 @@ fn write_staging_bytes(temporary: &Path, bytes: &[u8]) -> Result<(), SettingsErr
 
 /// Write `text` to an exclusively created staging file.
 fn write_staging(temporary: &Path, text: &str) -> Result<(), SettingsError> {
-    let mut staging = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(temporary)?;
-    if let Err(error) = staging
-        .write_all(text.as_bytes())
-        .and_then(|()| staging.sync_all())
-    {
-        drop(staging);
-        let _ = fs::remove_file(temporary);
-        return Err(error.into());
-    }
-    Ok(())
+    write_staging_bytes(temporary, text.as_bytes())
 }
 
 /// The staging file next to `path`. The name is unique to this process and

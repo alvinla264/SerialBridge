@@ -219,6 +219,15 @@ pub fn prepare(
     Ok(Prepared { session, info })
 }
 
+fn mark_expired(state: &mut SessionState, expired: &mut Vec<String>) {
+    for entry in state.devices.values_mut() {
+        if !entry.expired && !entry.identity.still_valid() {
+            entry.expired = true;
+            expired.push(entry.identity.canonical.clone());
+        }
+    }
+}
+
 impl SharingSession {
     pub fn id(&self) -> &str {
         &self.id
@@ -330,12 +339,7 @@ impl SharingSession {
         // Mark vanished entries expired first, then drop them; otherwise a
         // sequence of unplugged checks retains descriptors without bound.
         let mut expired = Vec::new();
-        for entry in state.devices.values_mut() {
-            if !entry.expired && !entry.identity.still_valid() {
-                entry.expired = true;
-                expired.push(entry.identity.canonical.clone());
-            }
-        }
+        mark_expired(&mut state, &mut expired);
         state.devices.retain(|_, entry| !entry.expired);
         let live = state.devices.len();
         let mut additions = 0;
@@ -374,12 +378,7 @@ impl SharingSession {
     ) -> Result<(Vec<String>, Vec<String>), ErrorBody> {
         let mut state = self.state.lock().expect("share state lock");
         let mut expired = Vec::new();
-        for entry in state.devices.values_mut() {
-            if !entry.expired && !entry.identity.still_valid() {
-                entry.expired = true;
-                expired.push(entry.identity.canonical.clone());
-            }
-        }
+        mark_expired(&mut state, &mut expired);
         let keep: std::collections::HashSet<String> = identities
             .iter()
             .map(|identity| identity.canonical.clone())
@@ -501,12 +500,7 @@ impl SharingSession {
     pub fn expire_invalid(&self) -> Vec<String> {
         let mut state = self.state.lock().expect("share state lock");
         let mut expired = Vec::new();
-        for entry in state.devices.values_mut() {
-            if !entry.expired && !entry.identity.still_valid() {
-                entry.expired = true;
-                expired.push(entry.identity.canonical.clone());
-            }
-        }
+        mark_expired(&mut state, &mut expired);
         expired
     }
 
