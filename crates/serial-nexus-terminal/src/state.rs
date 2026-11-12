@@ -1328,8 +1328,16 @@ impl AppState {
             for path in previous.difference(&next) {
                 self.draft_checked.remove(path);
             }
-            self.sharing.pending_checked = next.into_iter().collect();
-            self.reconcile_share_checks(&self.detected_local_identities());
+            let detected = self.detected_local_identities();
+            self.sharing.pending_checked = Checklist::new();
+            for device in &snapshot.checked {
+                if let Some(identity) = detected.get(&device.path) {
+                    self.sharing
+                        .pending_checked
+                        .insert_with_identity(device.path.clone(), identity.clone());
+                }
+            }
+            self.reconcile_share_checks(&detected);
         }
         // An inactive snapshot says only that sharing is off; the session-only
         // checked selection stays for this launch, as an explicit stop does.
