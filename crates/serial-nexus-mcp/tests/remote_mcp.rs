@@ -214,8 +214,12 @@ fn reply(response: &Value) -> (String, bool) {
 fn assert_no_secret(session: &McpSession, text: &str, info: &ShareSessionInfo) {
     assert!(!text.contains(&info.ai.credential), "secret in {text}");
     assert!(!text.contains(&info.human.credential), "secret in {text}");
-    assert!(!session.stderr_text().contains(&info.ai.credential));
-    assert!(!session.stderr_text().contains(&info.human.credential));
+    // stderr is captured as it arrives; give the collector a moment so this
+    // check can see anything the server has already written.
+    std::thread::sleep(Duration::from_millis(50));
+    let stderr = session.stderr_text();
+    assert!(!stderr.contains(&info.ai.credential), "secret in stderr");
+    assert!(!stderr.contains(&info.human.credential), "secret in stderr");
 }
 
 #[test]
@@ -696,7 +700,7 @@ fn rotated_credentials_are_reported_and_a_repair_is_used_on_the_next_call() {
 }
 
 #[test]
-fn concurrent_local_and_remote_writes_keep_each_request_whole() {
+fn concurrent_remote_human_and_ai_writes_keep_each_request_whole() {
     let mut device = SimulatedDevice::new();
     let host = SharedHost::start(std::slice::from_ref(&device.path));
     let peers = write_peers(&host.directory, vec![peer_entry(&host.info, &host.info.ai)]);
@@ -1249,4 +1253,25 @@ fn an_abrupt_core_loss_during_a_remote_write_is_uncertain_and_not_replayed() {
         device.read_for(Duration::from_millis(200)).is_empty(),
         "no fallback write may reach the device"
     );
+}
+
+#[test]
+fn the_stderr_capture_sees_writes_while_the_server_is_still_running() {
+    // The secrecy assertions read stderr before the server exits, so the
+    // capture must publish as it arrives rather than at EOF.
+    let (_directory, socket) = start_core(Duration::from_secs(30));
+    let session = spawn(&socket, Path::new("/nonexistent/peers.json"));
+    let marker = "SER14-STDERR-MARKER";
+    {
+        let mut stderr = std::fs::OpenOptions::new()
+            .append(true)
+            .open(format!("/proc/{}/fd/2", session.pid()))
+            .expect("open the running server's stderr");
+        stderr.write_all(marker.as_bytes()).expect("write marker");
+        stderr.flush().ok();
+    }
+    wait_until(Duration::from_secs(5), || {
+        session.stderr_text().contains(marker)
+    });
+    assert!(session.stderr_text().contains(marker));
 }

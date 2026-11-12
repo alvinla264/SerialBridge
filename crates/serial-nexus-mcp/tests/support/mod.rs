@@ -220,11 +220,20 @@ impl McpSession {
         {
             let buffer = Arc::clone(&stderr_buffer);
             std::thread::spawn(move || {
-                let mut reader = BufReader::new(stderr);
-                let mut text = String::new();
-                let _ = reader.read_to_string(&mut text);
-                if let Ok(mut guard) = buffer.lock() {
-                    guard.push_str(&text);
+                // Publish stderr as it arrives, not only at exit: a secrecy
+                // assertion made while the server is still running must be
+                // able to see what it has already written.
+                let mut reader = stderr;
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match reader.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => {
+                            if let Ok(mut text) = buffer.lock() {
+                                text.push_str(&String::from_utf8_lossy(&chunk[..read]));
+                            }
+                        }
+                    }
                 }
             });
         }
@@ -347,6 +356,11 @@ impl McpSession {
                 .to_string(),
             structured: result.get("structuredContent").cloned(),
         }
+    }
+
+    /// The server process id, for tests that act on it (e.g. its stderr).
+    pub fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     pub fn stderr_text(&self) -> String {

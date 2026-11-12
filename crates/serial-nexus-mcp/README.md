@@ -269,6 +269,10 @@ endpoint, a credential misplaced into a file field and never echoed, a remote
 path not resolved locally, and a rotated credential recovered by updating the
 file.
 
+The stderr secrecy assertions read the running server's output, so the test
+harness publishes stderr as it arrives (proven by a test that writes to the
+live process's stderr) rather than only when the server exits.
+
 Two hosts that share the *same* device path are kept apart end to end: each
 core runs in a private mount namespace with its own PTY bound over one shared
 placeholder, and writes, read history and session state stay with the endpoint
