@@ -114,12 +114,14 @@ impl Checklist {
         self.entries.contains_key(path)
     }
 
-    pub fn insert(&mut self, path: String) -> bool {
-        self.entries.insert(path, String::new()).is_none()
-    }
-
     pub fn insert_with_identity(&mut self, path: String, identity: String) -> bool {
-        self.entries.insert(path, identity).is_none()
+        use std::collections::btree_map::Entry;
+        if let Entry::Vacant(entry) = self.entries.entry(path) {
+            entry.insert(identity);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn remove(&mut self, path: &str) -> bool {
@@ -961,6 +963,9 @@ impl AppState {
     /// The buttons the sidebar can draw at its current height, in drawing
     /// order. The navigation uses the same list as the renderer.
     pub fn sidebar_buttons(&self) -> Vec<SidebarButton> {
+        if self.cols < 8 || self.rows < 2 {
+            return Vec::new();
+        }
         if self.rows >= 4 {
             vec![
                 SidebarButton::Share,
@@ -990,7 +995,11 @@ impl AppState {
     /// Move the sidebar selection over the devices and the visible buttons.
     pub fn select_delta(&mut self, delta: i32) {
         let buttons = self.sidebar_buttons();
-        let last = self.devices.len() + buttons.len() - 1;
+        let count = self.devices.len() + buttons.len();
+        if count == 0 {
+            return;
+        }
+        let last = count - 1;
         let current = match self.selected_button {
             Some(button) => buttons
                 .iter()
@@ -2052,6 +2061,15 @@ mod sharing_tests {
             !state.draft_checked.contains("/dev/ttyUSB0"),
             "a different node at the reused path needs a new check"
         );
+    }
+
+    #[test]
+    fn sidebar_navigation_has_no_controls_the_layout_cannot_draw() {
+        let mut state = AppState::new(10, 7);
+        assert!(state.sidebar_buttons().is_empty());
+        state.select_index(0);
+        state.select_delta(1);
+        assert_eq!(state.selected_button(), None);
     }
 
     #[test]
