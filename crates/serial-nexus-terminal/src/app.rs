@@ -873,6 +873,7 @@ impl App {
                                 self.state.sharing.clear_session();
                                 self.state.sharing.pending_checked =
                                     original_pending_checked.clone();
+                                self.state.draft_checked = original_pending_checked.clone();
                                 self.state.close_pairing_view();
                                 self.state.notice = Some(Notice::error(format!(
                                     "settings not saved: {error}; checklist rollback failed and sharing was stopped: {rollback_error}"
@@ -1095,6 +1096,7 @@ impl App {
         let result = self.connect_remote(&form);
         match result {
             Ok((id, label)) => {
+                let existing_notice = self.state.notice.clone();
                 self.state.remote_labels.insert(id, label.clone());
                 self.state.connect = None;
                 self.show_live_stream();
@@ -1102,13 +1104,21 @@ impl App {
                 let refresh_failures = self.refresh_remotes();
                 if self.remotes.iter().any(|link| link.id == id) {
                     if refresh_failures.is_empty() {
-                        self.state.notice = Some(Notice::info(format!(
-                            "connected to {label}: its checked devices are in the sidebar"
-                        )));
+                        if existing_notice.is_none() || self.state.notice == existing_notice {
+                            self.state.notice = Some(Notice::info(format!(
+                                "connected to {label}: its checked devices are in the sidebar"
+                            )));
+                        }
                     } else {
+                        let mut notices = refresh_failures;
+                        if let Some(Notice { text, .. }) = existing_notice {
+                            if !notices.iter().any(|notice| notice == &text) {
+                                notices.insert(0, text);
+                            }
+                        }
                         self.state.notice = Some(Notice::error(format!(
                             "connected to {label}; {}",
-                            refresh_failures.join("; ")
+                            notices.join("; ")
                         )));
                     }
                 }
