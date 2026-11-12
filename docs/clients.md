@@ -277,7 +277,8 @@ Nothing listens on the network until it is started deliberately.
 
 1. Open Settings and type the interface address and port the host should listen
    on: one concrete IPv4 or IPv6 address (for example `192.168.1.20` or `::1`).
-   A wildcard such as `0.0.0.0` or `::` is refused. The address and port are
+   A link-local IPv6 address carries its interface index, for example
+   `fe80::1%3`. A wildcard such as `0.0.0.0` or `::` is refused. The address and port are
    saved preferences; the device checklist is not.
 2. Tick the detected devices to share. A device does not need to be open by the
    host, and at least one must be ticked before sharing can start. `Space` or

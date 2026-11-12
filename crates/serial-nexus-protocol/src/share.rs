@@ -46,11 +46,30 @@ pub const AUTH_TIMEOUT_SECS: u64 = 5;
 pub struct ShareBind {
     pub address: IpAddr,
     pub port: u16,
+    /// IPv6 scope/interface index for a link-local address; 0 when unused.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub scope_id: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 impl ShareBind {
     pub fn new(address: IpAddr, port: u16) -> Self {
-        Self { address, port }
+        Self {
+            address,
+            port,
+            scope_id: 0,
+        }
+    }
+
+    pub fn with_scope(address: IpAddr, port: u16, scope_id: u32) -> Self {
+        Self {
+            address,
+            port,
+            scope_id,
+        }
     }
 
     /// Refuse addresses that would listen on every interface or that are not
@@ -81,7 +100,12 @@ impl ShareBind {
     }
 
     pub fn socket_addr(&self) -> SocketAddr {
-        SocketAddr::new(self.address, self.port)
+        match self.address {
+            IpAddr::V6(address) if self.scope_id != 0 => SocketAddr::V6(
+                std::net::SocketAddrV6::new(address, self.port, 0, self.scope_id),
+            ),
+            address => SocketAddr::new(address, self.port),
+        }
     }
 }
 

@@ -221,31 +221,10 @@ impl TuiSession {
     /// Screen text safe to print: pairing credentials never reach test logs.
     /// Wrapped credential fragments have no marker of their own, so a pairing
     /// screen is redacted as a whole.
-    fn redacted(text: &str) -> String {
-        if text.contains("credential:")
-            || text.contains("Human terminal pairing")
-            || text.contains("MCP (AI) pairing")
-        {
-            return "[screen redacted: pairing credentials may be visible]".to_string();
-        }
-        // A wrapped credential can be scrolled away from its label. Hide any
-        // long base64-like run (credentials and CA chunks) instead.
-        text.lines()
-            .map(|line| {
-                let secret = line.split_whitespace().any(|word| {
-                    word.len() >= 24
-                        && word.chars().all(|ch| {
-                            ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '-' | '_')
-                        })
-                });
-                if secret {
-                    "[redacted]".to_string()
-                } else {
-                    line.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+    fn redacted(_text: &str) -> String {
+        // Pairing screens can wrap a credential so that no label survives.
+        // Omit screen text entirely rather than risk printing a secret.
+        "[screen omitted: it may contain pairing credentials]".to_string()
     }
 
     /// Wait for a condition on the whole screen, then keep going.

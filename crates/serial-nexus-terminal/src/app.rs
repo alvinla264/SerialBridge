@@ -2,7 +2,7 @@
 //! not depend on a real terminal.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
@@ -688,6 +688,24 @@ impl App {
         }
     }
 
+    /// Parse a concrete IPv4/IPv6 address, allowing an IPv6 zone suffix such
+    /// as `fe80::1%3` (the interface index).
+    fn parse_address(text: &str) -> Result<(IpAddr, u32), String> {
+        if let Ok(address) = text.parse::<IpAddr>() {
+            return Ok((address, 0));
+        }
+        let (address, interface) = text
+            .rsplit_once('%')
+            .ok_or_else(|| "the address is not an IPv4 or IPv6 address".to_string())?;
+        let address: std::net::Ipv6Addr = address
+            .parse()
+            .map_err(|_| "the address is not an IPv4 or IPv6 address".to_string())?;
+        let scope = interface
+            .parse::<u32>()
+            .map_err(|_| format!("the IPv6 scope {interface:?} is not an interface index"))?;
+        Ok((IpAddr::V6(address), scope))
+    }
+
     /// Save the draft settings and checklist, then keep the draft and go back
     /// to the shown device's live stream.
     ///
@@ -697,13 +715,11 @@ impl App {
     /// the settings, so nothing is claimed that did not happen.
     fn save_settings(&mut self) {
         self.state.end_settings_edit();
-        let address = self.state.draft.share_address.trim().to_string();
-        let address: IpAddr = match address.parse() {
-            Ok(address) => address,
-            Err(_) => {
-                self.state.notice = Some(Notice::error(
-                    "settings not saved: the share address is not an IPv4 or IPv6 address",
-                ));
+        let address_text = self.state.draft.share_address.trim().to_string();
+        let (address, scope) = match Self::parse_address(&address_text) {
+            Ok(parsed) => parsed,
+            Err(message) => {
+                self.state.notice = Some(Notice::error(format!("settings not saved: {message}")));
                 return;
             }
         };
@@ -716,11 +732,12 @@ impl App {
                 return;
             }
         };
-        if let Err(message) = ShareBind::new(address, port).validate() {
+        let bind = ShareBind::with_scope(address, port, scope);
+        if let Err(message) = bind.validate() {
             self.state.notice = Some(Notice::error(format!("settings not saved: {message}")));
             return;
         }
-        self.state.draft.share_address = address.to_string();
+        self.state.draft.share_address = address_text;
         self.state.draft.share_port = port;
 
         // A replacement at a reused path must be checked again; stale UI state
@@ -957,16 +974,8 @@ impl App {
 
     /// The saved sharing endpoint, validated as one concrete address.
     fn share_bind(&self) -> Result<ShareBind, String> {
-        let address: IpAddr = self
-            .state
-            .settings
-            .share_address
-            .trim()
-            .parse()
-            .map_err(|_| {
-                "the share address is not an IPv4 or IPv6 address (set it in Settings)".to_string()
-            })?;
-        let bind = ShareBind::new(address, self.state.settings.share_port);
+        let (address, scope) = Self::parse_address(self.state.settings.share_address.trim())?;
+        let bind = ShareBind::with_scope(address, self.state.settings.share_port, scope);
         bind.validate()?;
         Ok(bind)
     }
@@ -1087,11 +1096,7 @@ impl App {
     /// Dial and authenticate one host, then register its endpoint. Every
     /// failure leaves nothing behind.
     fn connect_remote(&mut self, form: &ConnectForm) -> Result<(EndpointId, String), String> {
-        let address: IpAddr = form
-            .address
-            .trim()
-            .parse()
-            .map_err(|_| "the host address is not an IPv4 or IPv6 address".to_string())?;
+        let (address, scope) = Self::parse_address(form.address.trim())?;
         let port: u16 = form
             .port
             .trim()
@@ -1112,7 +1117,7 @@ impl App {
         }
         let host_name = address.to_string();
         let paired = PairedHost {
-            address: SocketAddr::new(address, port),
+            address: ShareBind::with_scope(address, port, scope).socket_addr(),
             host_name,
             ca_cert_der_b64: form.ca.trim().to_string(),
             host_cert_fingerprint_sha256: fingerprint,
