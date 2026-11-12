@@ -129,11 +129,7 @@ impl SettingsStore {
 
     /// Rename a staged file onto the live settings file.
     pub fn publish(&self, staging: PathBuf) -> Result<(), SettingsError> {
-        if let Err(error) = fs::rename(&staging, &self.path) {
-            let _ = fs::remove_file(&staging);
-            return Err(error.into());
-        }
-        Ok(())
+        publish_staging(&staging, &self.path)
     }
 
     /// Drop a staged file without touching the live settings.
@@ -157,8 +153,9 @@ impl SettingsStore {
         match snapshot {
             Some(bytes) => {
                 self.create_directory()?;
-                let text = String::from_utf8_lossy(bytes);
-                write_atomic(&self.path, &staging_path(&self.path), &text)
+                let staging = staging_path(&self.path);
+                write_staging_bytes(&staging, bytes)?;
+                publish_staging(&staging, &self.path)
             }
             None => match fs::remove_file(&self.path) {
                 Ok(()) => Ok(()),
@@ -196,7 +193,24 @@ impl SettingsStore {
 /// redirect the write or make it destroy another file.
 fn write_atomic(path: &Path, temporary: &Path, text: &str) -> Result<(), SettingsError> {
     write_staging(temporary, text)?;
+    publish_staging(temporary, path)
+}
+
+fn publish_staging(temporary: &Path, path: &Path) -> Result<(), SettingsError> {
     if let Err(error) = fs::rename(temporary, path) {
+        let _ = fs::remove_file(temporary);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+fn write_staging_bytes(temporary: &Path, bytes: &[u8]) -> Result<(), SettingsError> {
+    let mut staging = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temporary)?;
+    if let Err(error) = staging.write_all(bytes).and_then(|()| staging.sync_all()) {
+        drop(staging);
         let _ = fs::remove_file(temporary);
         return Err(error.into());
     }

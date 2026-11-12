@@ -1893,6 +1893,24 @@ mod sharing_tests {
     }
 
     #[test]
+    fn sidebar_navigation_matches_the_drawn_button_rows() {
+        let mut state = state_with_devices();
+        for rows in 2..8 {
+            state.resize(rows, 80);
+            let drawn = crate::render::sidebar(ratatui::layout::Rect::new(0, 0, 20, rows as u16))
+                .expect("sidebar")
+                .share
+                .height
+                > 0;
+            assert_eq!(
+                state.sidebar_buttons().len(),
+                if drawn { 3 } else { 1 },
+                "navigation and drawing agree at {rows} rows"
+            );
+        }
+    }
+
+    #[test]
     fn a_short_sidebar_navigates_only_the_buttons_it_draws() {
         let mut state = state_with_devices();
         state.resize(2, 80);

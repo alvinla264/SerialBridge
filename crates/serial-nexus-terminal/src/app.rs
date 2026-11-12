@@ -808,11 +808,26 @@ impl App {
                             return;
                         }
                     }
-                    // The core did not confirm the new checklist: put the old
-                    // preferences back and keep the draft for a retry.
-                    let _ = store.restore(previous_file.as_deref());
+                    if uncertain {
+                        // The core may have applied the checklist and even a
+                        // follow-up status timed out. Do not claim failure or
+                        // restore the file; say the outcome is unknown.
+                        self.state.notice = Some(Notice::error(format!(
+                            "settings save is unknown: {error}; the core may have applied the checklist — check it and save again"
+                        )));
+                        return;
+                    }
+                    // A definite commit failure means the checklist was not
+                    // applied; put the previous preferences back.
+                    let restored = store.restore(previous_file.as_deref()).is_ok();
                     self.sync_share_status();
-                    self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
+                    self.state.notice = Some(Notice::error(if restored {
+                        format!("settings not saved: {error}")
+                    } else {
+                        format!(
+                            "settings not saved: {error}; the previous preferences could not be restored"
+                        )
+                    }));
                     return;
                 }
             }

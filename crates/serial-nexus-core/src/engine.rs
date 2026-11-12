@@ -1827,6 +1827,12 @@ impl Engine {
             ));
         }
         let identities = self.validated_shared_identities(&params.devices, &params.expected)?;
+        if identities.len() > MAX_SHARED_DEVICES {
+            return Err(ErrorBody::new(
+                ErrorCode::LimitExceeded,
+                format!("at most {MAX_SHARED_DEVICES} devices may be shared"),
+            ));
+        }
         let token = format!(
             "rep-{}",
             self.next_identity_token.fetch_add(1, Ordering::SeqCst)
@@ -1863,11 +1869,19 @@ impl Engine {
                 "the prepared checklist is no longer available; save again",
             ));
         };
-        let (expired, removed) = session.replace(prepared.identities)?;
+        self.apply_shared_identities(&session, prepared.identities)
+    }
+
+    fn apply_shared_identities(
+        &self,
+        session: &SharingSession,
+        identities: Vec<DeviceIdentity>,
+    ) -> Result<ResponseData, ErrorBody> {
+        let (expired, removed) = session.replace(identities)?;
         for path in expired.into_iter().chain(removed) {
-            self.revoke_path_everywhere(&path, &session);
+            self.revoke_path_everywhere(&path, session);
         }
-        self.refresh_shared_instances(&session);
+        self.refresh_shared_instances(session);
         Ok(ResponseData::Sharing(session.snapshot()))
     }
 
@@ -1884,14 +1898,9 @@ impl Engine {
             ));
         }
         let identities = self.validated_shared_identities(&params.devices, &params.expected)?;
-        let (expired, removed) = session.replace(identities)?;
         // Revoke while the removed instances still carry their shared marker;
         // revalidation needs it to detach remote clients and cancel waits.
-        for path in expired.into_iter().chain(removed) {
-            self.revoke_path_everywhere(&path, &session);
-        }
-        self.refresh_shared_instances(&session);
-        Ok(ResponseData::Sharing(session.snapshot()))
+        self.apply_shared_identities(&session, identities)
     }
 
     fn uncheck_shared_devices(
