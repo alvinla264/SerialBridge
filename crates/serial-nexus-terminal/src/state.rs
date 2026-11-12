@@ -376,7 +376,7 @@ impl Default for ConnectForm {
     }
 }
 
-/// One diagonal row of the sidebar: a host group heading or a device.
+/// One sidebar row: a host group heading or a device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SidebarRow {
     Group(EndpointId),
@@ -1107,10 +1107,10 @@ impl AppState {
         self.select_index(row);
     }
 
-    /// Add a freshly opened session, point the sidebar at it and show it. The
-    /// screen starts empty and is fed only by live events, so output is never
-    /// duplicated by a history snapshot racing the live subscription.
-    /// Add a freshly opened local session (tests and the local-only path).
+    /// Add a freshly opened local session (tests and the local-only path),
+    /// point the sidebar at it and show it. The screen starts empty and is fed
+    /// only by live events, so output is never duplicated by a history
+    /// snapshot racing the live subscription.
     pub fn add_session(
         &mut self,
         device_id: u64,

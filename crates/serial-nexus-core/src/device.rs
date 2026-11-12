@@ -384,6 +384,8 @@ pub enum DeviceEvent {
 /// A path alone is not an identity: a device can be unplugged and another one
 /// can reappear at the same path. Sharing stores this fingerprint when the
 /// owner checks a device and compares it again at authorization and open time.
+static NEXT_DEVICE_IDENTITY_TOKEN: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone)]
 pub struct DeviceIdentity {
     /// Canonical path used for every later lookup.
@@ -391,6 +393,9 @@ pub struct DeviceIdentity {
     dev: u64,
     ino: u64,
     rdev: u64,
+    /// Unique owner-visible token carried by clones of this pinned identity.
+    /// Unlike stat fields, it cannot match a later node that reuses an inode.
+    token: u64,
     /// Link count when captured. A node that has been unlinked (`nlink == 0`)
     /// is no longer the device at its path, even if the numbers are recycled.
     links: u64,
@@ -408,6 +413,7 @@ impl std::fmt::Debug for DeviceIdentity {
             .field("dev", &self.dev)
             .field("ino", &self.ino)
             .field("rdev", &self.rdev)
+            .field("token", &self.token)
             .field("links", &self.links)
             .finish_non_exhaustive()
     }
@@ -453,6 +459,7 @@ impl DeviceIdentity {
             dev: stat.st_dev,
             ino: stat.st_ino,
             rdev: stat.st_rdev,
+            token: NEXT_DEVICE_IDENTITY_TOKEN.fetch_add(1, Ordering::Relaxed),
             links: stat.st_nlink,
             holder: Arc::new(holder),
         }
@@ -485,7 +492,7 @@ impl DeviceIdentity {
     /// An opaque label for the wire; never contains a path from outside the
     /// session's own allowlist.
     pub fn describe(&self) -> String {
-        format!("dev={}:{} ino={}", self.dev, self.rdev, self.ino)
+        format!("identity-{}", self.token)
     }
 
     /// Compare the identity of an already-open descriptor with this one.

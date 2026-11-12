@@ -108,15 +108,6 @@ struct State {
 
 /// Resolve a device path to one identity: aliases and `..` must name the same
 /// open device. Falls back to the original string if resolution fails.
-/// A path may only be authorized for the node the owner selected. An absent
-/// expectation (older client) keeps the previous path-based behaviour.
-fn identity_matches_expected(identity: &DeviceIdentity, expected: Option<&String>) -> bool {
-    match expected {
-        Some(expected) => *expected == identity.describe(),
-        None => true,
-    }
-}
-
 fn identity_path(path: &str) -> String {
     std::fs::canonicalize(path)
         .map(|resolved| resolved.to_string_lossy().into_owned())
@@ -1629,13 +1620,29 @@ impl Engine {
                         ))
                     }
                 }
-            } else {
-                if !identity_matches_expected(&detected, expected_token) {
-                    return Err(ErrorBody::new(
-                        ErrorCode::DeviceFailed,
-                        format!("the device at {path} changed; check it again"),
-                    ));
+            } else if let Some(expected_token) = expected_token {
+                // Snapshot tokens identify a cloned pinned identity, not its
+                // reusable stat tuple. Resolve them only through discovery's
+                // current pinned identity cache.
+                let cached = self
+                    .detected_tokens
+                    .lock()
+                    .expect("detected tokens lock")
+                    .get(path)
+                    .map(|(_, identity)| identity)
+                    .filter(|identity| identity.describe() == *expected_token)
+                    .filter(|identity| identity.still_valid())
+                    .cloned();
+                match cached {
+                    Some(identity) if identity.canonical == detected.canonical => identity,
+                    _ => {
+                        return Err(ErrorBody::new(
+                            ErrorCode::DeviceFailed,
+                            format!("the device at {path} changed; check it again"),
+                        ))
+                    }
                 }
+            } else {
                 detected
             };
             let canonical = identity.canonical.clone();
@@ -2804,16 +2811,16 @@ mod identity_tests {
         let path_text = path.to_string_lossy().into_owned();
         let old = DeviceIdentity::capture(&path_text).expect("old");
         let expected = old.describe();
-        assert!(identity_matches_expected(&old, Some(&expected)));
+        assert_eq!(expected, old.clone().describe());
 
         std::fs::remove_file(&path).expect("unlink old node");
         std::fs::write(&path, b"b").expect("replacement node");
         let new = DeviceIdentity::capture(&path_text).expect("new");
-        assert!(
-            !identity_matches_expected(&new, Some(&expected)),
+        assert_ne!(
+            new.describe(),
+            expected,
             "a replacement must not inherit the selected identity"
         );
-        assert!(identity_matches_expected(&new, None));
     }
 
     #[test]

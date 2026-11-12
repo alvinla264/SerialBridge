@@ -448,13 +448,12 @@ fn a_failed_settings_save_applies_neither_the_preferences_nor_the_checklist() {
     let (fixture, devices) = Fixture::new();
     let mut app = fixture.app();
     let path = devices[0].path.clone();
+    let replacement_path = devices[1].path.clone();
     check_device(&mut app, &path);
     set_bind(&mut app, "127.0.0.1", 0);
     save(&mut app);
     start(&mut app);
 
-    std::fs::remove_file(&fixture.settings_path).expect("remove settings file");
-    std::fs::create_dir(&fixture.settings_path).expect("block the settings file");
     app.state.begin_settings();
     app.state.draft.local_echo = false;
     let index = app
@@ -462,9 +461,19 @@ fn a_failed_settings_save_applies_neither_the_preferences_nor_the_checklist() {
         .devices
         .iter()
         .position(|device| device.path == path)
-        .expect("detected");
+        .expect("checked device detected");
     app.state.settings_row = SETTINGS_FIXED_ROWS + index;
     assert_eq!(app.state.toggle_draft(), Some(false));
+    let replacement_index = app
+        .state
+        .devices
+        .iter()
+        .position(|device| device.path == replacement_path)
+        .expect("replacement device detected");
+    app.state.settings_row = SETTINGS_FIXED_ROWS + replacement_index;
+    assert_eq!(app.state.toggle_draft(), Some(true));
+    std::fs::remove_file(&fixture.settings_path).expect("remove settings file");
+    std::fs::create_dir(&fixture.settings_path).expect("block the settings file");
     save(&mut app);
 
     let notice = app.state.notice.as_ref().expect("the failure is shown");
@@ -489,9 +498,17 @@ fn a_failed_settings_save_applies_neither_the_preferences_nor_the_checklist() {
         "the prior core checklist is restored"
     );
     assert!(
-        !app.state.draft_checked.contains(&path),
-        "the draft is kept"
+        !app.state
+            .sharing
+            .pending_checked
+            .contains(&replacement_path),
+        "the failed new checklist is rolled back"
     );
+    assert!(
+        !app.state.draft_checked.contains(&path),
+        "the attempted draft is kept"
+    );
+    assert!(app.state.draft_checked.contains(&replacement_path));
     app.shutdown();
 }
 

@@ -401,8 +401,7 @@ fn empty_remote_endpoints(state: &AppState) -> Vec<EndpointId> {
 
 fn is_empty_remote_group(state: &AppState, row: SidebarRow) -> bool {
     matches!(row, SidebarRow::Group(endpoint)
-        if state.remote_labels.contains_key(&endpoint)
-            && !state.devices.iter().any(|device| device.endpoint == endpoint))
+        if empty_remote_endpoints(state).contains(&endpoint))
 }
 
 fn sidebar_device_list(sidebar: Sidebar, sticky_rows: usize) -> Rect {
@@ -564,15 +563,8 @@ fn draw_header(state: &AppState, buffer: &mut Buffer, area: Rect) {
 fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u16, u16)> {
     let sidebar = sidebar(rect)?;
     let list = sidebar.list;
-    let empty_remote_tags: Vec<String> = state
-        .remote_labels
-        .keys()
-        .filter(|endpoint| {
-            !state
-                .devices
-                .iter()
-                .any(|device| device.endpoint == **endpoint)
-        })
+    let empty_remote_tags: Vec<String> = empty_remote_endpoints(state)
+        .iter()
         .map(|endpoint| state.endpoint_tag(*endpoint))
         .collect();
     let empty_endpoints = empty_remote_endpoints(state);
