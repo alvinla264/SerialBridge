@@ -865,26 +865,6 @@ impl App {
             return;
         }
         self.state.drop_replaced_checks();
-        let detected = self.state.detected_local_identities();
-        let missing: Vec<String> = self
-            .state
-            .sharing
-            .pending_checked
-            .iter()
-            .filter(|path| !detected.contains_key(path.as_str()))
-            .cloned()
-            .collect();
-        if !missing.is_empty() {
-            for path in &missing {
-                self.state.sharing.pending_checked.remove(path);
-                self.state.draft_checked.remove(path);
-            }
-            self.state.notice = Some(Notice::error(format!(
-                "sharing not started: no captured identity for {}; refresh and check it again",
-                missing.join(", ")
-            )));
-            return;
-        }
         let devices: Vec<String> = self.state.sharing.pending_checked.iter().cloned().collect();
         if devices.is_empty() {
             self.state.notice = Some(Notice::error(

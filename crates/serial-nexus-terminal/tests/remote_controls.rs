@@ -117,18 +117,7 @@ impl Terminal {
 #[test]
 fn a_new_connection_does_not_hide_an_existing_host_disconnect() {
     let _guard = serial_test();
-    let local = TempDir::new().expect("local core");
-    let local_socket = local.path().join("local.sock");
-    let local_config = serial_nexus_core::CoreConfig {
-        socket: local_socket.clone(),
-        ..Default::default()
-    };
-    std::thread::spawn(move || {
-        let _ = serial_nexus_core::server::run(local_config);
-    });
-    support::wait_until(Duration::from_secs(5), || {
-        std::os::unix::net::UnixStream::connect(&local_socket).is_ok()
-    });
+    let (_local, local_socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
 
     let paths = Arc::new(Mutex::new(Vec::new()));
     let first = start_host(&[], Arc::clone(&paths));
@@ -159,18 +148,7 @@ fn a_new_connection_does_not_hide_an_existing_host_disconnect() {
 fn a_paired_terminal_opens_an_allowed_unopened_port_and_keeps_the_secret_out_of_the_settings_file()
 {
     let _guard = serial_test();
-    let local = TempDir::new().expect("local core");
-    let local_socket = local.path().join("local.sock");
-    let local_config = serial_nexus_core::CoreConfig {
-        socket: local_socket.clone(),
-        ..Default::default()
-    };
-    std::thread::spawn(move || {
-        let _ = serial_nexus_core::server::run(local_config);
-    });
-    support::wait_until(Duration::from_secs(5), || {
-        std::os::unix::net::UnixStream::connect(&local_socket).is_ok()
-    });
+    let (_local, local_socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
 
     let mut device = SimulatedDevice::new();
     let path = device.path.clone();

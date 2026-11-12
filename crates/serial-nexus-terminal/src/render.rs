@@ -1206,7 +1206,7 @@ fn draw_row(buffer: &mut Buffer, area: Rect, label: &str, value: &str, style: RS
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let text = row_text(label, value, area.width as usize);
+    let text = row_text(label, value, area.width as usize, RowOverflow::Label);
     put(buffer, area, 0, &text, style);
 }
 
@@ -1214,39 +1214,17 @@ fn draw_value_row(buffer: &mut Buffer, area: Rect, label: &str, value: &str, sty
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let text = row_text_label(label, value, area.width as usize);
+    let text = row_text(label, value, area.width as usize, RowOverflow::Value);
     put(buffer, area, 0, &text, style);
 }
 
-fn row_text(label: &str, value: &str, width: usize) -> String {
-    if value.is_empty() {
-        return fit(label, width);
-    }
-    let label_width = display_width(label) as usize;
-    let value_width = display_width(value) as usize;
-    if label_width + value_width < width {
-        let mut line = label.to_string();
-        line.push_str(&" ".repeat(width - label_width - value_width));
-        line.push_str(value);
-        fit(&line, width)
-    } else {
-        // Too narrow for both: the label wins, and the value is clipped rather
-        // than dropped. A sidebar this narrow must still name the device, and
-        // still show as much of its baud/control status as fits.
-        let keep = width.saturating_sub(label_width + 1);
-        if keep < 3 || label_width >= width {
-            return fit(label, width);
-        }
-        let mut line = label.to_string();
-        line.push(' ');
-        line.push_str(fit(value, keep).trim_end());
-        fit(&line, width)
-    }
+#[derive(Clone, Copy)]
+enum RowOverflow {
+    Label,
+    Value,
 }
 
-/// A settings row: the short value must stay visible even when the label has
-/// to give way.
-fn row_text_label(label: &str, value: &str, width: usize) -> String {
+fn row_text(label: &str, value: &str, width: usize, overflow: RowOverflow) -> String {
     if value.is_empty() {
         return fit(label, width);
     }
@@ -1258,15 +1236,31 @@ fn row_text_label(label: &str, value: &str, width: usize) -> String {
         line.push_str(value);
         return fit(&line, width);
     }
-    let keep = width.saturating_sub(value_width + 1);
-    let mut line = fit(label, keep).trim_end().to_string();
-    while display_width(&line) as usize > keep {
-        line.pop();
+    match overflow {
+        RowOverflow::Label => {
+            // Preserve the label and clip the value when both cannot fit.
+            let keep = width.saturating_sub(label_width + 1);
+            if keep < 3 || label_width >= width {
+                return fit(label, width);
+            }
+            let mut line = label.to_string();
+            line.push(' ');
+            line.push_str(fit(value, keep).trim_end());
+            fit(&line, width)
+        }
+        RowOverflow::Value => {
+            // Preserve a short value in settings rows, abbreviating the label.
+            let keep = width.saturating_sub(value_width + 1);
+            let mut line = fit(label, keep).trim_end().to_string();
+            while display_width(&line) as usize > keep {
+                line.pop();
+            }
+            line.push_str(&" ".repeat(keep.saturating_sub(display_width(&line) as usize)));
+            line.push(' ');
+            line.push_str(value);
+            fit(&line, width)
+        }
     }
-    line.push_str(&" ".repeat(keep.saturating_sub(display_width(&line) as usize)));
-    line.push(' ');
-    line.push_str(value);
-    fit(&line, width)
 }
 
 fn focus_title_style(focused: bool) -> RStyle {

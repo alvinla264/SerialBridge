@@ -111,9 +111,8 @@ impl SettingsStore {
     /// file the terminal loaded. The staging file is created exclusively, so
     /// an existing entry (even a symlink) cannot redirect the write.
     pub fn save(&self, settings: &TerminalSettings) -> Result<(), SettingsError> {
-        self.create_directory()?;
-        let text = serde_json::to_string_pretty(settings)? + "\n";
-        write_atomic(&self.path, &staging_path(&self.path), &text)
+        let staging = self.stage(settings)?;
+        self.publish(staging)
     }
 
     /// Write `settings` to a staging file and return it. The live file is
@@ -191,6 +190,7 @@ impl SettingsStore {
 /// Write `text` to `temporary`, then rename it onto `path`. The staging file
 /// is created exclusively, so an existing entry (even a symlink) cannot
 /// redirect the write or make it destroy another file.
+#[cfg(test)]
 fn write_atomic(path: &Path, temporary: &Path, text: &str) -> Result<(), SettingsError> {
     write_staging(temporary, text)?;
     publish_staging(temporary, path)
