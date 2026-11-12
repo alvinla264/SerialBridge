@@ -103,10 +103,7 @@ impl Target {
             Self::Local => value,
             Self::Remote(endpoint) => {
                 let mut object = value.as_object().cloned().unwrap_or_default();
-                object.insert(
-                    "remote_endpoint".into(),
-                    json!({ "address": endpoint.address.to_string(), "port": endpoint.port }),
-                );
+                object.insert("remote_endpoint".into(), json!(endpoint));
                 Value::Object(object)
             }
         }
@@ -1420,6 +1417,15 @@ mod tests {
         assert_eq!(local, "Permission denied (os error 13) (PermissionDenied)");
         let remote = describe_server_error(&body, None, true);
         assert!(remote.contains("the host owner has not shared this device"));
+    }
+
+    #[test]
+    fn structured_remote_endpoint_preserves_nonzero_scope() {
+        let endpoint = RemoteEndpoint::with_scope("fe80::20".parse().unwrap(), 7331, 3);
+        let value = Target::Remote(endpoint).attach(json!({"ok": true}));
+        assert_eq!(value["remote_endpoint"]["scope_id"], 3);
+        assert_eq!(value["remote_endpoint"]["address"], "fe80::20");
+        assert_eq!(value["remote_endpoint"]["port"], 7331);
     }
 
     #[test]

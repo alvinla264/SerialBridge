@@ -192,7 +192,8 @@ the same name could point at a different device. A path this client cannot
 match to a remote connection is an error, not a guess.
 
 Results from a remote endpoint say so (`on remote 192.0.2.10:7000`) and carry
-`structuredContent.remote_endpoint`; local results are unchanged. Device ids,
+`structuredContent.remote_endpoint` with the address, port and (for scoped IPv6)
+`scope_id`; local results are unchanged. Device ids,
 control and history are kept separately per endpoint, so two hosts that both
 share `/dev/ttyUSB0` never collide. Only devices the host checked are visible,
 and an uncheck or owner termination revokes access immediately.
