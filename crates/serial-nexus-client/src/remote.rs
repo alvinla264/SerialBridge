@@ -625,18 +625,7 @@ fn dispatch(
                 let _ = pending.tx.send(Err(ClientError::from(error)));
             }
         }
-        ServerMessage::Event { event } => {
-            subscribers.lock().expect("subscribers lock").retain(|tx| {
-                match tx.try_send(event.clone()) {
-                    Ok(()) => true,
-                    // A bounded subscriber that cannot keep up is dropped
-                    // instead of silently losing a revocation or close event.
-                    // Its receiver then reports disconnection, so the client
-                    // can drop that host visibly rather than trust stale rows.
-                    Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
-                }
-            });
-        }
+        ServerMessage::Event { event } => send_event_to_subscribers(subscribers, event),
     }
 }
 
@@ -660,6 +649,10 @@ fn fail(
     let event = Event::TransportClosed {
         reason: reason.to_string(),
     };
+    send_event_to_subscribers(subscribers, event);
+}
+
+fn send_event_to_subscribers(subscribers: &Arc<Mutex<Vec<Sender<Event>>>>, event: Event) {
     subscribers
         .lock()
         .expect("subscribers lock")

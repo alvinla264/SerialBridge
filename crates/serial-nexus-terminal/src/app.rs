@@ -1053,9 +1053,11 @@ impl App {
                 self.show_live_stream();
                 self.state.focus = Focus::Sidebar;
                 self.refresh_remotes();
-                self.state.notice = Some(Notice::info(format!(
-                    "connected to {label}: its checked devices are in the sidebar"
-                )));
+                if self.remotes.iter().any(|link| link.id == id) {
+                    self.state.notice = Some(Notice::info(format!(
+                        "connected to {label}: its checked devices are in the sidebar"
+                    )));
+                }
             }
             Err(error) => {
                 form.error = Some(error);
@@ -1097,7 +1099,7 @@ impl App {
             role: PairingRole::Human,
             credential: form.credential.trim().to_string(),
         };
-        let check = serial_nexus_client::RemoteClient::connect(
+        let remote_client = serial_nexus_client::RemoteClient::connect(
             &paired,
             &secret,
             Some("serial-nexus-terminal".to_string()),
@@ -1107,10 +1109,10 @@ impl App {
         let id = EndpointId(self.next_endpoint);
         self.next_endpoint += 1;
         let label = format!("Remote {}", paired.address);
-        let events = check.subscribe_bounded(1024);
+        let events = remote_client.subscribe_bounded(1024);
         self.remotes.push(RemoteLink {
             id,
-            client: check,
+            client: remote_client,
             events,
             expected_closes: HashSet::new(),
         });
