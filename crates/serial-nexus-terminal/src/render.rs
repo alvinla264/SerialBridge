@@ -1704,6 +1704,12 @@ mod tests {
         let area = Rect::new(0, 0, 80, 12);
         let mut buffer = Buffer::empty(area);
         let cursor = render(&state, &mut buffer, area).expect("selected device cursor");
+        assert!(
+            screen(&state, 80, 12)
+                .join("\\n")
+                .contains("Remote 192.0.2.10:7331"),
+            "the empty host keeps its own endpoint group"
+        );
         let lines = screen(&state, 80, 12);
         let drawn_row = lines
             .iter()
