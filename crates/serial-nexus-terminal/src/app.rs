@@ -846,10 +846,25 @@ impl App {
                     }
                     Err(rollback_error) => {
                         self.state.draft_checked = original_draft_checked.clone();
-                        self.sync_share_status();
-                        self.state.notice = Some(Notice::error(format!(
-                            "settings save is unknown: {error}; checklist rollback failed: {rollback_error}"
-                        )));
+                        // A failed compensation must not leave the attempted
+                        // checklist available to remote clients. Fail closed
+                        // by stopping sharing instead of retaining a partially
+                        // applied authorization set.
+                        match self.client.stop_sharing() {
+                            Ok(()) => {
+                                self.state.sharing.clear_session();
+                                self.state.close_pairing_view();
+                                self.state.notice = Some(Notice::error(format!(
+                                    "settings not saved: {error}; checklist rollback failed and sharing was stopped: {rollback_error}"
+                                )));
+                            }
+                            Err(stop_error) => {
+                                self.sync_share_status();
+                                self.state.notice = Some(Notice::error(format!(
+                                    "settings save is unknown: {error}; checklist rollback failed: {rollback_error}; stop sharing failed: {stop_error}"
+                                )));
+                            }
+                        }
                     }
                 }
             } else {

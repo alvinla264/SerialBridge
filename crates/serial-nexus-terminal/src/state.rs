@@ -1136,13 +1136,17 @@ impl AppState {
             endpoint,
             device_id,
         };
+        let (control_label, control_id) = control
+            .as_ref()
+            .map(|holder| (Some(short_holder(holder)), Some(holder.client_id)))
+            .unwrap_or((None, None));
         let session = Session {
             endpoint,
             device_id,
             path: path.clone(),
             baud,
-            control: control.as_ref().map(short_holder),
-            control_id: control.as_ref().map(|holder| holder.client_id),
+            control: control_label.clone(),
+            control_id,
             screen: Screen::with_scrollback(
                 self.rows,
                 self.cols,
@@ -1160,8 +1164,8 @@ impl AppState {
             device.open = true;
             device.device_id = Some(device_id);
             device.baud = Some(baud);
-            device.control = control.as_ref().map(short_holder);
-            device.control_id = control.as_ref().map(|holder| holder.client_id);
+            device.control = control_label;
+            device.control_id = control_id;
         } else {
             self.devices.push(DeviceEntry {
                 endpoint,
@@ -1171,8 +1175,8 @@ impl AppState {
                 open: true,
                 device_id: Some(device_id),
                 baud: Some(baud),
-                control: control.as_ref().map(short_holder),
-                control_id: control.as_ref().map(|holder| holder.client_id),
+                control: control_label,
+                control_id,
             });
             self.devices.sort_by(|left, right| {
                 left.endpoint
