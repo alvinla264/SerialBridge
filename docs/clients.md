@@ -64,6 +64,78 @@ Errors are `ClientError`. Use `error.code()` to match the core's `ErrorCode`
 `NotFound`, `PermissionDenied`, ...); `is_control_held()` and
 `is_device_gone()` cover the two common cases.
 
+### Remote (LAN) transport
+
+`RemoteClient` reaches devices a host shares on the local network. It is the
+same transport the MCP server uses today and the terminal will use for its
+sharing controls. It never talks to the Unix socket, and a network failure is
+an error rather than a quiet local retry.
+
+```rust
+use std::net::{IpAddr, Ipv4Addr};
+use serial_nexus_client::{RemoteClient, RemoteEndpoint};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+// The exact address and port, plus the pairing information and credential the
+// host terminal showed. In a real program the pairing comes from configuration,
+// not from a tool argument.
+let endpoint = RemoteEndpoint::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 7000);
+let paired = /* PairedHost from the host's pairing details */;
+let secret = /* PairingSecret: role plus credential */;
+let client = RemoteClient::connect_to(endpoint, &paired, &secret, Some("my-client".into()), std::time::Duration::from_secs(5))?;
+let devices = client.list_devices()?;
+# Ok(())
+# }
+```
+
+| Call | What it does |
+| --- | --- |
+| `RemoteEndpoint::new(ip, port)` | The address and port to dial. `validate()` refuses port 0, wildcards, multicast and broadcast; IPv4-mapped IPv6 is the same endpoint as its IPv4 form. |
+| `RemoteClient::connect_to(endpoint, paired, secret, name, timeout)` | Dial exactly that endpoint. Refuses an endpoint the pairing does not describe (`ClientError::EndpointMismatch`). |
+| `RemoteClient::connect(paired, secret, name, timeout)` | The same, dialling the pairing's own address. |
+| `list_devices`, `open`, `close`, `read`, `write_bytes`, `status` | Same shapes as `Client`. |
+| `role()`, `auth()`, `limits()` | What the host authenticated this connection as, and its bounds. |
+| `is_connected()`, `subscribe()` | Connection state and events; a close also arrives as `Event::TransportClosed`. |
+
+Authentication happens before any request:
+
+1. the host must present a certificate chain that verifies under the pairing's
+   certificate authority **and** a leaf certificate whose SHA-256 equals
+   `host_cert_fingerprint_sha256`; a different certificate is refused and the
+   credential is not sent;
+2. the pairing credential is then sent as the first frame, and the host derives
+   the role from it. The client checks that the role the host reports is the
+   role the pairing promised, so a credential used under the wrong role is
+   refused.
+
+Frames are bounded by `MAX_REMOTE_FRAME_BYTES`, the handshake and pairing have
+deadlines, and a write whose answer is lost becomes `ClientError::WriteUncertain`
+(`may_have_reached_device`): the transport never replays it. `is_write_uncertain()`
+recognizes both that and a host answer carrying the same flag.
+
+### The private pairing file
+
+An MCP host cannot be trusted to keep a credential out of AI-visible tool
+arguments or history, so the human configures one private file instead.
+`Peers` loads it:
+
+- path: `SERIAL_NEXUS_MCP_PEERS`, else `$XDG_CONFIG_HOME/serial-nexus/mcp-peers.json`,
+  else `~/.config/serial-nexus/mcp-peers.json`; with none of those set the
+  loader fails instead of reading a relative file from the current directory;
+- shape: `{ "version": 1, "peers": [ { "endpoint": {"address", "port"}, "paired": {...}, "secret": {"role", "credential"} } ] }`;
+- it must be a regular file owned by the current user with no group or world
+  permission bits; a symlink, another owner or mode `644` is refused
+  (`PeerError`), and no error message contains the credential;
+- one entry per endpoint; duplicate endpoints are refused as ambiguous, and a
+  file larger than 64 KiB is refused rather than read whole;
+- the entry's endpoint, the pairing's address and the pairing's TLS name must
+  all be the same endpoint, and the certificate fingerprint must be 64
+  lowercase hex characters.
+
+`Peers::find(endpoint)` returns the one entry for exactly that address and
+port. [`crates/serial-nexus-mcp/README.md`](../crates/serial-nexus-mcp/README.md)
+shows the file a user writes.
+
 ### Auto-start and packaging
 
 `Client::connect` tries the socket first. If nothing answers and auto-start is

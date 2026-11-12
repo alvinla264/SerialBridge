@@ -19,8 +19,9 @@ and one real LAN address, and never flashes the board or changes firmware.
    still works after sharing stops.
 
 It does not test firmware behaviour beyond what the existing firmware prints or
-echoes, the terminal sharing UI (a follow-on task), remote MCP (a follow-on
-task), or NAT/firewalls.
+echoes, the terminal sharing UI (a follow-on task), or NAT/firewalls. The
+`serial-nexus-mcp` crate adds a companion ignored gate that exercises the actual
+MCP-over-stdio path against the same existing board echo firmware.
 
 ## Prerequisites
 
@@ -72,6 +73,41 @@ Expected lines: `1/7 local open`, `2/7 sharing: bind=...`, `3/7 remote pair`,
 `4/7 remote list`, `5/7 remote join`, `6/7 remote read`, `7/7 uncheck revoked
 remote access`, then `sharing stopped; local history ... lines`, and finally
 `test result: ok. 1 passed`.
+
+## Remote MCP stdio gate
+
+Run this second ignored test at the same exact head. It creates a unique
+TemporaryDirectory for the core Unix socket and another for MCP configuration;
+the MCP process receives `SERIAL_NEXUS_SOCKET`, `SERIAL_NEXUS_MCP_PEERS`, and
+`XDG_CONFIG_HOME` pointing only into those temporary directories. The pairing
+file is created with mode `0600` in a mode `0700` directory. The test performs
+host open/share setup, remote MCP `list_devices`, `connect`, `send`, and `read`,
+checks the firmware echo, unchecks the device, verifies subsequent MCP read is
+revoked, and scans tool responses and captured MCP stderr for both credentials.
+The host uses the canonical path from the local open result for sharing and
+checks the canonical path reported by remote discovery; a `/dev/serial/by-id`
+input may therefore appear as `/dev/ttyACM*` remotely.
+It prints the bound endpoint and board path, never the pairing values.
+
+Set the serial, bind, baud, probe, and expected echo variables as above using
+the `SER14_BOARD_*` names (`SER13_BOARD_*` are accepted as aliases). The probe
+and expected echo are **required** for this gate: choose only the harmless input
+known to work with the board's current echo firmware. There is no flashing or
+firmware change. Run:
+
+```sh
+SER14_BOARD_SERIAL=/dev/serial/by-id/usb-STMicroelectronics_... \
+SER14_BOARD_BIND=192.168.1.20:0 \
+SER14_BOARD_BAUD=115200 \
+SER14_BOARD_PROBE=$'hello\\r\\n' \
+SER14_BOARD_EXPECT_ECHO=hello \
+nix develop -c cargo test -p serial-nexus-mcp --test board_gate -- --ignored --nocapture
+```
+
+Do not run with the ignored flag removed: ordinary workspace tests do not open
+a physical board. Record the exact `git rev-parse HEAD` before running; if it
+changes, gate the new head separately. The output includes only non-secret
+endpoint/path/baud information and pass/fail details.
 
 ## If it fails
 

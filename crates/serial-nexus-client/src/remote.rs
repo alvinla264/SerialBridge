@@ -6,7 +6,8 @@
 //! selects the role on the core side; this client cannot ask for another.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, TcpStream};
+use std::fmt;
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -22,6 +23,81 @@ use serial_nexus_protocol::{
 };
 
 use crate::ClientError;
+
+/// The exact address and port to dial, chosen by the caller (the MCP host's
+/// pairing file, or the terminal's sharing UI), not by the pairing data.
+///
+/// The pairing still has the last word: a server that does not present the
+/// paired certificate is refused, and dialling anything other than the paired
+/// address is an error rather than a quiet retry somewhere else.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct RemoteEndpoint {
+    pub address: IpAddr,
+    pub port: u16,
+}
+
+impl RemoteEndpoint {
+    pub fn new(address: IpAddr, port: u16) -> Self {
+        Self { address, port }
+    }
+
+    pub fn from_socket_addr(address: SocketAddr) -> Self {
+        Self::new(address.ip(), address.port())
+    }
+
+    /// IPv4-mapped IPv6 is the same endpoint as its IPv4 form, exactly as the
+    /// core treats wildcard checks.
+    pub fn canonical_ip(address: IpAddr) -> IpAddr {
+        match address {
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => IpAddr::V4(v4),
+                None => address,
+            },
+            other => other,
+        }
+    }
+
+    /// The same endpoint with IPv4-mapped IPv6 folded to IPv4, so equality and
+    /// ordering treat both spellings as one endpoint.
+    pub fn canonical(&self) -> Self {
+        Self::new(Self::canonical_ip(self.address), self.port)
+    }
+
+    /// Refuse addresses no client can mean: port 0, wildcards, multicast and
+    /// broadcast.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.port == 0 {
+            return Err("the port must be between 1 and 65535".to_string());
+        }
+        let address = Self::canonical_ip(self.address);
+        if address.is_unspecified() {
+            return Err(format!(
+                "{address} is a wildcard address; give the host's concrete address"
+            ));
+        }
+        if address.is_multicast() {
+            return Err(format!("{address} is a multicast address"));
+        }
+        if let IpAddr::V4(v4) = address {
+            if v4.is_broadcast() {
+                return Err(format!("{address} is a broadcast address"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn socket_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.address, self.port)
+    }
+}
+
+impl fmt::Display for RemoteEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.socket_addr())
+    }
+}
 
 struct Pending {
     tx: Sender<Result<ResponseData, ClientError>>,
@@ -52,14 +128,41 @@ pub struct RemoteClient {
 }
 
 impl RemoteClient {
-    /// Connect to a paired host, verify its certificate, and authenticate with
-    /// the pairing credential.
+    /// Connect to the endpoint named by the pairing information.
     pub fn connect(
         paired: &PairedHost,
         secret: &PairingSecret,
         client_name: Option<String>,
         timeout: Duration,
     ) -> Result<Self, ClientError> {
+        Self::connect_to(
+            RemoteEndpoint::from_socket_addr(paired.address),
+            paired,
+            secret,
+            client_name,
+            timeout,
+        )
+    }
+
+    /// Connect to an explicitly specified IPv4/IPv6 address and port, verifying
+    /// that it is exactly the paired endpoint and that the host proves the
+    /// pinned certificate. A mismatch is an error; there is no fallback to the
+    /// local core.
+    pub fn connect_to(
+        endpoint: RemoteEndpoint,
+        paired: &PairedHost,
+        secret: &PairingSecret,
+        client_name: Option<String>,
+        timeout: Duration,
+    ) -> Result<Self, ClientError> {
+        endpoint.validate().map_err(ClientError::EndpointMismatch)?;
+        let paired_endpoint = RemoteEndpoint::from_socket_addr(paired.address);
+        if endpoint.canonical() != paired_endpoint.canonical() {
+            return Err(ClientError::EndpointMismatch(format!(
+                "{endpoint} is not the paired endpoint {paired_endpoint}"
+            )));
+        }
+        let address = endpoint.canonical().socket_addr();
         let ca_der = decode_bytes(&paired.ca_cert_der_b64)
             .map_err(|error| ClientError::Tls(format!("bad pairing CA: {error}")))?;
         let mut roots = rustls::RootCertStore::empty();
@@ -79,7 +182,7 @@ impl RemoteClient {
                 .map_err(|_| ClientError::HostRejected("invalid pairing host name".into()))?,
         };
 
-        let mut tcp = TcpStream::connect_timeout(&paired.address, timeout)?;
+        let mut tcp = TcpStream::connect_timeout(&address, timeout)?;
         tcp.set_nodelay(true)?;
         tcp.set_read_timeout(Some(Duration::from_millis(50)))?;
         tcp.set_write_timeout(Some(Duration::from_millis(50)))?;
@@ -151,6 +254,15 @@ impl RemoteClient {
                 client: SHARE_PROTOCOL_VERSION,
             });
         }
+        // The host derives the role from the credential it matched. A different
+        // role means this credential is not the one the pairing said it is, so
+        // the connection is not the one that was authorized.
+        if auth.role != secret.role {
+            return Err(ClientError::Authentication(format!(
+                "the host authenticated this connection as {:?}, but the pairing credential is for {:?}",
+                auth.role, secret.role
+            )));
+        }
 
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let subscribers: Arc<Mutex<Vec<Sender<Event>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -194,6 +306,11 @@ impl RemoteClient {
 
     pub fn auth(&self) -> &RemoteAuthResult {
         &self.inner.auth
+    }
+
+    /// Limits the paired host reported for this connection.
+    pub fn limits(&self) -> &serial_nexus_protocol::Limits {
+        &self.inner.auth.limits
     }
 
     pub fn role(&self) -> PairingRole {

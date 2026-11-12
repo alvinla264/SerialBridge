@@ -120,3 +120,13 @@ these words in their tool names and user-facing text.
 - **Remote frame**: one length-prefixed JSON message on a remote connection
   (4-byte big-endian length, then that many bytes), bounded to keep one peer
   from exhausting memory.
+- **Remote endpoint**: the exact IP address and TCP port of a **sharing
+  session**'s listener. It, not a device path or a device id, identifies a
+  **remote session**, so two hosts may share the same path without colliding.
+- **Pairing file**: the MCP host user's private per-endpoint file
+  (`mcp-peers.json`) with one **paired host** and **pairing credential** per
+  **remote endpoint**. Readable by its owner only; never an AI tool argument
+  and never part of a tool result.
+- **Remote session**: one MCP server's connection to one **remote endpoint**,
+  with its own device ids, control and history, separate from the local core
+  and from every other endpoint.
