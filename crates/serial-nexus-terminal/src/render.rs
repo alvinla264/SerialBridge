@@ -969,31 +969,7 @@ fn draw_connect(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u1
         let line = Rect::new(area.x, area.y + offset as u16, area.width, 1);
         let width = area.width as usize;
         let full_label = format!("{marker} {label}");
-        let value_width = display_width(&value) as usize;
-        let label_width = display_width(&full_label) as usize;
-        let (shown_label, shown_value) = if label_width + 1 + value_width < width {
-            (full_label, value)
-        } else {
-            // Long CA/fingerprint/credential values keep their label and show
-            // the newest characters, which is where the cursor is.
-            let room = width.saturating_sub(label_width + 1).max(1);
-            let value_room = if label_width + 1 + room > width {
-                width / 2
-            } else {
-                room
-            };
-            let tail: String = value
-                .chars()
-                .rev()
-                .take(value_room)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            let label_room = width.saturating_sub(display_width(&tail) as usize + 1);
-            (fit(&full_label, label_room), tail)
-        };
-        let text = fit(&format!("{shown_label} {shown_value}"), width);
+        let text = row_text(&full_label, &value, width, RowOverflow::Tail);
         put(buffer, line, 0, &text, highlighted(selected));
         if selected {
             let column = display_width(&text).min(width as u16).saturating_sub(1);
@@ -1222,6 +1198,7 @@ fn draw_value_row(buffer: &mut Buffer, area: Rect, label: &str, value: &str, sty
 enum RowOverflow {
     Label,
     Value,
+    Tail,
 }
 
 fn row_text(label: &str, value: &str, width: usize, overflow: RowOverflow) -> String {
@@ -1231,6 +1208,9 @@ fn row_text(label: &str, value: &str, width: usize, overflow: RowOverflow) -> St
     let label_width = display_width(label) as usize;
     let value_width = display_width(value) as usize;
     if label_width + value_width < width {
+        if matches!(overflow, RowOverflow::Tail) {
+            return fit(&format!("{label} {value}"), width);
+        }
         let mut line = label.to_string();
         line.push_str(&" ".repeat(width - label_width - value_width));
         line.push_str(value);
@@ -1259,6 +1239,25 @@ fn row_text(label: &str, value: &str, width: usize, overflow: RowOverflow) -> St
             line.push(' ');
             line.push_str(value);
             fit(&line, width)
+        }
+        RowOverflow::Tail => {
+            // Keep the label and the most recently entered value characters.
+            let room = width.saturating_sub(label_width + 1).max(1);
+            let value_room = if label_width + 1 + room > width {
+                width / 2
+            } else {
+                room
+            };
+            let tail: String = value
+                .chars()
+                .rev()
+                .take(value_room)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let label_room = width.saturating_sub(display_width(&tail) as usize + 1);
+            fit(&format!("{} {tail}", fit(label, label_room)), width)
         }
     }
 }

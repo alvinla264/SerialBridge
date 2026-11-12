@@ -1817,7 +1817,7 @@ impl Engine {
             }
         }
         for path in expired {
-            self.revoke_path_everywhere(&path, &session);
+            let _ = self.revoke_path_everywhere(&path, &session, true);
         }
         Ok(ResponseData::Sharing(session.snapshot()))
     }
@@ -1879,7 +1879,7 @@ impl Engine {
         let _gate = self.share_gate.write().expect("share gate");
         let (expired, removed) = session.replace(identities)?;
         for path in expired.into_iter().chain(removed) {
-            self.revoke_path_everywhere(&path, session);
+            let _ = self.revoke_path_everywhere(&path, session, true);
         }
         self.refresh_shared_instances(session);
         Ok(ResponseData::Sharing(session.snapshot()))
@@ -1907,33 +1907,9 @@ impl Engine {
         let mut revoked = Vec::new();
         for path in &params.devices {
             if let Some(identity) = session.uncheck(path) {
-                let device_ids: Vec<u64> = self
-                    .state
-                    .lock()
-                    .expect("state lock")
-                    .devices
-                    .iter()
-                    .filter(|(_, device)| device.path == identity.canonical)
-                    .map(|(id, _)| *id)
-                    .collect();
-                // Invalidate queued remote writes for this device even when
-                // their client has already detached.
-                {
-                    let mut state = self.state.lock().expect("state lock");
-                    let live = self.live_writes.lock().expect("live writes lock");
-                    for (path, epoch) in live.values().map(|(path, epoch)| (path, epoch)) {
-                        if *path == identity.canonical {
-                            epoch.fetch_add(1, Ordering::SeqCst);
-                        }
-                    }
-                    for device_id in &device_ids {
-                        if let Some(device) = state.devices.get_mut(device_id) {
-                            device.write_epoch.fetch_add(1, Ordering::SeqCst);
-                            device.shared = None;
-                        }
-                    }
-                }
-                revoked.extend(device_ids);
+                // Share replacement and individual unchecks use the same
+                // authorization, attached-instance, and queued-write revoke.
+                revoked.extend(self.revoke_path_everywhere(&identity.canonical, &session, false));
             }
         }
         // Authorization and epochs are now revoked atomically with write
@@ -2151,7 +2127,7 @@ impl Engine {
                     }
                 });
                 for path in expired_paths {
-                    self.revoke_path_everywhere(&path, &session);
+                    let _ = self.revoke_path_everywhere(&path, &session, true);
                 }
                 // Identity tokens are owner-only pinning data. A remote sees
                 // which checked devices it may use, never how many other nodes
@@ -2244,7 +2220,12 @@ impl Engine {
         self.begin_write(client_id, params)
     }
 
-    fn revoke_path_everywhere(&self, path: &str, session: &SharingSession) {
+    fn revoke_path_everywhere(
+        &self,
+        path: &str,
+        session: &SharingSession,
+        revalidate_instances: bool,
+    ) -> Vec<u64> {
         let ids: Vec<u64> = self
             .state
             .lock()
@@ -2254,8 +2235,18 @@ impl Engine {
             .filter(|(_, device)| device.path == path)
             .map(|(id, _)| *id)
             .collect();
-        for id in ids {
-            self.revalidate_shared_instance(id, session);
+        if revalidate_instances {
+            for id in &ids {
+                self.revalidate_shared_instance(*id, session);
+            }
+        } else {
+            let mut state = self.state.lock().expect("state lock");
+            for id in &ids {
+                if let Some(device) = state.devices.get_mut(id) {
+                    device.shared = None;
+                    device.write_epoch.fetch_add(1, Ordering::SeqCst);
+                }
+            }
         }
         let live = self.live_writes.lock().expect("live writes lock");
         for (registered, epoch) in live.values() {
@@ -2263,6 +2254,7 @@ impl Engine {
                 epoch.fetch_add(1, Ordering::SeqCst);
             }
         }
+        ids
     }
 
     fn detach_remote_path(&self, path: &str, reason: &str) {

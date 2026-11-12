@@ -115,18 +115,21 @@ impl Terminal {
 }
 
 #[test]
-fn a_new_connection_does_not_hide_an_existing_host_disconnect() {
+fn a_new_connection_does_not_hide_existing_host_disconnects() {
     let _guard = serial_test();
     let (_local, local_socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
 
     let paths = Arc::new(Mutex::new(Vec::new()));
     let first = start_host(&[], Arc::clone(&paths));
-    let second = start_host(&[], paths);
+    let second = start_host(&[], Arc::clone(&paths));
+    let third = start_host(&[], paths);
     let mut terminal = Terminal::new(&local_socket);
     terminal.connect(&first.info);
-    first.owner.stop_sharing().expect("stop first host");
-
     terminal.connect(&second.info);
+    first.owner.stop_sharing().expect("stop first host");
+    second.owner.stop_sharing().expect("stop second host");
+
+    terminal.connect(&third.info);
 
     let notice = terminal
         .app
@@ -138,9 +141,10 @@ fn a_new_connection_does_not_hide_an_existing_host_disconnect() {
         notice.severity,
         serial_nexus_terminal::state::Severity::Error
     );
-    assert!(
-        notice.text.contains("remote host unreachable"),
-        "{notice:?}"
+    assert_eq!(
+        notice.text.matches("remote host unreachable").count(),
+        2,
+        "every dropped host remains visible: {notice:?}"
     );
 }
 

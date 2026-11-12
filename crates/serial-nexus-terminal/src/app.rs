@@ -193,6 +193,7 @@ impl App {
     /// is dropped with its own sessions only; local devices and other remote
     /// hosts keep working.
     pub fn refresh_devices(&mut self) {
+        let mut failures = Vec::new();
         match self.client.list_devices() {
             Ok(result) => {
                 let entries: Vec<DeviceEntry> =
@@ -201,9 +202,12 @@ impl App {
                 self.state
                     .reconcile_share_checks(&self.state.detected_local_identities());
             }
-            Err(error) => self.state.notice = Some(Notice::error(error.to_string())),
+            Err(error) => failures.push(error.to_string()),
         }
-        self.refresh_remotes();
+        failures.extend(self.refresh_remotes());
+        if !failures.is_empty() {
+            self.state.notice = Some(Notice::error(failures.join("; ")));
+        }
         if self.state.sharing.active {
             self.sync_share_status();
         }
@@ -211,7 +215,7 @@ impl App {
 
     /// Re-list the devices of every remote host. A disconnected host is
     /// removed without touching any other endpoint's sessions.
-    fn refresh_remotes(&mut self) {
+    fn refresh_remotes(&mut self) -> Vec<String> {
         let mut failed = Vec::new();
         for link in &self.remotes {
             match link.client.list_devices() {
@@ -226,9 +230,16 @@ impl App {
                 Err(error) => failed.push((link.id, error)),
             }
         }
+        let mut notices = Vec::with_capacity(failed.len());
         for (id, error) in failed {
-            self.drop_remote(id, &format!("remote host unreachable: {error}"));
+            let notice = format!(
+                "remote host unreachable: {}: {error}",
+                self.state.endpoint_label(id)
+            );
+            self.drop_remote(id, &notice);
+            notices.push(notice);
         }
+        notices
     }
 
     /// Remove one remote host: its sessions, its devices and its link. Other
@@ -748,18 +759,8 @@ impl App {
         // paths only.
         let expected = self.state.draft_checked.identities();
 
-        // Stage the preferences but do not publish them until the core has
-        // accepted the checklist. A failed core step leaves the live file
-        // exactly as it was, with no restore write to fail.
-        let previous_file = match store.snapshot() {
-            Ok(file) => file,
-            Err(error) => {
-                self.state.notice = Some(Notice::error(format!(
-                    "settings not saved: the current settings could not be read: {error}"
-                )));
-                return;
-            }
-        };
+        // Keep preferences staged until the core accepts the checklist. A
+        // failed commit therefore cannot require a best-effort file restore.
         let mut staged = Some(match store.stage(&draft) {
             Ok(staged) => staged,
             Err(error) => {
@@ -786,20 +787,15 @@ impl App {
             }
         }
 
-        // Publish the preferences only after the core has validated the
-        // checklist. If this fails, no checklist was committed either.
-        if let Err(error) = store.publish(staged.take().expect("staged settings")) {
-            self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
-            return;
-        }
-
+        let previous_checked: Vec<String> =
+            self.state.sharing.pending_checked.iter().cloned().collect();
+        let previous_expected = self.state.sharing.pending_checked.identities();
+        let mut committed_checklist = false;
         if let Some(token) = prepared {
             match self.client.commit_shared_devices(token) {
                 Ok(snapshot) => {
                     let _ = self.state.apply_sharing_snapshot(snapshot);
-                    // A successful commit response is the core's authoritative
-                    // checklist; don't restore newly checked paths it omitted.
-                    self.state.draft_checked = self.state.sharing.pending_checked.clone();
+                    committed_checklist = true;
                 }
                 Err(error) => {
                     let uncertain = matches!(
@@ -808,39 +804,58 @@ impl App {
                     );
                     if uncertain {
                         self.sync_share_status();
-                        if self.state.sharing.active
-                            && draft_checked == self.state.sharing.checked()
-                        {
-                            self.state.commit_settings();
-                            self.state.notice = Some(Notice::info("settings saved"));
-                            return;
-                        }
+                        committed_checklist = self.state.sharing.active
+                            && draft_checked == self.state.sharing.checked();
                     }
-                    if uncertain {
-                        // The core may have applied the checklist and even a
-                        // follow-up status timed out. Do not claim failure or
-                        // restore the file; say the outcome is unknown.
-                        self.state.notice = Some(Notice::error(format!(
-                            "settings save is unknown: {error}; the core may have applied the checklist — check it and save again"
-                        )));
+                    if !committed_checklist {
+                        if let Some(staged) = staged.take() {
+                            store.discard(staged);
+                        }
+                        self.state.notice = Some(Notice::error(if uncertain {
+                            format!(
+                                "settings save is unknown: {error}; the core may have applied the checklist — check it and save again"
+                            )
+                        } else {
+                            format!("settings not saved: {error}")
+                        }));
                         return;
                     }
-                    // A definite commit failure means the checklist was not
-                    // applied; put the previous preferences back.
-                    let restored = store.restore(previous_file.as_deref()).is_ok();
-                    self.sync_share_status();
-                    self.state.notice = Some(Notice::error(if restored {
-                        format!("settings not saved: {error}")
-                    } else {
-                        format!(
-                            "settings not saved: {error}; the previous preferences could not be restored"
-                        )
-                    }));
-                    return;
                 }
             }
         }
 
+        if let Err(error) = store.publish(staged.take().expect("staged settings")) {
+            if committed_checklist {
+                let reverted = self
+                    .client
+                    .prepare_shared_devices_expected(previous_checked, previous_expected)
+                    .and_then(|token| self.client.commit_shared_devices(token));
+                match reverted {
+                    Ok(snapshot) => {
+                        let _ = self.state.apply_sharing_snapshot(snapshot);
+                        self.state.draft_checked = draft_checked;
+                        self.state.notice = Some(Notice::error(format!(
+                            "settings not saved: {error}; the checked devices were restored"
+                        )));
+                    }
+                    Err(rollback_error) => {
+                        self.sync_share_status();
+                        self.state.notice = Some(Notice::error(format!(
+                            "settings save is unknown: {error}; checklist rollback failed: {rollback_error}"
+                        )));
+                    }
+                }
+            } else {
+                self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
+            }
+            return;
+        }
+
+        if committed_checklist {
+            // The accepted snapshot is authoritative; only now replace the
+            // user's attempted draft with the core's committed checklist.
+            self.state.draft_checked = self.state.sharing.pending_checked.clone();
+        }
         self.state.commit_settings();
         self.state.notice = Some(Notice::info("settings saved"));
     }
@@ -1032,13 +1047,18 @@ impl App {
                 self.state.connect = None;
                 self.show_live_stream();
                 self.state.focus = Focus::Sidebar;
-                let links_before_refresh = self.remotes.len();
-                self.refresh_remotes();
-                let another_host_failed = self.remotes.len() < links_before_refresh;
-                if !another_host_failed && self.remotes.iter().any(|link| link.id == id) {
-                    self.state.notice = Some(Notice::info(format!(
-                        "connected to {label}: its checked devices are in the sidebar"
-                    )));
+                let refresh_failures = self.refresh_remotes();
+                if self.remotes.iter().any(|link| link.id == id) {
+                    if refresh_failures.is_empty() {
+                        self.state.notice = Some(Notice::info(format!(
+                            "connected to {label}: its checked devices are in the sidebar"
+                        )));
+                    } else {
+                        self.state.notice = Some(Notice::error(format!(
+                            "connected to {label}; {}",
+                            refresh_failures.join("; ")
+                        )));
+                    }
                 }
             }
             Err(error) => {

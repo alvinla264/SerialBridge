@@ -246,10 +246,6 @@ local access after stop.
 
 ## Not covered here
 
-- The terminal UI for choosing an address/devices and showing pairing
-  information.
-- Remote terminal and MCP client tasks, and any relay/discovery beyond a
-  concrete address the owner enters.
 - mDNS, NAT traversal, non-Linux platforms and hardware behaviour.
 - PTY fixtures are not enumerated by the real `enumerate::list_ports`, so most
   sharing tests open a PTY in the core first. The injected-lister test covers

@@ -84,17 +84,18 @@ these words in their tool names and user-facing text.
   core shutdown). Local clients receive events from their subscription onward;
   remote clients receive only authorized device events, from a bounded
   best-effort queue.
-- **Sharing session**: opt-in LAN access to a set of **checked devices**,
-  started by a **local owner** and alive only while that owner's local terminal
-  connection is. It has its own TLS certificate authority, host certificate and
-  pairing credentials; stopping it, or losing the owner connection, closes the
+- **Sharing session**: an opt-in TLS listener started by a **local owner** on
+  one concrete IPv4 or IPv6 address and port. It grants remote access only to
+  **checked devices** and lives only while the owner's local terminal
+  connection is active. Stopping it or losing that connection closes the
   listener, disconnects every **remote client** and revokes the credentials.
   Off by default; there is no listener until one is started.
 - **Local owner**: the local human terminal connection that started a sharing
   session. Only it may check, uncheck, inspect or stop sharing.
-- **Checked device**: a detected device the owner added to the session's
-  in-memory allowlist. The checked list is the whole of what remote clients may
-  see or use; a checked device need not be open locally.
+- **Checked device**: a detected device path the owner selected in the
+  settings checklist for the session's in-memory allowlist. Checking is
+  session-only, defaults to none and does not open the device. The core's
+  checked list, not the UI, authorizes what remote clients may see or use.
 - **Device identity**: the concrete device node behind a path, captured as
   `(st_dev, st_ino, st_rdev)` and an `O_PATH` descriptor that pins the node,
   captured when the device is checked. Discovery reports an opaque token for
@@ -121,17 +122,10 @@ these words in their tool names and user-facing text.
 - **Remote frame**: one length-prefixed JSON message on a remote connection
   (4-byte big-endian length, then that many bytes), bounded to keep one peer
   from exhausting memory.
+
 LAN sharing and remote-client terms (the core contract is in
 [docs/sharing.md](docs/sharing.md)):
 
-- **Sharing session**: the opt-in TLS listener one human terminal starts on one
-  concrete IPv4 or IPv6 address and port. It lives only while that terminal's
-  connection to the local core lives. Off by default.
-- **Owner**: the local human terminal that started the sharing session. Only
-  the owner may check, uncheck, inspect or stop it; other local clients cannot.
-- **Checked device**: a detected device path the owner has ticked in the
-  settings checklist. Checking is session-only, defaults to none and does not
-  open the device. The core's checked list, not the UI, authorizes access.
 - **Checklist draft**: the checked set being edited in the settings view. Save
   applies it (and writes the preferences); Cancel throws it away; a failed save
   applies neither.
