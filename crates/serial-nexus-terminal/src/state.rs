@@ -102,7 +102,7 @@ impl Notice {
 /// selected as. One map keeps the path/identity invariant in one place.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Checklist {
-    entries: BTreeMap<String, String>,
+    entries: BTreeMap<String, Option<String>>,
 }
 
 impl Checklist {
@@ -117,7 +117,7 @@ impl Checklist {
     pub fn insert_with_identity(&mut self, path: String, identity: String) -> bool {
         use std::collections::btree_map::Entry;
         if let Entry::Vacant(entry) = self.entries.entry(path) {
-            entry.insert(identity);
+            entry.insert(Some(identity));
             true
         } else {
             false
@@ -147,28 +147,34 @@ impl Checklist {
     pub fn identities(&self) -> BTreeMap<String, String> {
         self.entries
             .iter()
-            .filter(|(_, identity)| !identity.is_empty())
-            .map(|(path, identity)| (path.clone(), identity.clone()))
+            .filter_map(|(path, identity)| {
+                identity
+                    .as_ref()
+                    .map(|identity| (path.clone(), identity.clone()))
+            })
             .collect()
     }
 
     pub fn from_pairs(pairs: impl IntoIterator<Item = (String, String)>) -> Self {
         Self {
-            entries: pairs.into_iter().collect(),
+            entries: pairs
+                .into_iter()
+                .map(|(path, identity)| (path, Some(identity)))
+                .collect(),
         }
     }
 
     /// Reconcile with current discovery: fill a missing identity, drop a path
     /// that vanished, and drop one whose recorded identity changed.
     fn sync(&mut self, detected: &BTreeMap<String, String>) {
-        self.entries
-            .retain(|path, recorded| match detected.get(path) {
-                Some(current) => recorded.is_empty() || recorded == current,
-                None => false,
-            });
+        self.entries.retain(|path, recorded| {
+            detected
+                .get(path)
+                .is_some_and(|current| recorded.as_ref().is_none_or(|recorded| recorded == current))
+        });
         for (path, identity) in detected {
-            if self.entries.contains_key(path) {
-                self.entries.insert(path.clone(), identity.clone());
+            if let Some(recorded) = self.entries.get_mut(path) {
+                *recorded = Some(identity.clone());
             }
         }
     }
@@ -187,7 +193,7 @@ impl PartialEq<BTreeSet<String>> for Checklist {
 impl FromIterator<String> for Checklist {
     fn from_iter<T: IntoIterator<Item = String>>(iter: T) -> Self {
         Self {
-            entries: iter.into_iter().map(|path| (path, String::new())).collect(),
+            entries: iter.into_iter().map(|path| (path, None)).collect(),
         }
     }
 }
@@ -1310,13 +1316,14 @@ impl AppState {
     /// Take the core's authoritative sharing snapshot. A device the core no
     /// longer lists (unplugged, replaced at the same path, or revoked) also
     /// loses its checkbox: sharing it again needs an explicit check.
-    pub fn apply_sharing_snapshot(&mut self, snapshot: SharingSnapshot) {
+    pub fn apply_sharing_snapshot(&mut self, snapshot: SharingSnapshot) -> Vec<String> {
         let previous = self.sharing.checked();
         let next: BTreeSet<String> = snapshot
             .checked
             .iter()
             .map(|device| device.path.clone())
             .collect();
+        let lost = previous.difference(&next).cloned().collect();
         if snapshot.active {
             for path in previous.difference(&next) {
                 self.draft_checked.remove(path);
@@ -1332,6 +1339,7 @@ impl AppState {
             self.sharing.pairing = None;
             self.close_pairing_view();
         }
+        lost
     }
 
     /// Leave a pairing view after sharing ended without the human asking.
@@ -1916,6 +1924,25 @@ mod sharing_tests {
             remote_clients: 0,
             pending_connections: 0,
         }
+    }
+
+    #[test]
+    fn checklist_represents_missing_identity_explicitly_and_fills_it_on_sync() {
+        let mut checklist: Checklist = ["/dev/ttyUSB0".to_string()].into_iter().collect();
+        assert!(checklist.contains("/dev/ttyUSB0"));
+        assert!(checklist.identities().is_empty());
+
+        checklist.sync(&BTreeMap::from([(
+            "/dev/ttyUSB0".to_string(),
+            "stable-node".to_string(),
+        )]));
+        assert_eq!(
+            checklist
+                .identities()
+                .get("/dev/ttyUSB0")
+                .map(String::as_str),
+            Some("stable-node")
+        );
     }
 
     #[test]

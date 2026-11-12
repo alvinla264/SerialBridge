@@ -446,7 +446,7 @@ fn a_replacement_at_a_checked_path_needs_an_explicit_recheck() {
         remote_clients: 0,
         pending_connections: 0,
     };
-    app.state.apply_sharing_snapshot(snapshot);
+    let _ = app.state.apply_sharing_snapshot(snapshot);
     app.state.begin_settings();
     let row = app
         .state

@@ -1,7 +1,7 @@
 //! The event-driven app: client calls behind small state transitions that do
 //! not depend on a real terminal.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
@@ -746,8 +746,7 @@ impl App {
         // Every checked device needs the identity the owner selected. Without
         // one the core would fall back to the current node at that path, which
         // could be a replacement; refuse instead of authorizing it.
-        let draft_identities = self.state.draft_checked.identities();
-        let expected = self.expected_identities(&desired, &draft_identities);
+        let expected = self.state.draft_checked.identities();
         if active && expected.len() != desired.len() {
             self.state
                 .draft_checked
@@ -806,7 +805,7 @@ impl App {
         if let Some(token) = prepared {
             match self.client.commit_shared_devices(token) {
                 Ok(snapshot) => {
-                    self.state.apply_sharing_snapshot(snapshot);
+                    let _ = self.state.apply_sharing_snapshot(snapshot);
                     // A successful commit response is the core's authoritative
                     // checklist; don't restore newly checked paths it omitted.
                     self.state.draft_checked = self.state.sharing.pending_checked.clone();
@@ -909,8 +908,7 @@ impl App {
                 return;
             }
         };
-        let pending_identities = self.state.sharing.pending_checked.identities();
-        let expected = self.expected_identities(&devices, &pending_identities);
+        let expected = self.state.sharing.pending_checked.identities();
         match self.client.start_sharing_expected(bind, devices, expected) {
             Ok(info) => {
                 self.state.sharing.active = true;
@@ -949,18 +947,6 @@ impl App {
                 }
             }
         }
-    }
-
-    /// The recorded identity per path, for the paths still being granted.
-    fn expected_identities(
-        &self,
-        paths: &[String],
-        identities: &BTreeMap<String, String>,
-    ) -> BTreeMap<String, String> {
-        paths
-            .iter()
-            .filter_map(|path| identities.get(path).map(|id| (path.clone(), id.clone())))
-            .collect()
     }
 
     /// The saved sharing endpoint, validated as one concrete address.
@@ -1176,14 +1162,7 @@ impl App {
     fn sync_share_status(&mut self) {
         match self.client.sharing_status() {
             Ok(snapshot) => {
-                let before = self.state.sharing.checked();
-                let after: BTreeSet<String> = snapshot
-                    .checked
-                    .iter()
-                    .map(|device| device.path.clone())
-                    .collect();
-                let lost: Vec<String> = before.difference(&after).cloned().collect();
-                self.state.apply_sharing_snapshot(snapshot);
+                let lost = self.state.apply_sharing_snapshot(snapshot);
                 if !lost.is_empty() {
                     self.state.notice = Some(Notice::error(format!(
                         "no longer shared: {} — check it again in Settings",
