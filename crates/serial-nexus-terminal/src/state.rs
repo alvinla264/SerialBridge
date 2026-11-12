@@ -765,7 +765,7 @@ impl AppState {
         // The checklist starts from what the core currently shares, or from
         // the session-only selection made before sharing started.
         self.draft_checked = self.sharing.pending_checked.clone();
-        self.sync_checked_identities();
+        self.reconcile_share_checks(&self.detected_local_identities());
         self.port_text = self.draft.share_port.to_string();
         self.settings_row = 0;
         self.settings_editing = false;
@@ -1324,7 +1324,7 @@ impl AppState {
                 self.draft_checked.remove(path);
             }
             self.sharing.pending_checked = next.into_iter().collect();
-            self.sync_checked_identities();
+            self.reconcile_share_checks(&self.detected_local_identities());
         }
         // An inactive snapshot says only that sharing is off; the session-only
         // checked selection stays for this launch, as an explicit stop does.
@@ -1348,7 +1348,10 @@ impl AppState {
 
     /// Drop checked devices that are no longer detected. The core revokes
     /// their authorization; the checkbox must not survive a replacement.
-    pub fn prune_share_checks(&mut self, detected: &BTreeMap<String, String>) {
+    /// Reconcile both checklists against current identities in one operation.
+    /// A vanished device or replacement loses its selection; current identity
+    /// tokens are captured for surviving paths.
+    pub fn reconcile_share_checks(&mut self, detected: &BTreeMap<String, String>) {
         self.sharing.pending_checked.sync(detected);
         self.draft_checked.sync(detected);
     }
@@ -1358,16 +1361,7 @@ impl AppState {
     /// between two refreshes is not authorized by stale UI state.
     pub fn drop_replaced_checks(&mut self) {
         let detected = self.detected_local_identities();
-        self.prune_share_checks(&detected);
-    }
-
-    /// Refresh the identity tokens of checked devices from current discovery.
-    /// The claimed device paths stay; a path without a current token is left
-    /// for pruning to remove.
-    pub fn sync_checked_identities(&mut self) {
-        let detected = self.detected_local_identities();
-        self.sharing.pending_checked.sync(&detected);
-        self.draft_checked.sync(&detected);
+        self.reconcile_share_checks(&detected);
     }
 
     /// The local devices the core currently detects, mapped to their identity.
@@ -2053,7 +2047,7 @@ mod sharing_tests {
         ]
         .into_iter()
         .collect();
-        state.prune_share_checks(&detected);
+        state.reconcile_share_checks(&detected);
         assert!(
             !state.draft_checked.contains("/dev/ttyUSB0"),
             "a different node at the reused path needs a new check"
@@ -2073,7 +2067,7 @@ mod sharing_tests {
         let detected: BTreeMap<String, String> = [("/dev/ttyUSB1".to_string(), "id1".to_string())]
             .into_iter()
             .collect();
-        state.prune_share_checks(&detected);
+        state.reconcile_share_checks(&detected);
         assert!(!state.sharing.pending_checked.contains("/dev/ttyUSB0"));
         assert!(state.draft_checked.contains("/dev/ttyUSB1"));
     }

@@ -199,9 +199,8 @@ impl App {
                 let entries: Vec<DeviceEntry> =
                     result.devices.into_iter().map(device_entry).collect();
                 self.state.set_endpoint_devices(LOCAL_ENDPOINT, entries);
-                let detected = self.state.detected_local_identities();
-                self.state.prune_share_checks(&detected);
-                self.state.sync_checked_identities();
+                self.state
+                    .reconcile_share_checks(&self.state.detected_local_identities());
             }
             Err(error) => self.state.notice = Some(Notice::error(error.to_string())),
         }
@@ -311,8 +310,10 @@ impl App {
                 self.drop_remote(id, &format!("remote host disconnected: {reason}"));
                 return;
             }
-            // The core ends a sharing session when its owner connection goes
-            // away; there is no listener or credential left to show.
+            // A read failure does not necessarily close the writer socket;
+            // explicitly tear down the owner transport so the core observes
+            // EOF and revokes the listener and credentials.
+            self.client.shutdown_transport();
             self.state.sharing.clear_session();
             self.state.close_pairing_view();
         }
@@ -815,7 +816,12 @@ impl App {
 
         if let Some(token) = prepared {
             match self.client.commit_shared_devices(token) {
-                Ok(snapshot) => self.state.apply_sharing_snapshot(snapshot),
+                Ok(snapshot) => {
+                    self.state.apply_sharing_snapshot(snapshot);
+                    // A successful commit response is the core's authoritative
+                    // checklist; don't restore newly checked paths it omitted.
+                    self.state.draft_checked = self.state.sharing.pending_checked.clone();
+                }
                 Err(error) => {
                     let uncertain = matches!(
                         error,
@@ -880,7 +886,6 @@ impl App {
             return;
         }
         self.state.drop_replaced_checks();
-        self.state.sync_checked_identities();
         let detected = self.state.detected_local_identities();
         let missing: Vec<String> = self
             .state

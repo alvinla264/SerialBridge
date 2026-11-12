@@ -338,10 +338,15 @@ fn first_sidebar_row(state: &AppState, rows: &[SidebarRow], sidebar: Sidebar) ->
     // Clamp to the list's own last page so trailing rows (for example a
     // connected host with no approved devices) can be seen from the last
     // selectable device.
-    selected
-        .saturating_add(1)
-        .saturating_sub(capacity)
-        .min(rows.len().saturating_sub(capacity))
+    let first = selected.saturating_add(1).saturating_sub(capacity);
+    let last_device = rows
+        .iter()
+        .rposition(|row| matches!(row, SidebarRow::Device(_)));
+    if Some(selected) == last_device {
+        first.max(rows.len().saturating_sub(capacity))
+    } else {
+        first
+    }
 }
 
 fn in_rect(rect: Rect, column: u16, row: u16) -> bool {
@@ -1334,7 +1339,7 @@ fn to_ratatui(colour: Color) -> RColor {
 mod tests {
     use super::*;
     use crate::state::SessionKey;
-    use crate::state::{AppState, DeviceEntry, Focus, View};
+    use crate::state::{AppState, DeviceEntry, EndpointId, Focus, View};
     use serial_nexus_protocol::Event;
 
     fn screen(state: &AppState, width: u16, height: u16) -> Vec<String> {
@@ -1546,6 +1551,28 @@ mod tests {
         let cursor = render(&state, &mut buffer, area).expect("cursor");
         let button = settings_button(area).expect("button");
         assert_eq!(cursor, (button.x + 1, button.y));
+    }
+
+    #[test]
+    fn the_last_device_viewport_includes_an_empty_connected_host() {
+        let mut state = AppState::new(12, 40);
+        let devices = (0..12)
+            .map(|index| DeviceEntry::new(format!("/dev/tty{index}")))
+            .collect();
+        state.set_devices(devices);
+        state
+            .remote_labels
+            .insert(EndpointId(1), "remote host".into());
+        state.select_index(11);
+
+        let area = Rect::new(0, 0, 80, 12);
+        let sidebar = sidebar(panes(area).sidebar).expect("sidebar");
+        let rows = state.sidebar_rows();
+        let first = first_sidebar_row(&state, &rows, sidebar);
+        let visible = &rows[first..first + sidebar.list.height as usize];
+
+        assert!(visible.contains(&SidebarRow::Group(EndpointId(1))));
+        assert!(visible.contains(&SidebarRow::Device(11)));
     }
 
     #[test]
