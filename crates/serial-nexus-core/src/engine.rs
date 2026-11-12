@@ -1917,26 +1917,9 @@ impl Engine {
         match self.sharing_session() {
             Some(session) if session.owner_client_id() == client_id => {
                 for path in session.expire_invalid() {
-                    let ids: Vec<u64> = self
-                        .state
-                        .lock()
-                        .expect("state lock")
-                        .devices
-                        .iter()
-                        .filter(|(_, device)| device.path == path)
-                        .map(|(id, _)| *id)
-                        .collect();
-                    for id in ids {
-                        self.revalidate_shared_instance(id, &session);
-                    }
-                    // The device may already be out of the open map but still
-                    // draining in the live-writes registry.
-                    let live = self.live_writes.lock().expect("live writes lock");
-                    for (registered, epoch) in live.values() {
-                        if *registered == path {
-                            epoch.fetch_add(1, Ordering::SeqCst);
-                        }
-                    }
+                    // Revoke open instances and queued writes through the same
+                    // path used by allowlist replacement.
+                    let _ = self.revoke_path_everywhere(&path, &session, true);
                 }
                 Ok(ResponseData::Sharing(session.snapshot()))
             }

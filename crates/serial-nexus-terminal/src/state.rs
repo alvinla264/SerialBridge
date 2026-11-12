@@ -812,16 +812,26 @@ impl AppState {
         }
         // A connected host with no approved devices still gets its heading,
         // so the sidebar never hides an endpoint that is still connected.
-        for endpoint in self.remote_labels.keys() {
-            if !self
-                .devices
-                .iter()
-                .any(|device| device.endpoint == *endpoint)
-            {
-                rows.push(SidebarRow::Group(*endpoint));
-            }
-        }
+        rows.extend(
+            self.empty_remote_endpoints()
+                .into_iter()
+                .map(SidebarRow::Group),
+        );
         rows
+    }
+
+    /// Connected remote endpoints that currently have no device rows.
+    pub fn empty_remote_endpoints(&self) -> Vec<EndpointId> {
+        self.remote_labels
+            .keys()
+            .filter(|endpoint| {
+                !self
+                    .devices
+                    .iter()
+                    .any(|device| device.endpoint == **endpoint)
+            })
+            .copied()
+            .collect()
     }
 
     /// The heading of one endpoint's device group.

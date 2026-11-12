@@ -744,6 +744,7 @@ impl App {
         // Preserve the human's draft for every failed save, even if current
         // device discovery requires pruning it before authorization.
         let original_draft_checked = self.state.draft_checked.clone();
+        let original_pending_checked = self.state.sharing.pending_checked.clone();
         // A replacement at a reused path must be checked again; stale UI state
         // is never turned into an authorization.
         self.state.drop_replaced_checks();
@@ -752,6 +753,7 @@ impl App {
         let draft_checked = self.state.draft_checked.clone();
         let Some(store) = self.settings_store.clone() else {
             self.state.draft_checked = original_draft_checked;
+            self.state.sharing.pending_checked = original_pending_checked;
             self.state.notice = Some(Notice::error("settings not saved: no settings file"));
             return;
         };
@@ -769,6 +771,7 @@ impl App {
             Ok(staged) => staged,
             Err(error) => {
                 self.state.draft_checked = original_draft_checked.clone();
+                self.state.sharing.pending_checked = original_pending_checked.clone();
                 self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
                 return;
             }
@@ -786,6 +789,7 @@ impl App {
                         store.discard(staged);
                     }
                     self.state.draft_checked = original_draft_checked.clone();
+                    self.state.sharing.pending_checked = original_pending_checked.clone();
                     self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
                     return;
                 }
@@ -817,6 +821,9 @@ impl App {
                             store.discard(staged);
                         }
                         self.state.draft_checked = original_draft_checked.clone();
+                        if !uncertain {
+                            self.state.sharing.pending_checked = original_pending_checked.clone();
+                        }
                         self.state.notice = Some(Notice::error(if uncertain {
                             format!(
                                 "settings save is unknown: {error}; the core may have applied the checklist — check it and save again"
@@ -853,6 +860,8 @@ impl App {
                         match self.client.stop_sharing() {
                             Ok(()) => {
                                 self.state.sharing.clear_session();
+                                self.state.sharing.pending_checked =
+                                    original_pending_checked.clone();
                                 self.state.close_pairing_view();
                                 self.state.notice = Some(Notice::error(format!(
                                     "settings not saved: {error}; checklist rollback failed and sharing was stopped: {rollback_error}"
@@ -869,6 +878,7 @@ impl App {
                 }
             } else {
                 self.state.draft_checked = original_draft_checked;
+                self.state.sharing.pending_checked = original_pending_checked;
                 self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
             }
             return;

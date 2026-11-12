@@ -338,9 +338,8 @@ pub fn hit_test(state: &AppState, area: Rect, column: u16, row: u16) -> Option<H
     if in_rect(sidebar.connect, column, row) {
         return Some(Hit::Connect);
     }
-    let sticky_rows = empty_remote_endpoints(state)
-        .len()
-        .min(sidebar.list.height as usize);
+    let empty_endpoints = state.empty_remote_endpoints();
+    let sticky_rows = empty_endpoints.len().min(sidebar.list.height as usize);
     let list = sidebar_device_list(sidebar, sticky_rows);
     if list.height == 0 || !in_rect(list, column, row) {
         return None;
@@ -348,7 +347,7 @@ pub fn hit_test(state: &AppState, area: Rect, column: u16, row: u16) -> Option<H
     let rows: Vec<SidebarRow> = state
         .sidebar_rows()
         .into_iter()
-        .filter(|row| !is_empty_remote_group(state, *row))
+        .filter(|row| !is_empty_remote_group(&empty_endpoints, *row))
         .collect();
     let list_sidebar = Sidebar { list, ..sidebar };
     let first = first_sidebar_row(state, &rows, list_sidebar);
@@ -385,23 +384,8 @@ fn first_sidebar_row(state: &AppState, rows: &[SidebarRow], sidebar: Sidebar) ->
     }
 }
 
-fn empty_remote_endpoints(state: &AppState) -> Vec<EndpointId> {
-    state
-        .remote_labels
-        .keys()
-        .filter(|endpoint| {
-            !state
-                .devices
-                .iter()
-                .any(|device| device.endpoint == **endpoint)
-        })
-        .copied()
-        .collect()
-}
-
-fn is_empty_remote_group(state: &AppState, row: SidebarRow) -> bool {
-    matches!(row, SidebarRow::Group(endpoint)
-        if empty_remote_endpoints(state).contains(&endpoint))
+fn is_empty_remote_group(empty_endpoints: &[EndpointId], row: SidebarRow) -> bool {
+    matches!(row, SidebarRow::Group(endpoint) if empty_endpoints.contains(&endpoint))
 }
 
 fn sidebar_device_list(sidebar: Sidebar, sticky_rows: usize) -> Rect {
@@ -563,11 +547,11 @@ fn draw_header(state: &AppState, buffer: &mut Buffer, area: Rect) {
 fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u16, u16)> {
     let sidebar = sidebar(rect)?;
     let list = sidebar.list;
-    let empty_remote_tags: Vec<String> = empty_remote_endpoints(state)
+    let empty_endpoints = state.empty_remote_endpoints();
+    let empty_remote_tags: Vec<String> = empty_endpoints
         .iter()
         .map(|endpoint| state.endpoint_tag(*endpoint))
         .collect();
-    let empty_endpoints = empty_remote_endpoints(state);
     let sticky_rows = empty_endpoints.len().min(list.height as usize);
     let device_list = sidebar_device_list(sidebar, sticky_rows);
     // With no room for a device row, the title row carries the highlighted
@@ -620,7 +604,7 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u1
     let rows: Vec<SidebarRow> = state
         .sidebar_rows()
         .into_iter()
-        .filter(|row| !is_empty_remote_group(state, *row))
+        .filter(|row| !is_empty_remote_group(&empty_endpoints, *row))
         .collect();
     let list_sidebar = Sidebar {
         list: device_list,

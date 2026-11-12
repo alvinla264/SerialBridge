@@ -553,6 +553,8 @@ fn a_failed_save_keeps_a_checked_draft_when_discovery_identity_is_lost() {
     let mut app = fixture.app();
     let path = devices[0].path.clone();
     check_device(&mut app, &path);
+    save(&mut app);
+    app.state.begin_settings();
     let index = app
         .state
         .devices
@@ -565,7 +567,10 @@ fn a_failed_save_keeps_a_checked_draft_when_discovery_identity_is_lost() {
 
     save(&mut app);
 
-    assert!(!app.state.sharing.pending_checked.contains(&path));
+    assert!(
+        app.state.sharing.pending_checked.contains(&path),
+        "the previously saved checklist is not changed by a failed save"
+    );
     assert!(
         app.state.draft_checked.contains(&path),
         "a failed save retains the human's checklist draft"
@@ -595,6 +600,36 @@ fn leaving_the_terminal_stops_sharing_and_revokes_the_credentials() {
     // The listener and the credentials are gone with the owning terminal.
     let result = RemoteClient::connect(&host, &human, None, Duration::from_secs(2));
     assert!(result.is_err(), "the old pairing no longer works");
+}
+
+#[test]
+fn sharing_does_not_start_when_a_checked_device_has_no_current_identity() {
+    let (fixture, devices) = Fixture::new();
+    let mut app = fixture.app();
+    let path = devices[0].path.clone();
+    check_device(&mut app, &path);
+    set_bind(&mut app, "127.0.0.1", 0);
+    save(&mut app);
+    let index = app
+        .state
+        .devices
+        .iter()
+        .position(|device| device.path == path)
+        .expect("detected device");
+    app.state.devices[index].identity = None;
+
+    start(&mut app);
+
+    assert!(!app.state.sharing.active);
+    assert!(!app.state.sharing.pending_checked.contains(&path));
+    assert!(
+        app.state
+            .notice
+            .as_ref()
+            .is_some_and(|notice| notice.text.contains("check at least one device")),
+        "the path without an identity is refused"
+    );
+    app.shutdown();
 }
 
 #[test]
