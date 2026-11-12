@@ -756,14 +756,12 @@ impl App {
         // Every checked device needs the identity the owner selected. Without
         // one the core would fall back to the current node at that path, which
         // could be a replacement; refuse instead of authorizing it.
-        let expected = self.expected_identities(&desired, &self.state.draft_identities);
+        let draft_identities = self.state.draft_checked.identities();
+        let expected = self.expected_identities(&desired, &draft_identities);
         if active && expected.len() != desired.len() {
             self.state
                 .draft_checked
                 .retain(|path| expected.contains_key(path));
-            self.state
-                .draft_identities
-                .retain(|path, _| self.state.draft_checked.contains(path));
             self.state.notice = Some(Notice::error(
                 "settings not saved: a checked device has no captured identity; refresh and check it again",
             ));
@@ -826,7 +824,7 @@ impl App {
                     if uncertain {
                         self.sync_share_status();
                         if self.state.sharing.active
-                            && self.state.sharing.checked() == draft_checked
+                            && draft_checked == self.state.sharing.checked()
                         {
                             self.state.commit_settings();
                             self.state.notice = Some(Notice::info("settings saved"));
@@ -896,8 +894,6 @@ impl App {
             for path in &missing {
                 self.state.sharing.pending_checked.remove(path);
                 self.state.draft_checked.remove(path);
-                self.state.sharing.pending_identities.remove(path);
-                self.state.draft_identities.remove(path);
             }
             self.state.notice = Some(Notice::error(format!(
                 "sharing not started: no captured identity for {}; refresh and check it again",
@@ -919,7 +915,8 @@ impl App {
                 return;
             }
         };
-        let expected = self.expected_identities(&devices, &self.state.sharing.pending_identities);
+        let pending_identities = self.state.sharing.pending_checked.identities();
+        let expected = self.expected_identities(&devices, &pending_identities);
         match self.client.start_sharing_expected(bind, devices, expected) {
             Ok(info) => {
                 self.state.sharing.active = true;

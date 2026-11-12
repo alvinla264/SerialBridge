@@ -98,6 +98,98 @@ impl Notice {
     }
 }
 
+/// The checked devices of one checklist, with the identity each path was
+/// selected as. One map keeps the path/identity invariant in one place.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Checklist {
+    entries: BTreeMap<String, String>,
+}
+
+impl Checklist {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn contains(&self, path: &str) -> bool {
+        self.entries.contains_key(path)
+    }
+
+    pub fn insert(&mut self, path: String) -> bool {
+        self.entries.insert(path, String::new()).is_none()
+    }
+
+    pub fn insert_with_identity(&mut self, path: String, identity: String) -> bool {
+        self.entries.insert(path, identity).is_none()
+    }
+
+    pub fn remove(&mut self, path: &str) -> bool {
+        self.entries.remove(path).is_some()
+    }
+
+    pub fn retain(&mut self, mut keep: impl FnMut(&String) -> bool) {
+        self.entries.retain(|path, _| keep(path));
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &String> {
+        self.entries.keys()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn identities(&self) -> BTreeMap<String, String> {
+        self.entries
+            .iter()
+            .filter(|(_, identity)| !identity.is_empty())
+            .map(|(path, identity)| (path.clone(), identity.clone()))
+            .collect()
+    }
+
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (String, String)>) -> Self {
+        Self {
+            entries: pairs.into_iter().collect(),
+        }
+    }
+
+    /// Reconcile with current discovery: fill a missing identity, drop a path
+    /// that vanished, and drop one whose recorded identity changed.
+    fn sync(&mut self, detected: &BTreeMap<String, String>) {
+        self.entries
+            .retain(|path, recorded| match detected.get(path) {
+                Some(current) => recorded.is_empty() || recorded == current,
+                None => false,
+            });
+        for (path, identity) in detected {
+            if self.entries.contains_key(path) {
+                self.entries.insert(path.clone(), identity.clone());
+            }
+        }
+    }
+
+    fn paths(&self) -> BTreeSet<String> {
+        self.entries.keys().cloned().collect()
+    }
+}
+
+impl PartialEq<BTreeSet<String>> for Checklist {
+    fn eq(&self, other: &BTreeSet<String>) -> bool {
+        self.paths() == *other
+    }
+}
+
+impl FromIterator<String> for Checklist {
+    fn from_iter<T: IntoIterator<Item = String>>(iter: T) -> Self {
+        Self {
+            entries: iter.into_iter().map(|path| (path, String::new())).collect(),
+        }
+    }
+}
+
 /// The local owner's sharing session, as the core reports it.
 ///
 /// `pairing` holds the pairing secrets exactly once, in memory only: they are
@@ -113,10 +205,7 @@ pub struct SharingState {
     /// Device paths checked for sharing. While a session is running this
     /// mirrors the core's authoritative checked list; before it starts it is
     /// the selection the host made in the settings.
-    pub pending_checked: BTreeSet<String>,
-    /// The device identity each pending path was checked as. A different
-    /// device at the same path no longer matches and loses its check.
-    pub pending_identities: BTreeMap<String, String>,
+    pub pending_checked: Checklist,
 }
 
 impl SharingState {
@@ -125,8 +214,7 @@ impl SharingState {
             active: false,
             snapshot: None,
             pairing: None,
-            pending_checked: BTreeSet::new(),
-            pending_identities: BTreeMap::new(),
+            pending_checked: Checklist::new(),
         }
     }
 
@@ -138,7 +226,7 @@ impl SharingState {
                 .iter()
                 .map(|device| device.path.clone())
                 .collect(),
-            _ => self.pending_checked.clone(),
+            _ => self.pending_checked.paths(),
         }
     }
 
@@ -433,9 +521,7 @@ pub struct AppState {
     /// saves them. Escape throws them away.
     pub draft: TerminalSettings,
     /// The device checkboxes in the settings draft. Session-only.
-    pub draft_checked: BTreeSet<String>,
-    /// The identity each checked draft path was selected as.
-    pub draft_identities: BTreeMap<String, String>,
+    pub draft_checked: Checklist,
     /// This terminal's sharing session (owner only).
     pub sharing: SharingState,
     /// Labels for connected remote hosts, keyed by endpoint. The local
@@ -472,8 +558,7 @@ impl AppState {
             pairing_scroll: 0,
             settings: TerminalSettings::default(),
             draft: TerminalSettings::default(),
-            draft_checked: BTreeSet::new(),
-            draft_identities: BTreeMap::new(),
+            draft_checked: Checklist::new(),
             sharing: SharingState::new(),
             remote_labels: BTreeMap::new(),
             connect: None,
@@ -582,7 +667,6 @@ impl AppState {
                 let device = self.devices.get(index)?;
                 let path = device.path.clone();
                 let checked = if self.draft_checked.remove(&path) {
-                    self.draft_identities.remove(&path);
                     false
                 } else {
                     // Without a captured identity the core could only match a
@@ -593,8 +677,7 @@ impl AppState {
                         ));
                         return Some(false);
                     };
-                    self.draft_identities.insert(path.clone(), identity);
-                    self.draft_checked.insert(path);
+                    self.draft_checked.insert_with_identity(path, identity);
                     true
                 };
                 Some(checked)
@@ -681,8 +764,7 @@ impl AppState {
         self.draft = self.settings.clone();
         // The checklist starts from what the core currently shares, or from
         // the session-only selection made before sharing started.
-        self.draft_checked = self.sharing.checked();
-        self.draft_identities = self.sharing.pending_identities.clone();
+        self.draft_checked = self.sharing.pending_checked.clone();
         self.sync_checked_identities();
         self.port_text = self.draft.share_port.to_string();
         self.settings_row = 0;
@@ -694,8 +776,7 @@ impl AppState {
     /// Leave the settings without keeping the draft.
     pub fn cancel_settings(&mut self) {
         self.draft = self.settings.clone();
-        self.draft_checked = self.sharing.checked();
-        self.draft_identities = self.sharing.pending_identities.clone();
+        self.draft_checked = self.sharing.pending_checked.clone();
         self.port_text = self.draft.share_port.to_string();
         self.settings_editing = false;
         self.leave_settings();
@@ -708,7 +789,6 @@ impl AppState {
         self.settings = self.draft.clone();
         self.port_text = self.settings.share_port.to_string();
         self.sharing.pending_checked = self.draft_checked.clone();
-        self.sharing.pending_identities = self.draft_identities.clone();
         self.settings_editing = false;
         self.apply_scrollback();
         self.leave_settings();
@@ -1242,9 +1322,8 @@ impl AppState {
         if snapshot.active {
             for path in previous.difference(&next) {
                 self.draft_checked.remove(path);
-                self.draft_identities.remove(path);
             }
-            self.sharing.pending_checked = next;
+            self.sharing.pending_checked = next.into_iter().collect();
             self.sync_checked_identities();
         }
         // An inactive snapshot says only that sharing is off; the session-only
@@ -1270,16 +1349,8 @@ impl AppState {
     /// Drop checked devices that are no longer detected. The core revokes
     /// their authorization; the checkbox must not survive a replacement.
     pub fn prune_share_checks(&mut self, detected: &BTreeMap<String, String>) {
-        retain_checked(
-            &mut self.sharing.pending_checked,
-            &mut self.sharing.pending_identities,
-            detected,
-        );
-        retain_checked(
-            &mut self.draft_checked,
-            &mut self.draft_identities,
-            detected,
-        );
+        self.sharing.pending_checked.sync(detected);
+        self.draft_checked.sync(detected);
     }
 
     /// Drop a check whose recorded identity no longer matches the device at
@@ -1295,12 +1366,8 @@ impl AppState {
     /// for pruning to remove.
     pub fn sync_checked_identities(&mut self) {
         let detected = self.detected_local_identities();
-        sync_identities(
-            &self.sharing.pending_checked,
-            &mut self.sharing.pending_identities,
-            &detected,
-        );
-        sync_identities(&self.draft_checked, &mut self.draft_identities, &detected);
+        self.sharing.pending_checked.sync(&detected);
+        self.draft_checked.sync(&detected);
     }
 
     /// The local devices the core currently detects, mapped to their identity.
@@ -1456,36 +1523,6 @@ impl AppState {
             prompt.error = None;
         }
     }
-}
-
-/// Keep the identity map in step with the checked paths and the current
-/// discovery tokens.
-fn sync_identities(
-    checked: &BTreeSet<String>,
-    identities: &mut BTreeMap<String, String>,
-    detected: &BTreeMap<String, String>,
-) {
-    identities.retain(|path, _| checked.contains(path));
-    for path in checked {
-        if let Some(identity) = detected.get(path) {
-            identities.insert(path.clone(), identity.clone());
-        }
-    }
-}
-
-/// Drop checks whose path is no longer detected or whose recorded identity no
-/// longer matches the device at that path. A replacement at a reused path must
-/// be checked again instead of inheriting the old selection.
-fn retain_checked(
-    checked: &mut BTreeSet<String>,
-    identities: &mut BTreeMap<String, String>,
-    detected: &BTreeMap<String, String>,
-) {
-    checked.retain(|path| match (identities.get(path), detected.get(path)) {
-        (Some(recorded), Some(current)) => recorded == current,
-        (Some(_), None) | (None, Some(_)) | (None, None) => false,
-    });
-    identities.retain(|path, _| checked.contains(path));
 }
 
 fn on_off(value: bool) -> String {
@@ -2026,15 +2063,13 @@ mod sharing_tests {
     #[test]
     fn an_unplugged_path_is_pruned_from_the_checks() {
         let mut state = state_with_devices();
-        state.sharing.pending_checked.insert("/dev/ttyUSB0".into());
         state
             .sharing
-            .pending_identities
-            .insert("/dev/ttyUSB0".into(), "gone".into());
-        state.draft_checked.insert("/dev/ttyUSB1".into());
+            .pending_checked
+            .insert_with_identity("/dev/ttyUSB0".into(), "gone".into());
         state
-            .draft_identities
-            .insert("/dev/ttyUSB1".into(), "id1".into());
+            .draft_checked
+            .insert_with_identity("/dev/ttyUSB1".into(), "id1".into());
         let detected: BTreeMap<String, String> = [("/dev/ttyUSB1".to_string(), "id1".to_string())]
             .into_iter()
             .collect();

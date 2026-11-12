@@ -335,7 +335,13 @@ fn first_sidebar_row(state: &AppState, rows: &[SidebarRow], sidebar: Sidebar) ->
         .iter()
         .position(|row| matches!(row, SidebarRow::Device(index) if *index == state.selected))
         .unwrap_or(0);
-    selected.saturating_add(1).saturating_sub(capacity)
+    // Clamp to the list's own last page so trailing rows (for example a
+    // connected host with no approved devices) can be seen from the last
+    // selectable device.
+    selected
+        .saturating_add(1)
+        .saturating_sub(capacity)
+        .min(rows.len().saturating_sub(capacity))
 }
 
 fn in_rect(rect: Rect, column: u16, row: u16) -> bool {
