@@ -919,13 +919,21 @@ impl App {
                     self.state.sharing.active = true;
                     self.sync_share_status();
                     if self.state.sharing.active {
-                        self.state.notice = Some(Notice::error(format!(
-                            "sharing start is unknown: {error}; sharing may be on — press s to stop it"
-                        )));
-                    } else {
-                        self.state.notice =
-                            Some(Notice::error(format!("sharing did not start: {error}")));
+                        // The start response is the only copy of the fresh
+                        // credentials. If it was lost, stop the session rather
+                        // than leave an active listener whose pairing cannot
+                        // be shown to its owner.
+                        self.stop_sharing();
                     }
+                    self.state.notice = Some(Notice::error(if self.state.sharing.active {
+                        format!(
+                            "sharing start is unknown: {error}; pairing information was lost — press s to stop the session"
+                        )
+                    } else {
+                        format!(
+                            "sharing start response was lost: {error}; the session was stopped because pairing information is unavailable — start sharing again"
+                        )
+                    }));
                 } else {
                     self.state.sharing.clear_session();
                     self.state.notice =

@@ -338,12 +338,18 @@ pub fn hit_test(state: &AppState, area: Rect, column: u16, row: u16) -> Option<H
     if in_rect(sidebar.connect, column, row) {
         return Some(Hit::Connect);
     }
-    let list = sidebar.list;
+    let sticky_empty_hosts = has_empty_remote_hosts(state) && sidebar.list.height > 0;
+    let list = sidebar_device_list(sidebar, sticky_empty_hosts);
     if list.height == 0 || !in_rect(list, column, row) {
         return None;
     }
-    let rows = state.sidebar_rows();
-    let first = first_sidebar_row(state, &rows, sidebar);
+    let rows: Vec<SidebarRow> = state
+        .sidebar_rows()
+        .into_iter()
+        .filter(|row| !is_empty_remote_group(state, *row))
+        .collect();
+    let list_sidebar = Sidebar { list, ..sidebar };
+    let first = first_sidebar_row(state, &rows, list_sidebar);
     let offset = (row - list.y) as usize + first;
     match rows.get(offset) {
         Some(SidebarRow::Device(index)) => Some(Hit::Device(*index)),
@@ -374,6 +380,34 @@ fn first_sidebar_row(state: &AppState, rows: &[SidebarRow], sidebar: Sidebar) ->
         first.max(last_page)
     } else {
         first
+    }
+}
+
+fn has_empty_remote_hosts(state: &AppState) -> bool {
+    state.remote_labels.keys().any(|endpoint| {
+        !state
+            .devices
+            .iter()
+            .any(|device| device.endpoint == *endpoint)
+    })
+}
+
+fn is_empty_remote_group(state: &AppState, row: SidebarRow) -> bool {
+    matches!(row, SidebarRow::Group(endpoint)
+        if state.remote_labels.contains_key(&endpoint)
+            && !state.devices.iter().any(|device| device.endpoint == endpoint))
+}
+
+fn sidebar_device_list(sidebar: Sidebar, sticky_empty_hosts: bool) -> Rect {
+    if sticky_empty_hosts {
+        Rect::new(
+            sidebar.list.x,
+            sidebar.list.y.saturating_add(1),
+            sidebar.list.width,
+            sidebar.list.height.saturating_sub(1),
+        )
+    } else {
+        sidebar.list
     }
 }
 
@@ -563,10 +597,21 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u1
     };
     let title_style = focus_title_style(state.focus == Focus::Sidebar);
     put(buffer, sidebar.title, 0, &title, title_style);
-    if state.devices.is_empty() && list.height > 0 {
+    let sticky_empty_hosts = !empty_remote_tags.is_empty() && list.height > 0;
+    let device_list = sidebar_device_list(sidebar, sticky_empty_hosts);
+    if sticky_empty_hosts {
         put(
             buffer,
-            list,
+            Rect::new(list.x, list.y, list.width, 1),
+            0,
+            &format!(" Remote host: {}", empty_remote_tags.join(", ")),
+            dim(),
+        );
+    }
+    if state.devices.is_empty() && device_list.height > 0 {
+        put(
+            buffer,
+            device_list,
             1,
             "no serial devices — is the core running?",
             dim(),
@@ -575,13 +620,21 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u1
     let shown = state
         .shown_device()
         .map(|device| (device.endpoint, device.path.clone()));
-    let rows = state.sidebar_rows();
-    let first = first_sidebar_row(state, &rows, sidebar);
+    let rows: Vec<SidebarRow> = state
+        .sidebar_rows()
+        .into_iter()
+        .filter(|row| !is_empty_remote_group(state, *row))
+        .collect();
+    let list_sidebar = Sidebar {
+        list: device_list,
+        ..sidebar
+    };
+    let first = first_sidebar_row(state, &rows, list_sidebar);
     for (offset, row) in rows.iter().skip(first).enumerate() {
-        if offset >= list.height as usize {
+        if offset >= device_list.height as usize {
             break;
         }
-        let y = list.y + offset as u16;
+        let y = device_list.y + offset as u16;
         let line = Rect::new(list.x, y, list.width, 1);
         match row {
             SidebarRow::Group(endpoint) => {
@@ -1614,25 +1667,21 @@ mod tests {
     }
 
     #[test]
-    fn the_last_device_viewport_includes_an_empty_connected_host() {
-        let mut state = AppState::new(12, 40);
-        let devices = (0..12)
-            .map(|index| DeviceEntry::new(format!("/dev/tty{index}")))
-            .collect();
-        state.set_devices(devices);
+    fn an_empty_connected_host_stays_visible_in_a_full_sidebar() {
+        let mut state = AppState::new(16, 40);
+        state.set_devices(
+            (0..8)
+                .map(|index| DeviceEntry::new(format!("/dev/tty{index}")))
+                .collect(),
+        );
         state
             .remote_labels
-            .insert(EndpointId(1), "remote host".into());
-        state.select_index(11);
+            .insert(EndpointId(1), "empty host".into());
+        state.select_index(0);
 
-        let area = Rect::new(0, 0, 80, 12);
-        let sidebar = sidebar(panes(area).sidebar).expect("sidebar");
-        let rows = state.sidebar_rows();
-        let first = first_sidebar_row(&state, &rows, sidebar);
-        let visible = &rows[first..first + sidebar.list.height as usize];
-
-        assert!(visible.contains(&SidebarRow::Group(EndpointId(1))));
-        assert!(visible.contains(&SidebarRow::Device(11)));
+        let rendered = screen(&state, 80, 16).join("\\n");
+        assert!(rendered.contains("Remote host: #1"), "{rendered}");
+        assert!(rendered.contains("/dev/tty0"), "{rendered}");
     }
 
     #[test]
