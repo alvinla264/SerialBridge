@@ -185,7 +185,7 @@ pub struct Engine {
     /// carrying the opaque token the terminal selected. Holding the identity
     /// keeps the kernel from recycling its inode before a later ShareStart.
     detected_tokens: Mutex<HashMap<String, (String, DeviceIdentity)>>,
-    next_identity_token: AtomicU64,
+    next_engine_token: AtomicU64,
     /// A checklist validated by SharePrepare, waiting for the owner to publish
     /// its preferences and then commit it.
     prepared_share: Mutex<Option<PreparedShare>>,
@@ -222,7 +222,7 @@ impl Engine {
             share_gate: RwLock::new(()),
             live_writes: Mutex::new(HashMap::new()),
             detected_tokens: Mutex::new(HashMap::new()),
-            next_identity_token: AtomicU64::new(1),
+            next_engine_token: AtomicU64::new(1),
             prepared_share: Mutex::new(None),
         })
     }
@@ -545,7 +545,7 @@ impl Engine {
             .unwrap_or_else(|| {
                 format!(
                     "snx-{}",
-                    self.next_identity_token.fetch_add(1, Ordering::SeqCst)
+                    self.next_engine_token.fetch_add(1, Ordering::SeqCst)
                 )
             });
         tokens.insert(path.to_string(), (token.clone(), identity));
@@ -1835,7 +1835,7 @@ impl Engine {
         }
         let token = format!(
             "rep-{}",
-            self.next_identity_token.fetch_add(1, Ordering::SeqCst)
+            self.next_engine_token.fetch_add(1, Ordering::SeqCst)
         );
         *self.prepared_share.lock().expect("prepared share lock") = Some(PreparedShare {
             owner: client_id,
@@ -1877,6 +1877,10 @@ impl Engine {
         session: &SharingSession,
         identities: Vec<DeviceIdentity>,
     ) -> Result<ResponseData, ErrorBody> {
+        // Serialize authorization removal and write-epoch invalidation against
+        // remote admission. A command is either queued before the bump (then
+        // dropped by the writer) or admitted after the revoked ACL (denied).
+        let _gate = self.share_gate.write().expect("share gate");
         let (expired, removed) = session.replace(identities)?;
         for path in expired.into_iter().chain(removed) {
             self.revoke_path_everywhere(&path, session);
@@ -1909,6 +1913,7 @@ impl Engine {
         params: ShareDevicesParams,
     ) -> Result<ResponseData, ErrorBody> {
         let session = self.owner_session(client_id)?;
+        let gate = self.share_gate.write().expect("share gate");
         let mut revoked = Vec::new();
         for path in &params.devices {
             if let Some(identity) = session.uncheck(path) {
@@ -1941,6 +1946,9 @@ impl Engine {
                 revoked.extend(device_ids);
             }
         }
+        // Authorization and epochs are now revoked atomically with write
+        // admission. Drop the gate before queue notifications or serial cleanup.
+        drop(gate);
         // Revoke every requested device before any blocking serial cleanup, so
         // a stalled first device cannot delay authorization removal for later
         // ones. Local clients and other devices are untouched.
@@ -2095,7 +2103,8 @@ impl Engine {
                     .map(|(_, record)| record.tx.clone())
                     .collect();
                 for tx in receivers {
-                    let _ = tx.send(event.clone());
+                    // A full slow-peer queue must never stall local revocation.
+                    let _ = tx.try_send(event.clone());
                 }
             }
             session.clear_vacated(&path);

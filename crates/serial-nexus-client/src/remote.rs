@@ -36,15 +36,41 @@ use crate::ClientError;
 pub struct RemoteEndpoint {
     pub address: IpAddr,
     pub port: u16,
+    /// Interface index for scoped IPv6 link-local endpoints.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub scope_id: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 impl RemoteEndpoint {
     pub fn new(address: IpAddr, port: u16) -> Self {
-        Self { address, port }
+        Self {
+            address,
+            port,
+            scope_id: 0,
+        }
+    }
+
+    pub fn with_scope(address: IpAddr, port: u16, scope_id: u32) -> Self {
+        Self {
+            address,
+            port,
+            scope_id,
+        }
     }
 
     pub fn from_socket_addr(address: SocketAddr) -> Self {
-        Self::new(address.ip(), address.port())
+        match address {
+            SocketAddr::V4(address) => Self::new(IpAddr::V4(*address.ip()), address.port()),
+            SocketAddr::V6(address) => Self::with_scope(
+                IpAddr::V6(*address.ip()),
+                address.port(),
+                address.scope_id(),
+            ),
+        }
     }
 
     /// IPv4-mapped IPv6 is the same endpoint as its IPv4 form, exactly as the
@@ -62,7 +88,7 @@ impl RemoteEndpoint {
     /// The same endpoint with IPv4-mapped IPv6 folded to IPv4, so equality and
     /// ordering treat both spellings as one endpoint.
     pub fn canonical(&self) -> Self {
-        Self::new(Self::canonical_ip(self.address), self.port)
+        Self::with_scope(Self::canonical_ip(self.address), self.port, self.scope_id)
     }
 
     /// Refuse addresses no client can mean: port 0, wildcards, multicast and
@@ -72,6 +98,9 @@ impl RemoteEndpoint {
             return Err("the port must be between 1 and 65535".to_string());
         }
         let address = Self::canonical_ip(self.address);
+        if self.scope_id != 0 && !matches!(address, IpAddr::V6(ip) if ip.is_unicast_link_local()) {
+            return Err("an interface scope is valid only for link-local IPv6".to_string());
+        }
         if address.is_unspecified() {
             return Err(format!(
                 "{address} is a wildcard address; give the host's concrete address"
@@ -89,7 +118,15 @@ impl RemoteEndpoint {
     }
 
     pub fn socket_addr(&self) -> SocketAddr {
-        SocketAddr::new(self.address, self.port)
+        match self.address {
+            IpAddr::V4(address) => SocketAddr::new(IpAddr::V4(address), self.port),
+            IpAddr::V6(address) => SocketAddr::V6(std::net::SocketAddrV6::new(
+                address,
+                self.port,
+                0,
+                self.scope_id,
+            )),
+        }
     }
 }
 
@@ -647,6 +684,15 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_ipv6_socket_addresses_keep_their_interface_index() {
+        let socket: SocketAddr = "[fe80::1%3]:7331".parse().expect("scoped socket address");
+        let endpoint = RemoteEndpoint::from_socket_addr(socket);
+        assert_eq!(endpoint.scope_id, 3);
+        assert_eq!(endpoint.socket_addr(), socket);
+        assert!(endpoint.validate().is_ok());
+    }
 
     #[test]
     fn a_full_bounded_subscriber_is_dropped_without_blocking() {

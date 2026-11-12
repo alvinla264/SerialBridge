@@ -131,10 +131,10 @@ Device rules:
   `/dev/serial/by-id/...` and `/dev/ttyUSB0` name the same open device, and
   discovery canonicalizes `by-id` aliases so each device is listed once.
 - **Closing.** The last client disconnecting closes the device and releases its
-  rate. Every write already accepted is drained to the device before the close
-  completes, and the core waits for the device's I/O threads to release the
-  serial file before it reports the close (or broadcasts `DeviceClosed`), so an
-  immediate reopen works from any client.
+  rate. For a local close, accepted writes drain and the serial file is released
+  before `DeviceClosed` is reported, so immediate reopen is a drain barrier.
+  Remote close returns before asynchronous drain and is not a release barrier;
+  see [the client and interface guide](clients.md#remote-lan-transport).
 - **Write control.** One AI client per device may write. It asks for control
   with `open(..., request_control = true)`. If another AI holds it, the open
   succeeds read-only and reports the holder; the holder is also told via a

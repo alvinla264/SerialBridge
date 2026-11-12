@@ -801,16 +801,37 @@ fn parse_endpoint(ip: &Value, port: &Value) -> Result<RemoteEndpoint, Failure> {
     let text = ip
         .as_str()
         .ok_or_else(|| Failure::Params("ip must be an IPv4 or IPv6 address string".into()))?;
-    let address = text.parse::<IpAddr>().map_err(|_| {
-        Failure::Params(format!(
-            "{text:?} is not an IPv4 or IPv6 address (for example 192.0.2.10 or ::1)"
-        ))
-    })?;
+    let (address, scope_id) = match text.rsplit_once('%') {
+        Some((address, scope)) => {
+            let address = address.parse::<IpAddr>().map_err(|_| {
+                Failure::Params(format!(
+                    "{text:?} is not an IPv4 or IPv6 address (for example 192.0.2.10 or ::1)"
+                ))
+            })?;
+            let IpAddr::V6(address) = address else {
+                return Err(Failure::Params(
+                    "interface scope requires an IPv6 address".into(),
+                ));
+            };
+            let scope_id = scope.parse::<u32>().map_err(|_| {
+                Failure::Params("IPv6 interface scope must be a numeric interface index".into())
+            })?;
+            (IpAddr::V6(address), scope_id)
+        }
+        None => (
+            text.parse::<IpAddr>().map_err(|_| {
+                Failure::Params(format!(
+                    "{text:?} is not an IPv4 or IPv6 address (for example 192.0.2.10 or ::1)"
+                ))
+            })?,
+            0,
+        ),
+    };
     let number = as_integral(port)
         .ok_or_else(|| Failure::Params("port must be a TCP port number".into()))?;
     let port = u16::try_from(number)
         .map_err(|_| Failure::Params(format!("port {number} is not between 1 and 65535")))?;
-    let endpoint = RemoteEndpoint::new(address, port).canonical();
+    let endpoint = RemoteEndpoint::with_scope(address, port, scope_id).canonical();
     endpoint.validate().map_err(Failure::Params)?;
     Ok(endpoint)
 }
@@ -857,7 +878,7 @@ pub fn definitions() -> Value {
                 "properties": {
                     "ip": {
                         "type": "string",
-                        "description": "IPv4 or IPv6 address of a host sharing devices. Give it together with port; omit both for the local core."
+                        "description": "IPv4 or IPv6 address of a host sharing devices (link-local IPv6 may include a numeric interface scope, e.g. fe80::20%3). Give it together with port; omit both for the local core."
                     },
                     "port": {
                         "type": "integer",
@@ -895,7 +916,7 @@ pub fn definitions() -> Value {
                     },
                     "ip": {
                         "type": "string",
-                        "description": "IPv4 or IPv6 address of a host sharing devices. Give it together with port and path; omit it for the local core."
+                        "description": "IPv4 or IPv6 address of a host sharing devices (link-local IPv6 may include a numeric interface scope, e.g. fe80::20%3). Give it together with port and path; omit it for the local core."
                     }
                 },
                 "additionalProperties": false
@@ -1423,6 +1444,13 @@ mod tests {
         assert_eq!(local, "Permission denied (os error 13) (PermissionDenied)");
         let remote = describe_server_error(&body, None, true);
         assert!(remote.contains("the host owner has not shared this device"));
+    }
+
+    #[test]
+    fn remote_endpoint_parser_preserves_link_local_scope() {
+        let endpoint = parse_endpoint(&json!("fe80::1%3"), &json!(7331)).unwrap();
+        assert_eq!(endpoint.scope_id, 3);
+        assert_eq!(endpoint.socket_addr().to_string(), "[fe80::1%3]:7331");
     }
 
     #[test]

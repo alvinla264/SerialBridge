@@ -146,9 +146,12 @@ $EDITOR ~/.config/serial-nexus/mcp-peers.json
 }
 ```
 
-- One entry per endpoint; two entries for the same address and port are
-  refused as ambiguous, and a file larger than 64 KiB is refused. IPv4 and IPv6 are both accepted
-  (`"address": "::1"`, `"address": "fd00::20"`).
+- One entry per endpoint; two entries for the same address, scope and port are
+  refused as ambiguous, and a file larger than 64 KiB is refused. IPv4 and IPv6
+  are accepted (`"address": "::1"`, `"address": "fd00::20"`). For a scoped
+  link-local IPv6 host, use its numeric scope in the tool's `ip` argument (for
+  example `"fe80::20%3"`); the private pairing endpoint also includes
+  `"scope_id": 3`.
 - Use the **AI** credential (`"role": "ai"`) for this server. A human
   credential is refused: the role is enforced by the host, not chosen here.
 - The file must be a regular file owned by you with no group or world
@@ -170,7 +173,7 @@ Every tool takes the same optional pair:
 
 | Argument | Meaning |
 | --- | --- |
-| `ip` | The sharing host's IPv4 or IPv6 address. |
+| `ip` | The sharing host's IPv4 or IPv6 address; link-local IPv6 may include a numeric interface scope such as `fe80::20%3`. |
 | `port` | The sharing listener's TCP port. |
 
 Give both to use that host, or neither for the local core. Giving only one is a

@@ -149,8 +149,8 @@ type:
 Local clients keep the Unix socket, framing, hello, open/join, control,
 history, close and grace-period behaviour. The uid check, private socket
 directory and one-core-per-user lock are unchanged. Sharing is layered on top
-and never changes local request or event shapes; the only addition is the five
-owner control requests and their answers.
+and never changes local request or event shapes; owner-only start, status,
+check, uncheck, prepare, commit, replace and stop requests are additive.
 
 ## Test seams
 

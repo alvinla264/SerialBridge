@@ -342,8 +342,12 @@ fn first_sidebar_row(state: &AppState, rows: &[SidebarRow], sidebar: Sidebar) ->
     let last_device = rows
         .iter()
         .rposition(|row| matches!(row, SidebarRow::Device(_)));
-    if Some(selected) == last_device {
-        first.max(rows.len().saturating_sub(capacity))
+    let last_page = rows.len().saturating_sub(capacity);
+    // Advance for a trailing empty-host heading only when that page still
+    // contains the selected device. On a very short list, keep the selectable
+    // device visible; headers must never steal the cursor from its selection.
+    if Some(selected) == last_device && last_page <= selected {
+        first.max(last_page)
     } else {
         first
     }
@@ -605,66 +609,39 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u1
 
     // The three buttons are real rows: selected with the arrow keys and
     // clickable with the mouse.
-    let mut cursor = None;
     let share_selected = state.selected_button() == Some(SidebarButton::Share);
-    let share_style = if share_selected {
-        highlighted(true)
-    } else {
-        RStyle::default().fg(RColor::Cyan)
-    };
     let share_label = if state.sharing.active {
         "[ Share: on ]"
     } else {
         "[ Share: off ]"
     };
-    draw_row(
+    let mut cursor = draw_sidebar_button(
         buffer,
         sidebar.share,
-        &format!("{} {share_label}", if share_selected { "›" } else { " " }),
+        share_selected,
+        share_label,
         if state.sharing.active {
             "p pairing · s stops"
         } else {
             "Enter starts · s"
         },
-        share_style,
     );
-    if share_selected {
-        cursor = Some((sidebar.share.x + 1, sidebar.share.y));
-    }
-
-    let connect_selected = state.selected_button() == Some(SidebarButton::Connect);
-    let connect_style = if connect_selected {
-        highlighted(true)
-    } else {
-        RStyle::default().fg(RColor::Cyan)
-    };
-    draw_row(
+    cursor = draw_sidebar_button(
         buffer,
         sidebar.connect,
-        &format!("{} [ Connect ]", if connect_selected { "›" } else { " " }),
+        state.selected_button() == Some(SidebarButton::Connect),
+        "[ Connect ]",
         "Enter · c",
-        connect_style,
-    );
-    if connect_selected {
-        cursor = Some((sidebar.connect.x + 1, sidebar.connect.y));
-    }
-
-    let selected = state.settings_button_selected();
-    let style = if selected {
-        highlighted(true)
-    } else {
-        RStyle::default().fg(RColor::Cyan)
-    };
-    draw_row(
+    )
+    .or(cursor);
+    cursor = draw_sidebar_button(
         buffer,
         sidebar.button,
-        &format!("{} [ Settings ]", if selected { "›" } else { " " }),
+        state.settings_button_selected(),
+        "[ Settings ]",
         "Enter opens",
-        style,
-    );
-    if selected {
-        cursor = Some((sidebar.button.x + 1, sidebar.button.y));
-    }
+    )
+    .or(cursor);
 
     if let Some(cursor) = cursor {
         Some(cursor)
@@ -1176,6 +1153,23 @@ fn draw_hints(state: &AppState, buffer: &mut Buffer, area: Rect) {
     put(buffer, area, 0, &hints, dim());
 }
 
+fn draw_sidebar_button(
+    buffer: &mut Buffer,
+    area: Rect,
+    selected: bool,
+    label: &str,
+    hint: &str,
+) -> Option<(u16, u16)> {
+    let marker = if selected { "›" } else { " " };
+    let style = if selected {
+        highlighted(true)
+    } else {
+        RStyle::default().fg(RColor::Cyan)
+    };
+    draw_row(buffer, area, &format!("{marker} {label}"), hint, style);
+    selected.then_some((area.x + 1, area.y))
+}
+
 /// One sidebar or settings row: a label on the left, a value kept at the
 /// right edge, and the selection style.
 fn draw_row(buffer: &mut Buffer, area: Rect, label: &str, value: &str, style: RStyle) {
@@ -1573,6 +1567,26 @@ mod tests {
 
         assert!(visible.contains(&SidebarRow::Group(EndpointId(1))));
         assert!(visible.contains(&SidebarRow::Device(11)));
+    }
+
+    #[test]
+    fn a_short_sidebar_never_hides_the_selected_device_for_a_host_heading() {
+        let mut state = AppState::new(8, 80);
+        state.set_devices(vec![DeviceEntry::new("/dev/local")]);
+        state
+            .remote_labels
+            .insert(EndpointId(1), "empty host".into());
+        let area = Rect::new(0, 0, 80, 8);
+        let layout = sidebar(panes(area).sidebar).expect("sidebar");
+        let rows = state.sidebar_rows();
+        let first = first_sidebar_row(&state, &rows, layout);
+        let selected = rows
+            .iter()
+            .position(|row| *row == SidebarRow::Device(0))
+            .expect("selected device row");
+
+        assert!(selected >= first);
+        assert!(selected < first + layout.list.height as usize);
     }
 
     #[test]

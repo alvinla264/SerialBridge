@@ -243,6 +243,17 @@ impl App {
         self.state.notice = Some(Notice::error(reason.to_string()));
     }
 
+    fn expected_closes_mut(&mut self, endpoint: EndpointId) -> Option<&mut HashSet<u64>> {
+        if endpoint == LOCAL_ENDPOINT {
+            Some(&mut self.expected_closes)
+        } else {
+            self.remotes
+                .iter_mut()
+                .find(|link| link.id == endpoint)
+                .map(|link| &mut link.expected_closes)
+        }
+    }
+
     /// Drain live events from every host into the state. Events carry their
     /// endpoint, so two hosts with equal device ids never cross streams.
     pub fn pump(&mut self) {
@@ -281,12 +292,9 @@ impl App {
     }
 
     fn handle_event(&mut self, endpoint: EndpointId, event: Event, remote: Option<EndpointId>) {
-        let expected = match remote {
-            None => &mut self.expected_closes,
-            Some(id) => match self.remotes.iter_mut().find(|link| link.id == id) {
-                Some(link) => &mut link.expected_closes,
-                None => return,
-            },
+        let close_endpoint = remote.unwrap_or(endpoint);
+        let Some(expected) = self.expected_closes_mut(close_endpoint) else {
+            return;
         };
         if let Event::DeviceClosed { device_id, .. } = &event {
             if expected.remove(device_id) {
@@ -1279,12 +1287,10 @@ impl App {
         baud: Option<u32>,
     ) -> Result<SessionKey, ClientError> {
         let opened = self.open_on(endpoint, path, baud)?;
-        if endpoint == LOCAL_ENDPOINT {
-            // Rejoining a device (even the same id, while another client kept
-            // it open) must not leave an old close suppression behind.
-            self.expected_closes.remove(&opened.device_id);
-        } else if let Some(link) = self.remotes.iter_mut().find(|link| link.id == endpoint) {
-            link.expected_closes.remove(&opened.device_id);
+        // Rejoining a device (even the same id, while another client kept it
+        // open) must not leave an old close suppression behind.
+        if let Some(expected) = self.expected_closes_mut(endpoint) {
+            expected.remove(&opened.device_id);
         }
         let key = SessionKey {
             endpoint,
@@ -1363,10 +1369,8 @@ impl App {
             device_id: session.device_id,
         };
         let path = session.path.clone();
-        if key.endpoint == LOCAL_ENDPOINT {
-            self.expected_closes.insert(key.device_id);
-        } else if let Some(link) = self.remotes.iter_mut().find(|link| link.id == key.endpoint) {
-            link.expected_closes.insert(key.device_id);
+        if let Some(expected) = self.expected_closes_mut(key.endpoint) {
+            expected.insert(key.device_id);
         }
         let closed = self
             .endpoint_client(key.endpoint)

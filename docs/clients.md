@@ -66,10 +66,11 @@ Errors are `ClientError`. Use `error.code()` to match the core's `ErrorCode`
 
 ### Remote (LAN) transport
 
-`RemoteClient` reaches devices a host shares on the local network. It is the
-same transport the MCP server uses today and the terminal will use for its
-sharing controls. It never talks to the Unix socket, and a network failure is
-an error rather than a quiet local retry.
+`RemoteClient` reaches devices a host shares on the local network. It is used
+by the MCP server and by the terminal's Connect form. It never talks to the
+Unix socket, and a network failure is an error rather than a quiet local retry.
+IPv6 link-local addresses include their numeric interface scope (for example
+`fe80::1%3`) so the connection uses the selected interface.
 
 ```rust
 use std::net::{IpAddr, Ipv4Addr};
