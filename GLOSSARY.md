@@ -121,8 +121,7 @@ these words in their tool names and user-facing text.
 - **Remote frame**: one length-prefixed JSON message on a remote connection
   (4-byte big-endian length, then that many bytes), bounded to keep one peer
   from exhausting memory.
-
-LAN sharing terms (the terminal's side; the core's contract is in
+LAN sharing and remote-client terms (the core contract is in
 [docs/sharing.md](docs/sharing.md)):
 
 - **Sharing session**: the opt-in TLS listener one human terminal starts on one
@@ -141,7 +140,7 @@ LAN sharing terms (the terminal's side; the core's contract is in
   fingerprint and one credential. Shown only to the owner.
 - **Human credential** and **MCP credential**: the two distinct secrets a
   session generates. The core derives the remote client's role from which one
-  matched; neither is persisted or sent to a device.
+  matched; neither is persisted by the host or sent to a device.
 - **Pairing view**: the owner-only right-pane view (`p`) showing the bound
   address, host authentication data, both credentials and the checked devices.
 - **Connect form**: the remote terminal's memory-only form for a host address,
@@ -151,3 +150,11 @@ LAN sharing terms (the terminal's side; the core's contract is in
   connected remote host is a separate endpoint with its own transport and
   grouping heading. A **session key** is an endpoint plus that host's device
   id, so equal paths or ids on two hosts cannot collide.
+- **Remote endpoint**: the exact IP address and TCP port of a sharing session's
+  listener. It, not a device path or device id, identifies a remote session.
+- **Pairing file**: the MCP host user's private per-endpoint file
+  (`mcp-peers.json`) with one paired host and MCP pairing credential per remote
+  endpoint. Readable by its owner only; never an AI tool argument or tool result.
+- **Remote session**: one MCP server's connection to one remote endpoint, with
+  its own device ids, control and history, separate from the local core and
+  every other endpoint.

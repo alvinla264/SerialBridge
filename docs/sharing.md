@@ -1,9 +1,8 @@
 # LAN sharing: internal contract
 
-This page is the contract between the core's sharing foundation and the
-follow-on tasks (the terminal's sharing controls and the remote terminal/MCP
-clients). Sharing is **off by default** and there is no network listener unless
-a local owner starts one.
+This page documents the core contract used by the terminal's LAN sharing
+controls, remote terminal, and remote MCP client. Sharing is **off by default**
+and there is no network listener unless a local owner starts one.
 
 ## Lifecycle
 
