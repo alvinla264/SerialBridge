@@ -1596,46 +1596,29 @@ impl Engine {
             // vanished from enumeration must not be shared from stale state.
             let detected = self.detected_device(path)?;
             let expected_token = expected.get(path);
-            let identity = if expected_token.is_some_and(|token| token.starts_with("snx-")) {
-                // The token names the pinned node from the last discovery. An
-                // invalid pin means the node was replaced, even if the kernel
-                // recycled its inode numbers for the new one.
+            let identity = if let Some(expected_token) = expected_token {
+                // Resolve both discovery tokens and snapshot identity tokens
+                // through the current pinned discovery cache. A stale pin is
+                // rejected even if the kernel reuses its stat tuple.
                 let cached = self
                     .detected_tokens
                     .lock()
                     .expect("detected tokens lock")
                     .get(path)
-                    .filter(|(token, _)| Some(token) == expected_token)
-                    .map(|(_, identity)| identity.clone());
+                    .filter(|(token, identity)| {
+                        if expected_token.starts_with("snx-") {
+                            token == expected_token
+                        } else {
+                            identity.token() == *expected_token
+                        }
+                    })
+                    .map(|(_, identity)| identity.clone())
+                    .filter(|identity| {
+                        identity.still_valid() && identity.canonical == detected.canonical
+                    });
                 match cached {
-                    Some(identity)
-                        if identity.still_valid() && identity.canonical == detected.canonical =>
-                    {
-                        identity
-                    }
-                    _ => {
-                        return Err(ErrorBody::new(
-                            ErrorCode::DeviceFailed,
-                            format!("the device at {path} changed; check it again"),
-                        ))
-                    }
-                }
-            } else if let Some(expected_token) = expected_token {
-                // Snapshot tokens identify a cloned pinned identity, not its
-                // reusable stat tuple. Resolve them only through discovery's
-                // current pinned identity cache.
-                let cached = self
-                    .detected_tokens
-                    .lock()
-                    .expect("detected tokens lock")
-                    .get(path)
-                    .map(|(_, identity)| identity)
-                    .filter(|identity| identity.describe() == *expected_token)
-                    .filter(|identity| identity.still_valid())
-                    .cloned();
-                match cached {
-                    Some(identity) if identity.canonical == detected.canonical => identity,
-                    _ => {
+                    Some(identity) => identity,
+                    None => {
                         return Err(ErrorBody::new(
                             ErrorCode::DeviceFailed,
                             format!("the device at {path} changed; check it again"),
@@ -2637,7 +2620,7 @@ fn summary(device: &Device) -> DeviceSummary {
     DeviceSummary {
         path: device.path.clone(),
         description: None,
-        identity: Some(device.identity.describe()),
+        identity: Some(device.identity.token()),
         open: true,
         device_id: Some(device.id),
         baud: Some(device.baud),
@@ -2810,14 +2793,14 @@ mod identity_tests {
         std::fs::write(&path, b"a").expect("node");
         let path_text = path.to_string_lossy().into_owned();
         let old = DeviceIdentity::capture(&path_text).expect("old");
-        let expected = old.describe();
-        assert_eq!(expected, old.clone().describe());
+        let expected = old.token();
+        assert_eq!(expected, old.clone().token());
 
         std::fs::remove_file(&path).expect("unlink old node");
         std::fs::write(&path, b"b").expect("replacement node");
         let new = DeviceIdentity::capture(&path_text).expect("new");
         assert_ne!(
-            new.describe(),
+            new.token(),
             expected,
             "a replacement must not inherit the selected identity"
         );

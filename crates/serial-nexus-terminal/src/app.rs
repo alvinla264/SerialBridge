@@ -741,6 +741,9 @@ impl App {
         self.state.draft.share_address = address_text;
         self.state.draft.share_port = port;
 
+        // Preserve the human's draft for every failed save, even if current
+        // device discovery requires pruning it before authorization.
+        let original_draft_checked = self.state.draft_checked.clone();
         // A replacement at a reused path must be checked again; stale UI state
         // is never turned into an authorization.
         self.state.drop_replaced_checks();
@@ -748,6 +751,7 @@ impl App {
         let draft = self.state.draft.clone();
         let draft_checked = self.state.draft_checked.clone();
         let Some(store) = self.settings_store.clone() else {
+            self.state.draft_checked = original_draft_checked;
             self.state.notice = Some(Notice::error("settings not saved: no settings file"));
             return;
         };
@@ -764,7 +768,7 @@ impl App {
         let mut staged = Some(match store.stage(&draft) {
             Ok(staged) => staged,
             Err(error) => {
-                self.state.draft_checked = draft_checked;
+                self.state.draft_checked = original_draft_checked.clone();
                 self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
                 return;
             }
@@ -781,6 +785,7 @@ impl App {
                     if let Some(staged) = staged.take() {
                         store.discard(staged);
                     }
+                    self.state.draft_checked = original_draft_checked.clone();
                     self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
                     return;
                 }
@@ -811,6 +816,7 @@ impl App {
                         if let Some(staged) = staged.take() {
                             store.discard(staged);
                         }
+                        self.state.draft_checked = original_draft_checked.clone();
                         self.state.notice = Some(Notice::error(if uncertain {
                             format!(
                                 "settings save is unknown: {error}; the core may have applied the checklist — check it and save again"
@@ -833,12 +839,13 @@ impl App {
                 match reverted {
                     Ok(snapshot) => {
                         let _ = self.state.apply_sharing_snapshot(snapshot);
-                        self.state.draft_checked = draft_checked;
+                        self.state.draft_checked = original_draft_checked.clone();
                         self.state.notice = Some(Notice::error(format!(
                             "settings not saved: {error}; the checked devices were restored"
                         )));
                     }
                     Err(rollback_error) => {
+                        self.state.draft_checked = original_draft_checked.clone();
                         self.sync_share_status();
                         self.state.notice = Some(Notice::error(format!(
                             "settings save is unknown: {error}; checklist rollback failed: {rollback_error}"
@@ -846,6 +853,7 @@ impl App {
                     }
                 }
             } else {
+                self.state.draft_checked = original_draft_checked;
                 self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
             }
             return;

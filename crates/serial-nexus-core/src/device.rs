@@ -491,7 +491,7 @@ impl DeviceIdentity {
 
     /// An opaque label for the wire; never contains a path from outside the
     /// session's own allowlist.
-    pub fn describe(&self) -> String {
+    pub fn token(&self) -> String {
         format!("identity-{}", self.token)
     }
 

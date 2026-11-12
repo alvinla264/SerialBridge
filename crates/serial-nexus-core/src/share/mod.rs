@@ -507,7 +507,7 @@ impl SharingSession {
                 .filter(|entry| !entry.expired)
                 .map(|entry| SharedDevice {
                     path: entry.identity.canonical.clone(),
-                    identity: entry.identity.describe(),
+                    identity: entry.identity.token(),
                 })
                 .collect(),
             remote_clients: state.authenticated,

@@ -513,6 +513,36 @@ fn a_failed_settings_save_applies_neither_the_preferences_nor_the_checklist() {
 }
 
 #[test]
+fn a_failed_save_keeps_a_checked_draft_when_discovery_identity_is_lost() {
+    let (fixture, devices) = Fixture::new();
+    let mut app = fixture.app();
+    let path = devices[0].path.clone();
+    check_device(&mut app, &path);
+    let index = app
+        .state
+        .devices
+        .iter()
+        .position(|device| device.path == path)
+        .expect("detected device");
+    app.state.devices[index].identity = None;
+    std::fs::remove_file(&fixture.settings_path).expect("remove settings file");
+    std::fs::create_dir(&fixture.settings_path).expect("block the settings file");
+
+    save(&mut app);
+
+    assert!(!app.state.sharing.pending_checked.contains(&path));
+    assert!(
+        app.state.draft_checked.contains(&path),
+        "a failed save retains the human's checklist draft"
+    );
+    assert_eq!(
+        app.state.notice.as_ref().map(|notice| notice.severity),
+        Some(Severity::Error)
+    );
+    app.shutdown();
+}
+
+#[test]
 fn leaving_the_terminal_stops_sharing_and_revokes_the_credentials() {
     let (fixture, devices) = Fixture::new();
     let mut app = fixture.app();
