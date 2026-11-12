@@ -49,19 +49,7 @@ impl RemoteEndpoint {
     /// Parse an IPv4/IPv6 address with an optional numeric IPv6 interface
     /// scope, returning the IP and scope separately for socket construction.
     pub fn parse_address(text: &str) -> Result<(IpAddr, u32), String> {
-        if let Ok(address) = text.parse::<IpAddr>() {
-            return Ok((address, 0));
-        }
-        let (address, interface) = text
-            .rsplit_once('%')
-            .ok_or_else(|| "the address is not an IPv4 or IPv6 address".to_string())?;
-        let address: std::net::Ipv6Addr = address
-            .parse()
-            .map_err(|_| "the address is not an IPv4 or IPv6 address".to_string())?;
-        let scope = interface
-            .parse::<u32>()
-            .map_err(|_| format!("the IPv6 scope {interface:?} is not an interface index"))?;
-        Ok((IpAddr::V6(address), scope))
+        serial_nexus_protocol::parse_scoped_ip(text)
     }
 
     pub fn new(address: IpAddr, port: u16) -> Self {
@@ -123,9 +111,7 @@ impl RemoteEndpoint {
             return Err("the port must be between 1 and 65535".to_string());
         }
         let address = Self::canonical_ip(self.address);
-        if self.scope_id != 0 && !matches!(address, IpAddr::V6(ip) if ip.is_unicast_link_local()) {
-            return Err("an interface scope is valid only for link-local IPv6".to_string());
-        }
+        serial_nexus_protocol::validate_scope(address, self.scope_id)?;
         if address.is_unspecified() {
             return Err(format!(
                 "{address} is a wildcard address; give the host's concrete address"
@@ -143,15 +129,7 @@ impl RemoteEndpoint {
     }
 
     pub fn socket_addr(&self) -> SocketAddr {
-        match self.address {
-            IpAddr::V4(address) => SocketAddr::new(IpAddr::V4(address), self.port),
-            IpAddr::V6(address) => SocketAddr::V6(std::net::SocketAddrV6::new(
-                address,
-                self.port,
-                0,
-                self.scope_id,
-            )),
-        }
+        serial_nexus_protocol::scoped_socket_addr(self.address, self.port, self.scope_id)
     }
 }
 

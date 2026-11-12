@@ -55,6 +55,41 @@ fn is_zero(value: &u32) -> bool {
     *value == 0
 }
 
+/// Parse an IPv4/IPv6 address with an optional numeric IPv6 interface scope.
+pub fn parse_scoped_ip(text: &str) -> Result<(IpAddr, u32), String> {
+    if let Ok(address) = text.parse::<IpAddr>() {
+        return Ok((address, 0));
+    }
+    let (address, interface) = text
+        .rsplit_once('%')
+        .ok_or_else(|| "the address is not an IPv4 or IPv6 address".to_string())?;
+    let address: std::net::Ipv6Addr = address
+        .parse()
+        .map_err(|_| "the address is not an IPv4 or IPv6 address".to_string())?;
+    let scope_id = interface
+        .parse::<u32>()
+        .map_err(|_| format!("the IPv6 scope {interface:?} is not an interface index"))?;
+    Ok((IpAddr::V6(address), scope_id))
+}
+
+/// Ensure an interface scope is only used with link-local IPv6.
+pub fn validate_scope(address: IpAddr, scope_id: u32) -> Result<(), String> {
+    if scope_id != 0 && !matches!(address, IpAddr::V6(ip) if ip.is_unicast_link_local()) {
+        return Err("an interface scope is valid only for link-local IPv6".to_string());
+    }
+    Ok(())
+}
+
+/// Build a socket address while retaining a link-local IPv6 interface scope.
+pub fn scoped_socket_addr(address: IpAddr, port: u16, scope_id: u32) -> SocketAddr {
+    match address {
+        IpAddr::V6(address) if scope_id != 0 => {
+            SocketAddr::V6(std::net::SocketAddrV6::new(address, port, 0, scope_id))
+        }
+        address => SocketAddr::new(address, port),
+    }
+}
+
 impl ShareBind {
     pub fn new(address: IpAddr, port: u16) -> Self {
         Self {
@@ -75,6 +110,7 @@ impl ShareBind {
     /// Refuse addresses that would listen on every interface or that are not
     /// usable unicast endpoints.
     pub fn validate(&self) -> Result<(), String> {
+        validate_scope(self.address, self.scope_id)?;
         // An IPv4-mapped IPv6 address is an IPv4 address in disguise; validate
         // the inner address so `::ffff:0.0.0.0` cannot become a wildcard bind.
         if let std::net::IpAddr::V6(v6) = self.address {
@@ -100,12 +136,7 @@ impl ShareBind {
     }
 
     pub fn socket_addr(&self) -> SocketAddr {
-        match self.address {
-            IpAddr::V6(address) if self.scope_id != 0 => SocketAddr::V6(
-                std::net::SocketAddrV6::new(address, self.port, 0, self.scope_id),
-            ),
-            address => SocketAddr::new(address, self.port),
-        }
+        scoped_socket_addr(self.address, self.port, self.scope_id)
     }
 }
 
@@ -448,6 +479,19 @@ mod tests {
             ShareBind::new("::1".parse().unwrap(), 9000).to_string(),
             "[::1]:9000"
         );
+    }
+
+    #[test]
+    fn scoped_socket_helpers_preserve_only_link_local_scopes() {
+        let (address, scope) = parse_scoped_ip("fe80::1%3").expect("scoped IPv6");
+        assert_eq!(scope, 3);
+        assert_eq!(
+            scoped_socket_addr(address, 7331, scope).to_string(),
+            "[fe80::1%3]:7331"
+        );
+        assert!(validate_scope(address, scope).is_ok());
+        assert!(validate_scope("::1".parse().unwrap(), scope).is_err());
+        assert!(validate_scope("127.0.0.1".parse().unwrap(), scope).is_err());
     }
 
     #[test]
