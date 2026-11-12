@@ -95,6 +95,21 @@ struct AuthorizedDevice {
     expired: bool,
 }
 
+fn insert_authorized_devices(
+    entries: &mut BTreeMap<String, AuthorizedDevice>,
+    identities: impl IntoIterator<Item = DeviceIdentity>,
+) {
+    for identity in identities {
+        entries.insert(
+            identity.canonical.clone(),
+            AuthorizedDevice {
+                identity,
+                expired: false,
+            },
+        );
+    }
+}
+
 struct SessionState {
     /// Canonical path to the identity authorized at check time.
     devices: BTreeMap<String, AuthorizedDevice>,
@@ -166,15 +181,7 @@ pub fn prepare(
     debug_assert!(!human.matches(&ai_credential));
 
     let mut allowlist = BTreeMap::new();
-    for identity in devices {
-        allowlist.insert(
-            identity.canonical.clone(),
-            AuthorizedDevice {
-                identity,
-                expired: false,
-            },
-        );
-    }
+    insert_authorized_devices(&mut allowlist, devices);
 
     let session = Arc::new(SharingSession {
         id: session_id.clone(),
@@ -357,15 +364,7 @@ impl SharingSession {
                 format!("at most {MAX_SHARED_DEVICES} devices may be shared"),
             ));
         }
-        for identity in identities {
-            state.devices.insert(
-                identity.canonical.clone(),
-                AuthorizedDevice {
-                    identity,
-                    expired: false,
-                },
-            );
-        }
+        insert_authorized_devices(&mut state.devices, identities);
         Ok(expired)
     }
 
@@ -396,15 +395,7 @@ impl SharingSession {
             .cloned()
             .collect();
         state.devices.retain(|path, _| keep.contains(path));
-        for identity in identities {
-            state.devices.insert(
-                identity.canonical.clone(),
-                AuthorizedDevice {
-                    identity,
-                    expired: false,
-                },
-            );
-        }
+        insert_authorized_devices(&mut state.devices, identities);
         Ok((expired, removed))
     }
 

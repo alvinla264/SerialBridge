@@ -1549,6 +1549,17 @@ impl Engine {
         Ok(session)
     }
 
+    fn active_owner_session(&self, client_id: u64) -> Result<Arc<SharingSession>, ErrorBody> {
+        let session = self.owner_session(client_id)?;
+        if session.is_stopped() {
+            return Err(ErrorBody::new(
+                ErrorCode::ShuttingDown,
+                "sharing is stopping",
+            ));
+        }
+        Ok(session)
+    }
+
     /// Capture a detected device's identity. Checking never opens the device.
     fn detected_device(&self, path: &str) -> Result<DeviceIdentity, ErrorBody> {
         let identity = DeviceIdentity::capture(path).map_err(|error| {
@@ -1783,13 +1794,7 @@ impl Engine {
         client_id: u64,
         params: ShareDevicesParams,
     ) -> Result<ResponseData, ErrorBody> {
-        let session = self.owner_session(client_id)?;
-        if session.is_stopped() {
-            return Err(ErrorBody::new(
-                ErrorCode::ShuttingDown,
-                "sharing is stopping",
-            ));
-        }
+        let session = self.active_owner_session(client_id)?;
         // Validate every path first, then add the whole batch at once. A
         // failed batch leaves the allowlist exactly as it was.
         let identities = self.validated_shared_identities(&params.devices, &params.expected)?;
@@ -1819,13 +1824,7 @@ impl Engine {
         client_id: u64,
         params: ShareDevicesParams,
     ) -> Result<ResponseData, ErrorBody> {
-        let session = self.owner_session(client_id)?;
-        if session.is_stopped() {
-            return Err(ErrorBody::new(
-                ErrorCode::ShuttingDown,
-                "sharing is stopping",
-            ));
-        }
+        let _session = self.active_owner_session(client_id)?;
         let identities = self.validated_shared_identities(&params.devices, &params.expected)?;
         if identities.len() > MAX_SHARED_DEVICES {
             return Err(ErrorBody::new(
@@ -1850,13 +1849,7 @@ impl Engine {
         client_id: u64,
         params: ShareCommitParams,
     ) -> Result<ResponseData, ErrorBody> {
-        let session = self.owner_session(client_id)?;
-        if session.is_stopped() {
-            return Err(ErrorBody::new(
-                ErrorCode::ShuttingDown,
-                "sharing is stopping",
-            ));
-        }
+        let session = self.active_owner_session(client_id)?;
         let prepared = self
             .prepared_share
             .lock()
@@ -1894,13 +1887,7 @@ impl Engine {
         client_id: u64,
         params: ShareDevicesParams,
     ) -> Result<ResponseData, ErrorBody> {
-        let session = self.owner_session(client_id)?;
-        if session.is_stopped() {
-            return Err(ErrorBody::new(
-                ErrorCode::ShuttingDown,
-                "sharing is stopping",
-            ));
-        }
+        let session = self.active_owner_session(client_id)?;
         let identities = self.validated_shared_identities(&params.devices, &params.expected)?;
         // Revoke while the removed instances still carry their shared marker;
         // revalidation needs it to detach remote clients and cancel waits.
