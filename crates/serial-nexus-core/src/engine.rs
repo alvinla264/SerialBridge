@@ -2145,6 +2145,12 @@ impl Engine {
                 for path in expired_paths {
                     self.revoke_path_everywhere(&path, &session);
                 }
+                // Identity tokens are owner-only pinning data. A remote sees
+                // which checked devices it may use, never how many other nodes
+                // the host has pinned.
+                for device in &mut devices.devices {
+                    device.identity = None;
+                }
                 Ok(ResponseData::Devices(devices))
             }
             Request::Open(params) => {

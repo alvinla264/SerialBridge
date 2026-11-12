@@ -255,9 +255,10 @@ pub struct DeviceSummary {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Opaque device-node identity (dev/inode/rdev) when it could be captured.
-    /// It changes when a different device appears at the same path, so a
-    /// client can tell a replacement from the device the user selected.
+    /// An opaque owner-only token for the pinned device node, when it could be
+    /// captured. It changes when a different device appears at the same path,
+    /// so the owner terminal can tell a replacement from the device the user
+    /// selected. Remote replies carry no token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<String>,
     pub open: bool,
