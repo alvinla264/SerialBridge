@@ -444,6 +444,37 @@ fn a_replacement_at_a_checked_path_needs_an_explicit_recheck() {
 }
 
 #[test]
+fn periodic_device_refresh_preserves_the_authoritative_shared_checklist() {
+    let (fixture, devices) = Fixture::new();
+    let mut app = fixture.app();
+    let path = devices[0].path.clone();
+    check_device(&mut app, &path);
+    set_bind(&mut app, "127.0.0.1", 0);
+    save(&mut app);
+    start(&mut app);
+    app.state.notice = None;
+
+    app.refresh_devices();
+
+    assert!(app.state.sharing.pending_checked.contains(&path));
+    assert!(app.state.notice.is_none());
+    app.state.begin_settings();
+    let row = app
+        .state
+        .devices
+        .iter()
+        .position(|device| device.path == path)
+        .expect("device remains detected");
+    assert_eq!(
+        app.state.draft_device_checked(SETTINGS_FIXED_ROWS + row),
+        Some(true)
+    );
+    save(&mut app);
+    assert!(app.state.sharing.pending_checked.contains(&path));
+    app.shutdown();
+}
+
+#[test]
 fn a_failed_settings_save_applies_neither_the_preferences_nor_the_checklist() {
     let (fixture, devices) = Fixture::new();
     let mut app = fixture.app();
