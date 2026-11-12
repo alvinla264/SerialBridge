@@ -45,8 +45,9 @@ these words in their tool names and user-facing text.
   (`list_devices`, `connect`, `disconnect`, `read`, `send`). It returns one
   bounded result; there is no continuous stream.
 - **Settings**: the human terminal's own preferences, stored per user in
-  `terminal.json` (`local_echo` and `scrollback`, both on by default). Not core
-  configuration.
+  `terminal.json` (`local_echo`, `scrollback`, `share_address` and `share_port`).
+  Echo and scrollback default on; sharing defaults to loopback at port 7331. The
+  checked-device list and pairing credentials are session-only, not settings.
 - **Local echo**: showing the keys a human types in the **stream** in the
   terminal's own view. On by default; the `local_echo` **setting** turns it off
   for a device that echoes what it receives.

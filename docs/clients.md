@@ -248,8 +248,10 @@ AI write control.
   keeps the status line and hides the hints.
 - Settings are stored per user in `$XDG_CONFIG_HOME/serial-nexus/terminal.json`
   (`~/.config/serial-nexus/terminal.json` when `XDG_CONFIG_HOME` is unset and
-  `HOME` is set). The file holds `local_echo` and `scrollback`, both on by
-  default; the terminal loads them at launch and writes the defaults on the
+  `HOME` is set). The file holds `local_echo` and `scrollback` (both on by
+  default), plus `share_address` (loopback by default) and `share_port` (7331
+  by default). The checked-device list and pairing credentials are
+  session-only. The terminal loads settings at launch and writes defaults on
   first launch. An invalid or unreadable file is reported in the footer and
   left untouched, never silently replaced, and settings changed in that launch
   are not saved; saves go to a temporary file and are renamed into place, and a

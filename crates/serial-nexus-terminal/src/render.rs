@@ -17,8 +17,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::screen::{Color, Style};
 use crate::state::{
-    AppState, ConnectField, Focus, SettingsRow, Severity, SidebarButton, SidebarRow, View,
-    LOCAL_ENDPOINT,
+    AppState, ConnectField, EndpointId, Focus, SettingsRow, Severity, SidebarButton, SidebarRow,
+    View, LOCAL_ENDPOINT,
 };
 
 /// The sidebar's preferred narrowest width when both panes are shown.
@@ -338,8 +338,10 @@ pub fn hit_test(state: &AppState, area: Rect, column: u16, row: u16) -> Option<H
     if in_rect(sidebar.connect, column, row) {
         return Some(Hit::Connect);
     }
-    let sticky_empty_hosts = has_empty_remote_hosts(state) && sidebar.list.height > 0;
-    let list = sidebar_device_list(sidebar, sticky_empty_hosts);
+    let sticky_rows = empty_remote_endpoints(state)
+        .len()
+        .min(sidebar.list.height as usize);
+    let list = sidebar_device_list(sidebar, sticky_rows);
     if list.height == 0 || !in_rect(list, column, row) {
         return None;
     }
@@ -383,13 +385,18 @@ fn first_sidebar_row(state: &AppState, rows: &[SidebarRow], sidebar: Sidebar) ->
     }
 }
 
-fn has_empty_remote_hosts(state: &AppState) -> bool {
-    state.remote_labels.keys().any(|endpoint| {
-        !state
-            .devices
-            .iter()
-            .any(|device| device.endpoint == *endpoint)
-    })
+fn empty_remote_endpoints(state: &AppState) -> Vec<EndpointId> {
+    state
+        .remote_labels
+        .keys()
+        .filter(|endpoint| {
+            !state
+                .devices
+                .iter()
+                .any(|device| device.endpoint == **endpoint)
+        })
+        .copied()
+        .collect()
 }
 
 fn is_empty_remote_group(state: &AppState, row: SidebarRow) -> bool {
@@ -398,17 +405,14 @@ fn is_empty_remote_group(state: &AppState, row: SidebarRow) -> bool {
             && !state.devices.iter().any(|device| device.endpoint == endpoint))
 }
 
-fn sidebar_device_list(sidebar: Sidebar, sticky_empty_hosts: bool) -> Rect {
-    if sticky_empty_hosts {
-        Rect::new(
-            sidebar.list.x,
-            sidebar.list.y.saturating_add(1),
-            sidebar.list.width,
-            sidebar.list.height.saturating_sub(1),
-        )
-    } else {
-        sidebar.list
-    }
+fn sidebar_device_list(sidebar: Sidebar, sticky_rows: usize) -> Rect {
+    let sticky_rows = sticky_rows.min(sidebar.list.height as usize) as u16;
+    Rect::new(
+        sidebar.list.x,
+        sidebar.list.y.saturating_add(sticky_rows),
+        sidebar.list.width,
+        sidebar.list.height.saturating_sub(sticky_rows),
+    )
 }
 
 fn in_rect(rect: Rect, column: u16, row: u16) -> bool {
@@ -571,9 +575,12 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u1
         })
         .map(|endpoint| state.endpoint_tag(*endpoint))
         .collect();
+    let empty_endpoints = empty_remote_endpoints(state);
+    let sticky_rows = empty_endpoints.len().min(list.height as usize);
+    let device_list = sidebar_device_list(sidebar, sticky_rows);
     // With no room for a device row, the title row carries the highlighted
     // device instead, while still showing connected empty hosts.
-    let title = if list.height == 0 && state.selected_device().is_some() {
+    let title = if device_list.height == 0 && state.selected_device().is_some() {
         let selected = match state.selected_device() {
             Some(device) if device.endpoint != LOCAL_ENDPOINT => {
                 format!("› {} {}", state.endpoint_tag(device.endpoint), device.path)
@@ -597,14 +604,12 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u1
     };
     let title_style = focus_title_style(state.focus == Focus::Sidebar);
     put(buffer, sidebar.title, 0, &title, title_style);
-    let sticky_empty_hosts = !empty_remote_tags.is_empty() && list.height > 0;
-    let device_list = sidebar_device_list(sidebar, sticky_empty_hosts);
-    if sticky_empty_hosts {
+    for (offset, endpoint) in empty_endpoints.iter().take(sticky_rows).enumerate() {
         put(
             buffer,
-            Rect::new(list.x, list.y, list.width, 1),
+            Rect::new(list.x, list.y + offset as u16, list.width, 1),
             0,
-            &format!(" Remote host: {}", empty_remote_tags.join(", ")),
+            &format!(" {}", state.endpoint_label(*endpoint)),
             dim(),
         );
     }
@@ -734,7 +739,7 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u1
 
     if let Some(cursor) = cursor {
         Some(cursor)
-    } else if list.height == 0 {
+    } else if device_list.height == 0 {
         // The device is shown on the title row when no device row fits.
         Some((sidebar.title.x + 1, sidebar.title.y))
     } else {
@@ -744,7 +749,7 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u1
             .position(|row| matches!(row, SidebarRow::Device(index) if *index == state.selected))
             .unwrap_or(0);
         let offset = selected_row.saturating_sub(first) as u16;
-        Some((list.x + 1, list.y + offset))
+        Some((device_list.x + 1, device_list.y + offset))
     }
 }
 
@@ -1676,12 +1681,40 @@ mod tests {
         );
         state
             .remote_labels
-            .insert(EndpointId(1), "empty host".into());
+            .insert(EndpointId(1), "Remote 192.0.2.10:7331".into());
         state.select_index(0);
 
         let rendered = screen(&state, 80, 16).join("\\n");
-        assert!(rendered.contains("Remote host: #1"), "{rendered}");
+        assert!(rendered.contains("Remote 192.0.2.10:7331"), "{rendered}");
         assert!(rendered.contains("/dev/tty0"), "{rendered}");
+    }
+
+    #[test]
+    fn scrolled_sidebar_clicks_and_cursor_match_drawn_device_rows() {
+        let mut state = AppState::new(12, 40);
+        state.set_devices(
+            (0..20)
+                .map(|index| DeviceEntry::new(format!("/dev/tty{index:02}")))
+                .collect(),
+        );
+        state
+            .remote_labels
+            .insert(EndpointId(1), "Remote 192.0.2.10:7331".into());
+        state.select_index(15);
+        let area = Rect::new(0, 0, 80, 12);
+        let mut buffer = Buffer::empty(area);
+        let cursor = render(&state, &mut buffer, area).expect("selected device cursor");
+        let lines = screen(&state, 80, 12);
+        let drawn_row = lines
+            .iter()
+            .position(|line| line.contains("/dev/tty15"))
+            .expect("selected device is drawn");
+        assert_eq!(cursor.1 as usize, drawn_row);
+        let sidebar = sidebar(panes(area).sidebar).expect("sidebar");
+        assert_eq!(
+            hit_test(&state, area, sidebar.list.x + 1, drawn_row as u16),
+            Some(Hit::Device(15))
+        );
     }
 
     #[test]

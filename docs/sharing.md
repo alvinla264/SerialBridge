@@ -170,16 +170,11 @@ them; they only replace discovery or the I/O implementation:
 `crates/serial-nexus-core/tests/seams.rs` runs both seams and holds a lock while
 installing them. They are test infrastructure, not a configuration surface.
 
-## Final-round security fixes and tests
+## Security regression coverage
 
-The last round-capped review (head `c587b01`) confirmed three majors, all fixed
-after that round. A further human-approved focused security review was run on
-`bda12ac` and confirmed three additional findings, all fixed after that review:
-a stop/enqueue race, unchecked-device discovery, and metadata-only oversized
-waited-write answers. The fixes are covered by the tests below, but the newest
-post-review code has not itself been independently re-reviewed; the
-coordinator must assess it before merge, and must repeat the board gate if the
-head changes.
+These tests cover security and lifecycle properties that were established in
+iterative local reviews; the coordinator's current integrated-head review and
+board-gate status are tracked separately from this protocol contract.
 
 - **Remote list/event visibility of a replacement.** Discovery and event
   filtering now require the exact open device instance to have been authorized
