@@ -135,11 +135,24 @@ The PTY fixtures pre-open their devices, so opening a closed device through the
 baud prompt, device discovery, and a hand-edited invalid settings file staying
 untouched are covered at the app and client/core seams, not through this PTY.
 
+Further terminal coverage uses real core/client seams and dedicated PTY flows:
+- `sharing_controls.rs`: checklist Save/Cancel, bind failures, session-only
+  device selection, identity replacement, pairing credentials, revocation and
+  cleanup on shutdown.
+- `remote_controls.rs`: authenticated Connect, certificate mismatch, several
+  endpoint groups, same-path isolation, unplug/disconnect notices, and remote
+  write failures.
+- `pty_sharing.rs` and `pty_remote.rs`: the actual rendered and keyboard-driven
+  Share/Pairing and Connect workflows, including device access on the host.
+
 `serial-nexus-mcp` additionally has end-to-end tests over real MCP stdio framing:
 handshake and tool listing, protocol errors, default and joined baud, rejected
 conflicts, two independent sessions with read-only takeover, exact writes,
 waited sends, partial lines, timeouts, disconnect releasing control, detached
-and missing devices, an unplugged device, and auto-start.
+and missing devices, an unplugged device, and auto-start. Remote MCP tests cover
+private pairing-file permissions/redaction, per-endpoint sessions and device
+identity, explicit remote pairing and transport, and isolation between local
+and remote endpoints.
 
 Not proven here: real hardware and drivers, PTY behaviour that differs from
 USB serial adapters, platforms other than Linux, terminals other than what the
