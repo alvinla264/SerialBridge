@@ -514,7 +514,26 @@ fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u1
             None => " Devices ".to_string(),
         }
     } else {
-        format!(" Devices ({}) ", state.devices.len())
+        let empty_remote_tags: Vec<String> = state
+            .remote_labels
+            .keys()
+            .filter(|endpoint| {
+                !state
+                    .devices
+                    .iter()
+                    .any(|device| device.endpoint == **endpoint)
+            })
+            .map(|endpoint| state.endpoint_tag(*endpoint))
+            .collect();
+        if empty_remote_tags.is_empty() {
+            format!(" Devices ({}) ", state.devices.len())
+        } else {
+            format!(
+                " Devices ({}) · Empty host: {} ",
+                state.devices.len(),
+                empty_remote_tags.join(",")
+            )
+        }
     };
     let title_style = if state.focus == Focus::Sidebar {
         RStyle::default()
@@ -1587,6 +1606,7 @@ mod tests {
 
         assert!(selected >= first);
         assert!(selected < first + layout.list.height as usize);
+        assert!(screen(&state, 80, 8).join("\\n").contains("Empty host: #1"));
     }
 
     #[test]
