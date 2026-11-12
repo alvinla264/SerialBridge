@@ -6,8 +6,10 @@
 mod support;
 
 use std::io::Write;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -31,6 +33,13 @@ impl SharedHost {
 
     fn start_on(address: IpAddr, devices: &[String]) -> Self {
         let (directory, socket) = start_core(Duration::from_secs(30));
+        Self::start_at(directory, socket, address, devices)
+    }
+
+    /// Share `devices` from an already-running core. The path is what the
+    /// core sees; two cores in different mount namespaces may see the same
+    /// path as different nodes.
+    fn start_at(directory: TempDir, socket: PathBuf, address: IpAddr, devices: &[String]) -> Self {
         let owner = Client::connect_to_socket(&socket, ClientInfo::human("owner-terminal"))
             .expect("owner connects");
         // A PTY is not an enumerated port, so the host opens each device it
@@ -87,6 +96,100 @@ fn remote_args(host: &SharedHost, rest: Value) -> Value {
     object.insert("ip".into(), json!(address.to_string()));
     object.insert("port".into(), json!(port));
     Value::Object(object)
+}
+
+/// The core binary built beside this test binary, for tests that need a real
+/// core *process*: one that can be killed, or started in its own mount
+/// namespace.
+fn core_binary() -> PathBuf {
+    let core = Path::new(env!("CARGO_BIN_EXE_serial-nexus-mcp"))
+        .parent()
+        .expect("target dir")
+        .join("serial-nexus-core");
+    assert!(
+        core.is_file(),
+        "serial-nexus-core binary missing at {core:?}"
+    );
+    core
+}
+
+/// Wait until a spawned core answers on its socket, or say why it never did.
+fn wait_for_core_socket(socket: &Path, child: &mut Child) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if UnixStream::connect(socket).is_ok() {
+            return;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("core exited before its socket appeared: {status}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("core socket {socket:?} did not appear within 10s");
+}
+
+fn core_command(socket: &Path) -> Command {
+    let mut command = Command::new(core_binary());
+    command
+        .env("SERIAL_NEXUS_SOCKET", socket)
+        .env("SERIAL_NEXUS_GRACE_SECS", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+/// Start the core binary as a child process on a fresh temp socket, so a test
+/// can end it abruptly.
+fn start_core_process(directory: &Path) -> (Child, PathBuf) {
+    let socket = directory.join("core.sock");
+    let mut child = core_command(&socket).spawn().expect("spawn core process");
+    wait_for_core_socket(&socket, &mut child);
+    (child, socket)
+}
+
+/// Whether this machine lets an ordinary user create a user and mount
+/// namespace. GitHub's Ubuntu images may deny it; the same-path test says so
+/// and skips rather than pretending to pass.
+fn user_namespaces_available() -> bool {
+    Command::new("unshare")
+        .args(["-rm", "--", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Start the core binary in its own mount namespace with `device` bound over
+/// `mountpoint`, so two hosts can present the *same* device path backed by
+/// different nodes.
+fn start_core_with_device_at(
+    directory: &Path,
+    device: &str,
+    mountpoint: &Path,
+) -> (Child, PathBuf) {
+    let socket = directory.join("core.sock");
+    let mut child = Command::new("unshare")
+        .args([
+            "-rm",
+            "--",
+            "/bin/sh",
+            "-c",
+            "mount --bind \"$SNX_TEST_DEVICE\" \"$SNX_TEST_MOUNTPOINT\" && exec \"$SNX_TEST_CORE\"",
+        ])
+        .env("SNX_TEST_DEVICE", device)
+        .env("SNX_TEST_MOUNTPOINT", mountpoint)
+        .env("SNX_TEST_CORE", core_binary())
+        .env("SERIAL_NEXUS_SOCKET", &socket)
+        .env("SERIAL_NEXUS_GRACE_SECS", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn core in a user and mount namespace");
+    wait_for_core_socket(&socket, &mut child);
+    (child, socket)
 }
 
 fn call(session: &mut McpSession, name: &str, arguments: Value) -> Value {
@@ -902,4 +1005,248 @@ fn a_fifo_in_place_of_the_pairing_file_is_refused_without_blocking() {
     );
     let ping = session.request("ping", json!({}));
     assert!(ping.get("result").is_some(), "{ping}");
+}
+
+#[test]
+fn two_hosts_sharing_the_same_device_path_stay_isolated_end_to_end() {
+    // Both hosts see the identical path string for different physical nodes:
+    // each core lives in its own mount namespace, with its own PTY bound over
+    // one shared placeholder. The MCP session may only ever reach the host it
+    // named, so a write for one path can never land on the other host's node.
+    let mount_directory = TempDir::new().expect("mount directory");
+    let shared_path = mount_directory.path().join("ttyUSB0");
+    std::fs::File::create(&shared_path).expect("mount placeholder");
+    let shared = shared_path.to_string_lossy().into_owned();
+
+    if !user_namespaces_available() {
+        eprintln!(
+            "skipping same-path two-host isolation: this machine denies unprivileged user namespaces"
+        );
+        return;
+    }
+
+    let mut first_device = SimulatedDevice::new();
+    let mut second_device = SimulatedDevice::new();
+    let first_directory = TempDir::new().expect("first core directory");
+    let second_directory = TempDir::new().expect("second core directory");
+    let (_first_core, first_socket) =
+        start_core_with_device_at(first_directory.path(), &first_device.path, &shared_path);
+    let (_second_core, second_socket) =
+        start_core_with_device_at(second_directory.path(), &second_device.path, &shared_path);
+
+    let first = SharedHost::start_at(
+        first_directory,
+        first_socket,
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        std::slice::from_ref(&shared),
+    );
+    let second = SharedHost::start_at(
+        second_directory,
+        second_socket,
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        std::slice::from_ref(&shared),
+    );
+    let peers = write_peers(
+        &first.directory,
+        vec![
+            peer_entry(&first.info, &first.info.ai),
+            peer_entry(&second.info, &second.info.ai),
+        ],
+    );
+    let mut session = spawn(&first.socket, &peers);
+    let (first_address, first_port) = first.endpoint();
+    let (second_address, second_port) = second.endpoint();
+    assert_ne!((first_address, first_port), (second_address, second_port));
+
+    let listed_first = session.call_tool("list_devices", remote_args(&first, json!({})));
+    assert!(!listed_first.is_error, "{}", listed_first.text);
+    assert!(listed_first.text.contains(&shared), "{}", listed_first.text);
+    assert!(
+        listed_first
+            .text
+            .contains(&format!("remote {first_address}:{first_port}")),
+        "{}",
+        listed_first.text
+    );
+    let listed_second = session.call_tool("list_devices", remote_args(&second, json!({})));
+    assert!(!listed_second.is_error, "{}", listed_second.text);
+    assert!(
+        listed_second.text.contains(&shared),
+        "{}",
+        listed_second.text
+    );
+    assert!(
+        listed_second
+            .text
+            .contains(&format!("remote {second_address}:{second_port}")),
+        "{}",
+        listed_second.text
+    );
+
+    let opened_first = session.call_tool(
+        "connect",
+        remote_args(&first, json!({ "path": shared, "request_control": true })),
+    );
+    assert!(!opened_first.is_error, "{}", opened_first.text);
+    let opened_second = session.call_tool(
+        "connect",
+        remote_args(&second, json!({ "path": shared, "request_control": true })),
+    );
+    assert!(!opened_second.is_error, "{}", opened_second.text);
+    // Both cores hand out the same id for the same path: only the endpoint may
+    // separate the two sessions.
+    assert_eq!(opened_first.device_id(), opened_second.device_id());
+
+    let sent_first = session.call_tool(
+        "send",
+        remote_args(
+            &first,
+            json!({ "device": shared, "text": "FIRST-ONLY", "lines": 0 }),
+        ),
+    );
+    assert!(!sent_first.is_error, "{}", sent_first.text);
+    assert_eq!(
+        first_device.read_n(10, Duration::from_secs(5)),
+        b"FIRST-ONLY"
+    );
+    assert!(
+        second_device
+            .read_for(Duration::from_millis(300))
+            .is_empty(),
+        "the first host's write must not reach the second host's device"
+    );
+
+    let sent_second = session.call_tool(
+        "send",
+        remote_args(
+            &second,
+            json!({ "device": shared, "text": "SECOND-ONLY", "lines": 0 }),
+        ),
+    );
+    assert!(!sent_second.is_error, "{}", sent_second.text);
+    assert_eq!(
+        second_device.read_n(11, Duration::from_secs(5)),
+        b"SECOND-ONLY"
+    );
+    assert!(
+        first_device.read_for(Duration::from_millis(300)).is_empty(),
+        "the second host's write must not reach the first host's device"
+    );
+
+    // History belongs to the endpoint that wrote it.
+    let read_first = session.call_tool(
+        "read",
+        remote_args(&first, json!({ "device": shared, "lines": 10 })),
+    );
+    assert!(!read_first.is_error, "{}", read_first.text);
+    assert!(
+        read_first.text.contains("FIRST-ONLY"),
+        "{}",
+        read_first.text
+    );
+    assert!(
+        !read_first.text.contains("SECOND-ONLY"),
+        "{}",
+        read_first.text
+    );
+    let read_second = session.call_tool(
+        "read",
+        remote_args(&second, json!({ "device": shared, "lines": 10 })),
+    );
+    assert!(!read_second.is_error, "{}", read_second.text);
+    assert!(
+        read_second.text.contains("SECOND-ONLY"),
+        "{}",
+        read_second.text
+    );
+    assert!(
+        !read_second.text.contains("FIRST-ONLY"),
+        "{}",
+        read_second.text
+    );
+    assert_no_secret(
+        &session,
+        &format!("{}{}", read_first.text, read_second.text),
+        &first.info,
+    );
+}
+
+#[test]
+fn an_abrupt_core_loss_during_a_remote_write_is_uncertain_and_not_replayed() {
+    // The host process dies without closing anything politely: the client sees
+    // an abrupt transport loss while its write is unanswered. The call must
+    // report an uncertain outcome, must not replay the bytes and must not fall
+    // back to a local device.
+    let directory = TempDir::new().expect("core directory");
+    let mut device = SimulatedDevice::new();
+    let (mut core, socket) = start_core_process(directory.path());
+    let host = SharedHost::start_at(
+        directory,
+        socket,
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        std::slice::from_ref(&device.path),
+    );
+    let peers = write_peers(&host.directory, vec![peer_entry(&host.info, &host.info.ai)]);
+    let mut session = spawn(&host.socket, &peers);
+    let connected = session.call_tool(
+        "connect",
+        remote_args(
+            &host,
+            json!({ "path": device.path, "request_control": true }),
+        ),
+    );
+    assert!(!connected.is_error, "{}", connected.text);
+    let id = connected.device_id();
+
+    let request = session.start_request(
+        "tools/call",
+        json!({
+            "name": "send",
+            "arguments": remote_args(&host, json!({
+                "device": id,
+                "text": "ABRUPT-LOSS",
+                "lines": 1,
+                "timeout_ms": 30_000,
+            })),
+        }),
+    );
+    assert_eq!(
+        device.read_n(11, Duration::from_secs(5)),
+        b"ABRUPT-LOSS",
+        "the accepted write reaches the device before the host disappears"
+    );
+    core.kill().expect("kill the host process");
+    core.wait().expect("reap the host process");
+
+    let response = session.response_for(&request);
+    let (text, is_error) = reply(&response);
+    assert!(is_error, "{text}");
+    assert!(
+        text.to_lowercase().contains("uncertain")
+            || text.to_lowercase().contains("may have reached"),
+        "{}",
+        text
+    );
+    assert!(
+        text.to_lowercase().contains("not sent again")
+            || text.to_lowercase().contains("not replayed"),
+        "{}",
+        text
+    );
+    assert_no_secret(&session, &text, &host.info);
+    assert!(
+        device.read_for(Duration::from_millis(300)).is_empty(),
+        "the write must not be replayed after the transport loss"
+    );
+
+    // The endpoint is gone: a later remote call fails and names no local
+    // device, and the local core is not silently used in its place.
+    let after = session.call_tool("list_devices", remote_args(&host, json!({})));
+    assert!(after.is_error, "{}", after.text);
+    assert!(!after.text.contains(&device.path), "{}", after.text);
+    assert_no_secret(&session, &after.text, &host.info);
+    assert!(
+        device.read_for(Duration::from_millis(200)).is_empty(),
+        "no fallback write may reach the device"
+    );
 }

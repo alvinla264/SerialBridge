@@ -263,7 +263,15 @@ endpoint and address validation, an unknown endpoint, a human credential
 refused for the AI role, a host that cannot prove the pinned certificate, an
 unreadable pairing file, two hosts with equal device ids kept apart, one AI
 writer across local and remote, concurrent whole writes, unchecking a device,
-owner termination stopping a write without replay, an IPv6 endpoint, a
-credential misplaced into a file field and never echoed, a remote path not
-resolved locally, and a rotated credential recovered by updating the file. No
+owner termination stopping a write without replay, an abrupt host-process loss
+during a remote write (uncertain, never replayed, no local fallback), an IPv6
+endpoint, a credential misplaced into a file field and never echoed, a remote
+path not resolved locally, and a rotated credential recovered by updating the
+file.
+
+Two hosts that share the *same* device path are kept apart end to end: each
+core runs in a private mount namespace with its own PTY bound over one shared
+placeholder, and writes, read history and session state stay with the endpoint
+the call named. Where a machine forbids unprivileged user namespaces, that one
+test says so and skips; the endpoint-keyed bookkeeping unit test still runs. No
 physical hardware is used.
