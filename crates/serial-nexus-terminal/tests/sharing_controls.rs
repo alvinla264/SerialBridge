@@ -513,6 +513,41 @@ fn a_failed_settings_save_applies_neither_the_preferences_nor_the_checklist() {
 }
 
 #[test]
+fn rechecking_after_stop_retains_the_current_discovery_identity() {
+    let (fixture, devices) = Fixture::new();
+    let mut app = fixture.app();
+    let path = devices[0].path.clone();
+    check_device(&mut app, &path);
+    set_bind(&mut app, "127.0.0.1", 0);
+    save(&mut app);
+    start(&mut app);
+
+    app.state.begin_settings();
+    let index = app
+        .state
+        .devices
+        .iter()
+        .position(|device| device.path == path)
+        .expect("detected");
+    app.state.settings_row = SETTINGS_FIXED_ROWS + index;
+    assert_eq!(app.state.toggle_draft(), Some(false));
+    save(&mut app);
+    app.stop_sharing();
+
+    check_device(&mut app, &path);
+    save(&mut app);
+    app.state.begin_settings();
+    save(&mut app);
+
+    assert!(app.state.sharing.pending_checked.contains(&path));
+    assert_eq!(
+        app.state.notice.as_ref().map(|notice| notice.severity),
+        Some(Severity::Info)
+    );
+    app.shutdown();
+}
+
+#[test]
 fn a_failed_save_keeps_a_checked_draft_when_discovery_identity_is_lost() {
     let (fixture, devices) = Fixture::new();
     let mut app = fixture.app();
