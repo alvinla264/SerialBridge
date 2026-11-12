@@ -9,13 +9,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use serial_nexus_client::{Client, ClientInfo, ShareBind};
-use serial_nexus_core::enumerate::{install_port_lister, PortInfo};
+
 use serial_nexus_protocol::ShareSessionInfo;
 use serial_nexus_terminal::app::App;
 use serial_nexus_terminal::input::Key;
 use serial_nexus_terminal::settings::SettingsStore;
 use serial_nexus_terminal::state::{EndpointId, View};
-use support::{connect, start_core, SimulatedDevice};
+use support::{connect, start_core, PortListerGuard, SimulatedDevice};
 use tempfile::TempDir;
 
 static REMOTE_TESTS: Mutex<()> = Mutex::new(());
@@ -32,22 +32,12 @@ struct Host {
     _xdg: TempDir,
     owner: Client,
     info: ShareSessionInfo,
+    _lister: PortListerGuard,
 }
 
 fn start_host(devices: &[&str], lister_paths: Arc<Mutex<Vec<PathBuf>>>) -> Host {
     let (core, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
-    let paths = Arc::clone(&lister_paths);
-    install_port_lister(Some(Arc::new(move || {
-        paths
-            .lock()
-            .expect("paths")
-            .iter()
-            .map(|path| PortInfo {
-                path: path.to_string_lossy().into_owned(),
-                description: Some("simulated".into()),
-            })
-            .collect()
-    })));
+    let lister = PortListerGuard::from_paths(lister_paths);
     let owner = connect(&socket, ClientInfo::human("host-terminal"));
     let info = owner
         .start_sharing(
@@ -60,6 +50,7 @@ fn start_host(devices: &[&str], lister_paths: Arc<Mutex<Vec<PathBuf>>>) -> Host 
         _xdg: TempDir::new().expect("xdg"),
         owner,
         info,
+        _lister: lister,
     }
 }
 
@@ -121,6 +112,47 @@ impl Terminal {
             .unwrap_or_else(|| panic!("{path} is not a remote device"))
             .endpoint
     }
+}
+
+#[test]
+fn a_new_connection_does_not_hide_an_existing_host_disconnect() {
+    let _guard = serial_test();
+    let local = TempDir::new().expect("local core");
+    let local_socket = local.path().join("local.sock");
+    let local_config = serial_nexus_core::CoreConfig {
+        socket: local_socket.clone(),
+        ..Default::default()
+    };
+    std::thread::spawn(move || {
+        let _ = serial_nexus_core::server::run(local_config);
+    });
+    support::wait_until(Duration::from_secs(5), || {
+        std::os::unix::net::UnixStream::connect(&local_socket).is_ok()
+    });
+
+    let paths = Arc::new(Mutex::new(Vec::new()));
+    let first = start_host(&[], Arc::clone(&paths));
+    let second = start_host(&[], paths);
+    let mut terminal = Terminal::new(&local_socket);
+    terminal.connect(&first.info);
+    first.owner.stop_sharing().expect("stop first host");
+
+    terminal.connect(&second.info);
+
+    let notice = terminal
+        .app
+        .state
+        .notice
+        .as_ref()
+        .expect("disconnect notice");
+    assert_eq!(
+        notice.severity,
+        serial_nexus_terminal::state::Severity::Error
+    );
+    assert!(
+        notice.text.contains("remote host unreachable"),
+        "{notice:?}"
+    );
 }
 
 #[test]

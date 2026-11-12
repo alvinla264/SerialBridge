@@ -6,12 +6,11 @@ mod support;
 
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use serial_nexus_core::enumerate::{install_port_lister, PortInfo};
 use support::tui::{TuiSession, KEY_CTRL_BRACKET, KEY_CTRL_S, KEY_ENTER, KEY_ESC};
-use support::{start_core, SimulatedDevice};
+use support::{start_core, PortListerGuard, SimulatedDevice};
 use tempfile::TempDir;
 
 const ROWS: u16 = 30;
@@ -31,7 +30,8 @@ struct Fixture {
     xdg: PathBuf,
     socket: PathBuf,
     device: SimulatedDevice,
-    guard: MutexGuard<'static, ()>,
+    _lister: PortListerGuard,
+    _guard: MutexGuard<'static, ()>,
 }
 
 impl Fixture {
@@ -39,13 +39,7 @@ impl Fixture {
         let guard = serial_test();
         let (core, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
         let device = SimulatedDevice::new();
-        let path = device.path.clone();
-        install_port_lister(Some(Arc::new(move || {
-            vec![PortInfo {
-                path: path.clone(),
-                description: Some("simulated".into()),
-            }]
-        })));
+        let lister = PortListerGuard::from_path(device.path.clone());
         let xdg = TempDir::new().expect("xdg");
         Self {
             _core: core,
@@ -53,7 +47,8 @@ impl Fixture {
             xdg: xdg.path().to_path_buf(),
             _xdg: xdg,
             device,
-            guard,
+            _lister: lister,
+            _guard: guard,
         }
     }
 
@@ -63,13 +58,6 @@ impl Fixture {
 
     fn settings_text(&self) -> String {
         std::fs::read_to_string(self.xdg.join("serial-nexus/terminal.json")).unwrap_or_default()
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        install_port_lister(None);
-        let _ = &self.guard;
     }
 }
 

@@ -1052,8 +1052,10 @@ impl App {
                 self.state.connect = None;
                 self.show_live_stream();
                 self.state.focus = Focus::Sidebar;
+                let links_before_refresh = self.remotes.len();
                 self.refresh_remotes();
-                if self.remotes.iter().any(|link| link.id == id) {
+                let another_host_failed = self.remotes.len() < links_before_refresh;
+                if !another_host_failed && self.remotes.iter().any(|link| link.id == id) {
                     self.state.notice = Some(Notice::info(format!(
                         "connected to {label}: its checked devices are in the sidebar"
                     )));

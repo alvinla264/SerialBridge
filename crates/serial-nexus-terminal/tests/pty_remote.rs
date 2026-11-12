@@ -5,14 +5,13 @@
 mod support;
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use serial_nexus_client::{ClientInfo, ShareBind};
-use serial_nexus_core::enumerate::{install_port_lister, PortInfo};
 use serial_nexus_protocol::ShareSessionInfo;
 use support::tui::{TuiSession, KEY_CTRL_BRACKET, KEY_ENTER, KEY_TAB};
-use support::{connect, start_core, SimulatedDevice};
+use support::{connect, start_core, PortListerGuard, SimulatedDevice};
 use tempfile::TempDir;
 
 const ROWS: u16 = 32;
@@ -34,6 +33,7 @@ struct Fixture {
     local_socket: PathBuf,
     device: SimulatedDevice,
     info: ShareSessionInfo,
+    _lister: PortListerGuard,
     _guard: MutexGuard<'static, ()>,
 }
 
@@ -45,13 +45,7 @@ impl Fixture {
         let (host_dir, host_socket) =
             start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
         let device = SimulatedDevice::new();
-        let path = device.path.clone();
-        install_port_lister(Some(Arc::new(move || {
-            vec![PortInfo {
-                path: path.clone(),
-                description: Some("simulated".into()),
-            }]
-        })));
+        let lister = PortListerGuard::from_path(device.path.clone());
         let owner = connect(&host_socket, ClientInfo::human("host-terminal"));
         let info = owner
             .start_sharing(
@@ -70,18 +64,13 @@ impl Fixture {
             _xdg: xdg,
             device,
             info,
+            _lister: lister,
             _guard: guard,
         }
     }
 
     fn tui(&self) -> TuiSession {
         TuiSession::spawn(&self.local_socket, &self.xdg, ROWS, COLS)
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        install_port_lister(None);
     }
 }
 

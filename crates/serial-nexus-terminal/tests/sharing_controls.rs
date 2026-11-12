@@ -10,12 +10,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use serial_nexus_client::{ClientInfo, RemoteClient};
-use serial_nexus_core::enumerate::{install_port_lister, PortInfo};
+
 use serial_nexus_protocol::{PairedHost, PairingRole, PairingSecret, SharingSnapshot};
 use serial_nexus_terminal::app::App;
 use serial_nexus_terminal::settings::SettingsStore;
 use serial_nexus_terminal::state::{Notice, Severity, SETTINGS_FIXED_ROWS};
-use support::{connect, start_core, SimulatedDevice};
+use support::{connect, start_core, PortListerGuard, SimulatedDevice};
 use tempfile::TempDir;
 
 /// The port lister is process-wide, so sharing tests take turns.
@@ -29,28 +29,14 @@ fn serial_test() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poison| poison.into_inner())
 }
 
-fn lister(devices: &Arc<Mutex<Vec<PathBuf>>>) -> Arc<serial_nexus_core::enumerate::PortLister> {
-    let devices = Arc::clone(devices);
-    Arc::new(move || {
-        devices
-            .lock()
-            .expect("devices lock")
-            .iter()
-            .map(|path| PortInfo {
-                path: path.to_string_lossy().into_owned(),
-                description: Some("simulated".into()),
-            })
-            .collect()
-    })
-}
-
 struct Fixture {
     _core: TempDir,
     _xdg: TempDir,
     socket: PathBuf,
     settings_path: PathBuf,
     devices: Arc<Mutex<Vec<PathBuf>>>,
-    guard: MutexGuard<'static, ()>,
+    _lister: PortListerGuard,
+    _guard: MutexGuard<'static, ()>,
 }
 
 impl Fixture {
@@ -63,7 +49,7 @@ impl Fixture {
             .map(|device| PathBuf::from(&device.path))
             .collect();
         let devices = Arc::new(Mutex::new(paths));
-        install_port_lister(Some(lister(&devices)));
+        let lister = PortListerGuard::from_paths(Arc::clone(&devices));
         let xdg = TempDir::new().expect("xdg");
         let settings_path = xdg.path().join("serial-nexus/terminal.json");
         (
@@ -73,7 +59,8 @@ impl Fixture {
                 socket,
                 settings_path,
                 devices,
-                guard,
+                _lister: lister,
+                _guard: guard,
             },
             simulated,
         )
@@ -99,13 +86,6 @@ impl Fixture {
 
     fn settings_text(&self) -> String {
         std::fs::read_to_string(&self.settings_path).unwrap_or_default()
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        install_port_lister(None);
-        let _ = &self.guard;
     }
 }
 

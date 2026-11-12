@@ -128,20 +128,12 @@ impl Checklist {
         self.entries.remove(path).is_some()
     }
 
-    pub fn retain(&mut self, mut keep: impl FnMut(&String) -> bool) {
-        self.entries.retain(|path, _| keep(path));
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = &String> {
         self.entries.keys()
     }
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
     }
 
     pub fn identities(&self) -> BTreeMap<String, String> {
@@ -153,15 +145,6 @@ impl Checklist {
                     .map(|identity| (path.clone(), identity.clone()))
             })
             .collect()
-    }
-
-    pub fn from_pairs(pairs: impl IntoIterator<Item = (String, String)>) -> Self {
-        Self {
-            entries: pairs
-                .into_iter()
-                .map(|(path, identity)| (path, Some(identity)))
-                .collect(),
-        }
     }
 
     /// Reconcile with current discovery: fill a missing identity, drop a path
