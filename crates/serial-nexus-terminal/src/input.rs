@@ -147,7 +147,11 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
             Key::Esc => Action::SettingsCancel,
             Key::Tab | Key::Down | Key::Char('j') => Action::SettingsMove(1),
             Key::BackTab | Key::Up | Key::Char('k') => Action::SettingsMove(-1),
-            Key::Char(' ') | Key::Enter => match kind {
+            Key::Char(' ') => match kind {
+                Some(SettingsRow::ShareAddress | SettingsRow::SharePort) => Action::Ignore,
+                _ => Action::SettingsToggle,
+            },
+            Key::Enter => match kind {
                 Some(SettingsRow::ShareAddress | SettingsRow::SharePort) => {
                     Action::SettingsBeginEdit
                 }
@@ -614,6 +618,11 @@ mod sharing_input_tests {
         state.settings_row = 4; // the device checkbox
         assert_eq!(map_key(&state, Key::Char(' ')), Action::SettingsToggle);
         state.settings_row = 2; // the address
+        assert_eq!(
+            map_key(&state, Key::Char(' ')),
+            Action::Ignore,
+            "Space must not clear an address field"
+        );
         assert_eq!(map_key(&state, Key::Enter), Action::SettingsBeginEdit);
         state.settings_editing = true;
         assert_eq!(

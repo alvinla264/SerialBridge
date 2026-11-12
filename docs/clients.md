@@ -167,8 +167,8 @@ public for wrappers with their own launch strategy.
 AI write control.
 
 - At a usable width the terminal shows the device sidebar on the left and the
-  right pane beside it: the shown device's stream, its scrollback, or the
-  Settings view. A narrow terminal cannot fit both, so it shows the focused
+  right pane beside it: the shown device's stream, its scrollback, Settings,
+  the owner-only Pairing view, or the remote Connect form. A narrow terminal cannot fit both, so it shows the focused
   pane only. `Ctrl+]` moves the keyboard focus between the sidebar and the right
   pane; the header names the focused pane, the focused pane's title (or the
   pane edge) is highlighted, and the visible cursor follows the focus — the
@@ -191,9 +191,11 @@ AI write control.
 - In the sidebar, `↑`/`↓` (or `j`/`k`) highlight, `Enter` (or `o`) opens or
   joins the highlighted device, `b` shows the highlighted attached device's
   scrollback (or, for a closed device that has none, the baud prompt) and `d`
-  disconnects the highlighted device. The bottom row is the Settings button:
-  highlight it with the arrow keys and open it with `Enter`, or click it with
-  the mouse. `Ctrl+Q` quits from here, even while the baud prompt is open. `]`
+  disconnects the highlighted device. The sidebar also has Share and Connect
+  buttons before Settings: Share starts or stops the local host session (and
+  opens pairing information when active), while Connect opens the remote host
+  form. Focus buttons with arrows and activate with `Enter`, or click them.
+  `Ctrl+Q` quits from here, even while the baud prompt is open. `]`
   sends a literal `Ctrl+]` to the shown device while that device's stream is in
   the right pane; it writes nothing while the settings or scrollback are shown,
   and no other key typed in the sidebar reaches a device. `Ctrl+]` during the
@@ -228,10 +230,12 @@ AI write control.
   typing is visible on a device that does not echo. Turn it off in the settings
   when the device echoes what it receives.
 - The settings open in the right pane while the sidebar stays visible. The view
-  lists both flags, `local_echo` and `scrollback`. `Tab`, `Shift+Tab` and
-  `↑`/`↓` move between them, `Space` (or `Enter`) toggles the selection, `Ctrl+S`
-  saves the file and only then puts the changes into effect, and `Esc` throws
-  every change away. With the mouse, a flag row toggles on click, and the
+  lists `local_echo`, `scrollback`, the share address and port, and one
+  session-only checkbox per detected local device. `Tab`, `Shift+Tab` and
+  `↑`/`↓` move between rows; `Space` or `Enter` toggles a device checkbox or
+  flag. Press `Enter` on the address or port row to replace its value; Space
+  leaves text rows unchanged. `Ctrl+S` saves the file and only then puts the
+  changes into effect, and `Esc` throws every change away. With the mouse, a flag row toggles on click, and the
   `[ Save ]` and `[ Cancel ]` buttons on the page do what they say — a mouse
   save uses the same save-then-apply path as `Ctrl+S`. Save and Cancel both
   return to the shown device's live stream. A save that fails — including a
