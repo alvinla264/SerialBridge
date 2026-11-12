@@ -473,8 +473,11 @@ impl Engine {
         let state = self.state.lock().expect("state lock");
         let mut devices: Vec<DeviceSummary> = Vec::new();
         let mut seen = HashSet::new();
-        let previous =
-            std::mem::take(&mut *self.detected_tokens.lock().expect("detected tokens lock"));
+        // Keep the last published cache available until the replacement is
+        // complete. Owner validation may run concurrently with discovery and
+        // must not observe a transiently empty map for unchanged devices.
+        let mut token_cache = self.detected_tokens.lock().expect("detected tokens lock");
+        let previous = token_cache.clone();
         let mut tokens: HashMap<String, (String, DeviceIdentity)> = HashMap::new();
         for port in ports {
             seen.insert(port.path.clone());
@@ -524,7 +527,7 @@ impl Engine {
                 devices.push(entry);
             }
         }
-        *self.detected_tokens.lock().expect("detected tokens lock") = tokens;
+        *token_cache = tokens;
         devices.sort_by(|a, b| a.path.cmp(&b.path));
         serial_nexus_protocol::DevicesResult { devices }
     }
