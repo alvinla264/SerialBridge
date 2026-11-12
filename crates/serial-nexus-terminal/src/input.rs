@@ -3,7 +3,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::state::{AppState, Focus, SettingsRow, View};
+use crate::state::{AppState, Focus, View};
 
 /// A key the TUI understands, independent of the terminal library.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,13 +148,11 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
             Key::Tab | Key::Down | Key::Char('j') => Action::SettingsMove(1),
             Key::BackTab | Key::Up | Key::Char('k') => Action::SettingsMove(-1),
             Key::Char(' ') => match kind {
-                Some(SettingsRow::ShareAddress | SettingsRow::SharePort) => Action::Ignore,
+                Some(row) if row.is_text_field() => Action::Ignore,
                 _ => Action::SettingsToggle,
             },
             Key::Enter => match kind {
-                Some(SettingsRow::ShareAddress | SettingsRow::SharePort) => {
-                    Action::SettingsBeginEdit
-                }
+                Some(row) if row.is_text_field() => Action::SettingsBeginEdit,
                 _ => Action::SettingsToggle,
             },
             // Typing is not a command in the settings; only the two text rows

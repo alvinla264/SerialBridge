@@ -1606,11 +1606,7 @@ impl Engine {
                     .expect("detected tokens lock")
                     .get(path)
                     .filter(|(token, identity)| {
-                        if expected_token.starts_with("snx-") {
-                            token == expected_token
-                        } else {
-                            identity.token() == *expected_token
-                        }
+                        token == expected_token || identity.token() == *expected_token
                     })
                     .map(|(_, identity)| identity.clone())
                     .filter(|identity| {

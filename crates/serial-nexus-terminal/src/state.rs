@@ -69,6 +69,16 @@ pub enum SettingsRow {
     Device(usize),
 }
 
+impl SettingsRow {
+    pub fn is_text_field(self) -> bool {
+        matches!(self, Self::ShareAddress | Self::SharePort)
+    }
+
+    pub fn is_toggle(self) -> bool {
+        !self.is_text_field()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
     Info,
@@ -1309,7 +1319,11 @@ impl AppState {
             .iter()
             .map(|device| device.path.clone())
             .collect();
-        let lost = previous.difference(&next).cloned().collect();
+        let lost = if snapshot.active {
+            previous.difference(&next).cloned().collect()
+        } else {
+            Vec::new()
+        };
         if snapshot.active {
             for path in previous.difference(&next) {
                 self.draft_checked.remove(path);
@@ -1910,6 +1924,27 @@ mod sharing_tests {
             remote_clients: 0,
             pending_connections: 0,
         }
+    }
+
+    #[test]
+    fn inactive_snapshot_keeps_session_checks_without_a_revocation_notice() {
+        let mut state = state_with_devices();
+        state
+            .sharing
+            .pending_checked
+            .insert_with_identity("/dev/ttyUSB0".into(), "stable-node".into());
+        state.sharing.active = true;
+        state.sharing.snapshot = Some(snapshot(&["/dev/ttyUSB0"]));
+        let mut stopped = snapshot(&[]);
+        stopped.active = false;
+        stopped.session_id = None;
+        stopped.bind = None;
+
+        let lost = state.apply_sharing_snapshot(stopped);
+
+        assert!(lost.is_empty());
+        assert!(state.sharing.pending_checked.contains("/dev/ttyUSB0"));
+        assert!(!state.sharing.active);
     }
 
     #[test]

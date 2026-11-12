@@ -18,7 +18,7 @@ use crate::render::{hit_test, pairing_max_scroll, panes, settings_hit_test, Hit,
 use crate::settings::{SettingsStore, TerminalSettings};
 use crate::state::{
     short_holder, AppState, ConnectForm, DeviceEntry, EndpointId, Focus, Notice, SessionKey,
-    SettingsRow, SidebarButton, View, LOCAL_ENDPOINT,
+    SidebarButton, View, LOCAL_ENDPOINT,
 };
 
 /// Two clicks on the same cell within this long count as a double-click.
@@ -556,15 +556,14 @@ impl App {
                         self.state.settings_row = index;
                         self.state.end_settings_edit();
                         match self.state.settings_kind(index) {
-                            Some(SettingsRow::Device(_))
-                            | Some(SettingsRow::LocalEcho)
-                            | Some(SettingsRow::Scrollback) => {
+                            Some(row) if row.is_toggle() => {
                                 self.state.toggle_draft();
                             }
-                            Some(SettingsRow::ShareAddress | SettingsRow::SharePort) => {
+                            Some(row) if row.is_text_field() => {
                                 self.state.begin_settings_edit();
                             }
                             None => {}
+                            _ => unreachable!("settings row classification is exhaustive"),
                         }
                     }
                     Some(SettingsHit::Save) => self.save_settings(),
