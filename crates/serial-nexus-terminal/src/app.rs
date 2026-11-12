@@ -713,6 +713,15 @@ impl App {
     /// accepted the checklist and the file was written. A refused checklist
     /// change or a failed write leaves the options as they were and stays in
     /// the settings, so nothing is claimed that did not happen.
+    fn restore_settings_checklists(
+        &mut self,
+        draft_checked: crate::state::Checklist,
+        pending_checked: crate::state::Checklist,
+    ) {
+        self.state.draft_checked = draft_checked;
+        self.state.sharing.pending_checked = pending_checked;
+    }
+
     fn save_settings(&mut self) {
         self.state.end_settings_edit();
         let address_text = self.state.draft.share_address.trim().to_string();
@@ -751,8 +760,7 @@ impl App {
         let draft = self.state.draft.clone();
         let draft_checked = self.state.draft_checked.clone();
         let Some(store) = self.settings_store.clone() else {
-            self.state.draft_checked = original_draft_checked;
-            self.state.sharing.pending_checked = original_pending_checked;
+            self.restore_settings_checklists(original_draft_checked, original_pending_checked);
             self.state.notice = Some(Notice::error("settings not saved: no settings file"));
             return;
         };
@@ -769,8 +777,10 @@ impl App {
         let mut staged = Some(match store.stage(&draft) {
             Ok(staged) => staged,
             Err(error) => {
-                self.state.draft_checked = original_draft_checked.clone();
-                self.state.sharing.pending_checked = original_pending_checked.clone();
+                self.restore_settings_checklists(
+                    original_draft_checked.clone(),
+                    original_pending_checked.clone(),
+                );
                 self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
                 return;
             }
@@ -787,8 +797,10 @@ impl App {
                     if let Some(staged) = staged.take() {
                         store.discard(staged);
                     }
-                    self.state.draft_checked = original_draft_checked.clone();
-                    self.state.sharing.pending_checked = original_pending_checked.clone();
+                    self.restore_settings_checklists(
+                        original_draft_checked.clone(),
+                        original_pending_checked.clone(),
+                    );
                     self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
                     return;
                 }
