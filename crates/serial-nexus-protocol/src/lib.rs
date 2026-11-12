@@ -130,6 +130,10 @@ pub enum Request {
     ShareCheck(ShareDevicesParams),
     /// Replace the whole allowlist atomically. Local owner only.
     ShareReplace(ShareDevicesParams),
+    /// Validate a full checklist without changing anything. Local owner only.
+    SharePrepare(ShareDevicesParams),
+    /// Apply a prepared checklist. Local owner only.
+    ShareCommit(ShareCommitParams),
     /// Remove devices from the allowlist and revoke remote access at once.
     /// Local owner only.
     ShareUncheck(ShareDevicesParams),
@@ -216,6 +220,7 @@ pub enum ResponseData {
     Status(DeviceStatus),
     ShareStarted(ShareSessionInfo),
     Sharing(SharingSnapshot),
+    SharePrepared(SharePrepared),
     ShareStopped(ShareStopped),
 }
 

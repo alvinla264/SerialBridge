@@ -170,6 +170,18 @@ pub struct ShareDevicesParams {
     pub expected: BTreeMap<String, String>,
 }
 
+/// A validated checklist that has not been applied yet.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharePrepared {
+    pub token: String,
+}
+
+/// Apply a previously prepared checklist.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareCommitParams {
+    pub token: String,
+}
+
 /// Which kind of pairing credential a secret is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

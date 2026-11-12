@@ -10,8 +10,9 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use serial_nexus_protocol::{
     encode_bytes, paths, ClientInfo, DeviceRef, DeviceStatus, DevicesResult, Event, HelloParams,
     HelloResult, Limits, OpenParams, OpenResult, ReadParams, ReadResult, Request, RequestMessage,
-    ResponseData, ServerMessage, ShareBind, ShareDevicesParams, ShareSessionInfo, ShareStartParams,
-    SharingSnapshot, WaitSpec, WriteParams, WriteResult, MAX_MESSAGE_BYTES, PROTOCOL_VERSION,
+    ResponseData, ServerMessage, ShareBind, ShareCommitParams, ShareDevicesParams,
+    ShareSessionInfo, ShareStartParams, SharingSnapshot, WaitSpec, WriteParams, WriteResult,
+    MAX_MESSAGE_BYTES, PROTOCOL_VERSION,
 };
 
 use crate::autostart::{find_core_binary, spawn_core};
@@ -369,6 +370,34 @@ impl Client {
     ) -> Result<SharingSnapshot, ClientError> {
         match self.request(
             Request::ShareReplace(ShareDevicesParams { devices, expected }),
+            self.timeout(),
+        )? {
+            ResponseData::Sharing(snapshot) => Ok(snapshot),
+            other => Err(ClientError::UnexpectedResponse(format!("{other:?}"))),
+        }
+    }
+
+    /// Validate a full checklist without applying it. Pair with
+    /// [`commit_shared_devices`] after the preferences are safely published.
+    pub fn prepare_shared_devices_expected(
+        &self,
+        devices: Vec<String>,
+        expected: BTreeMap<String, String>,
+    ) -> Result<String, ClientError> {
+        match self.request(
+            Request::SharePrepare(ShareDevicesParams { devices, expected }),
+            self.timeout(),
+        )? {
+            ResponseData::SharePrepared(prepared) => Ok(prepared.token),
+            other => Err(ClientError::UnexpectedResponse(format!("{other:?}"))),
+        }
+    }
+
+    /// Apply the checklist previously validated by
+    /// [`prepare_shared_devices_expected`].
+    pub fn commit_shared_devices(&self, token: String) -> Result<SharingSnapshot, ClientError> {
+        match self.request(
+            Request::ShareCommit(ShareCommitParams { token }),
             self.timeout(),
         )? {
             ResponseData::Sharing(snapshot) => Ok(snapshot),

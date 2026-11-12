@@ -735,8 +735,6 @@ impl App {
         };
         let active = self.state.sharing.active;
         let desired: Vec<String> = draft_checked.iter().cloned().collect();
-        let previous_checked = self.state.sharing.checked();
-        let previous_identities = self.state.sharing.pending_identities.clone();
 
         // Every checked device needs the identity the owner selected. Without
         // one the core would fall back to the current node at that path, which
@@ -758,6 +756,7 @@ impl App {
         // Stage the preferences but do not publish them until the core has
         // accepted the checklist. A failed core step leaves the live file
         // exactly as it was, with no restore write to fail.
+        let previous_file = store.snapshot().ok().flatten();
         let mut staged = Some(match store.stage(&draft) {
             Ok(staged) => staged,
             Err(error) => {
@@ -767,16 +766,34 @@ impl App {
             }
         });
 
+        let mut prepared = None;
         if active {
             match self
                 .client
-                .replace_shared_devices_expected(desired.clone(), expected)
+                .prepare_shared_devices_expected(desired.clone(), expected)
             {
+                Ok(token) => prepared = Some(token),
+                Err(error) => {
+                    if let Some(staged) = staged.take() {
+                        store.discard(staged);
+                    }
+                    self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
+                    return;
+                }
+            }
+        }
+
+        // Publish the preferences only after the core has validated the
+        // checklist. If this fails, no checklist was committed either.
+        if let Err(error) = store.publish(staged.take().expect("staged settings")) {
+            self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
+            return;
+        }
+
+        if let Some(token) = prepared {
+            match self.client.commit_shared_devices(token) {
                 Ok(snapshot) => self.state.apply_sharing_snapshot(snapshot),
                 Err(error) => {
-                    // A timeout is not proof of failure: the core may have
-                    // applied the new list. Ask it; only a list that matches
-                    // the draft counts as success.
                     let uncertain = matches!(
                         error,
                         ClientError::Timeout(_) | ClientError::WriteUncertain(_)
@@ -786,20 +803,14 @@ impl App {
                         if self.state.sharing.active
                             && self.state.sharing.checked() == draft_checked
                         {
-                            let staged = staged.take().expect("staged settings");
-                            if let Err(error) = store.publish(staged) {
-                                self.state.notice =
-                                    Some(Notice::error(format!("settings not saved: {error}")));
-                                return;
-                            }
                             self.state.commit_settings();
                             self.state.notice = Some(Notice::info("settings saved"));
                             return;
                         }
                     }
-                    if let Some(staged) = staged.take() {
-                        store.discard(staged);
-                    }
+                    // The core did not confirm the new checklist: put the old
+                    // preferences back and keep the draft for a retry.
+                    let _ = store.restore(previous_file.as_deref());
                     self.sync_share_status();
                     self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
                     return;
@@ -807,23 +818,6 @@ impl App {
             }
         }
 
-        if let Err(error) = store.publish(staged.take().expect("staged settings")) {
-            // The live file is unchanged. Put the core back on the previous
-            // checklist so a failed Save leaves the previous sharing state.
-            if active {
-                let expected = self.expected_identities(
-                    &previous_checked.iter().cloned().collect::<Vec<_>>(),
-                    &previous_identities,
-                );
-                let _ = self.client.replace_shared_devices_expected(
-                    previous_checked.iter().cloned().collect(),
-                    expected,
-                );
-                self.sync_share_status();
-            }
-            self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
-            return;
-        }
         self.state.commit_settings();
         self.state.notice = Some(Notice::info("settings saved"));
     }

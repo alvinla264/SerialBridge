@@ -70,6 +70,8 @@ type:
 | `ShareStop` | `ShareStopped` | owner only |
 | `ShareCheck(ShareDevicesParams)` | `Sharing(SharingSnapshot)` | owner only |
 | `ShareReplace(ShareDevicesParams)` | `Sharing(SharingSnapshot)` | owner only, atomic whole-list replacement |
+| `SharePrepare(ShareDevicesParams)` | `SharePrepared(SharePrepared)` | owner only, validates without changing |
+| `ShareCommit(ShareCommitParams)` | `Sharing(SharingSnapshot)` | owner only, applies a prepared list |
 | `ShareUncheck(ShareDevicesParams)` | `Sharing(SharingSnapshot)` | owner only, revokes now |
 | `ShareStatus` | `Sharing(SharingSnapshot)` | owner only; `active: false` when off |
 

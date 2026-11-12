@@ -9,8 +9,8 @@ use serial_nexus_protocol::{
     decode_bytes, ClientKind, ControlReleaseReason, ControlState, DeviceStatus, DeviceSummary,
     ErrorBody, ErrorCode, Event, HelloParams, HelloResult, HistoryLine, Holder, OpenParams,
     OpenResult, ReadParams, ReadResult, Request, ResponseData, Role, ServerMessage,
-    ShareDevicesParams, ShareStartParams, Source, WriteParams, WriteResult, MAX_SHARED_DEVICES,
-    PROTOCOL_VERSION,
+    ShareCommitParams, ShareDevicesParams, SharePrepared, ShareStartParams, Source, WriteParams,
+    WriteResult, MAX_SHARED_DEVICES, PROTOCOL_VERSION,
 };
 
 use crate::config::CoreConfig;
@@ -186,6 +186,15 @@ pub struct Engine {
     /// keeps the kernel from recycling its inode before a later ShareStart.
     detected_tokens: Mutex<HashMap<String, (String, DeviceIdentity)>>,
     next_identity_token: AtomicU64,
+    /// A checklist validated by SharePrepare, waiting for the owner to publish
+    /// its preferences and then commit it.
+    prepared_share: Mutex<Option<PreparedShare>>,
+}
+
+struct PreparedShare {
+    owner: u64,
+    token: String,
+    identities: Vec<DeviceIdentity>,
 }
 
 impl Engine {
@@ -214,6 +223,7 @@ impl Engine {
             live_writes: Mutex::new(HashMap::new()),
             detected_tokens: Mutex::new(HashMap::new()),
             next_identity_token: AtomicU64::new(1),
+            prepared_share: Mutex::new(None),
         })
     }
 
@@ -423,6 +433,8 @@ impl Engine {
             Request::ShareStop => self.stop_sharing_from_owner(client_id),
             Request::ShareCheck(params) => self.check_shared_devices(client_id, params),
             Request::ShareReplace(params) => self.replace_shared_devices(client_id, params),
+            Request::SharePrepare(params) => self.prepare_shared_devices(client_id, params),
+            Request::ShareCommit(params) => self.commit_shared_devices(client_id, params),
             Request::ShareUncheck(params) => self.uncheck_shared_devices(client_id, params),
             Request::ShareStatus => self.sharing_status(client_id),
         }
@@ -1724,6 +1736,7 @@ impl Engine {
     /// Stop sharing: close the listener, disconnect every remote client and
     /// revoke the session's credentials.
     pub fn stop_sharing(&self) {
+        *self.prepared_share.lock().expect("prepared share lock") = None;
         // Hold the gate while revoking and stopping: a remote write admitted
         // concurrently either queued before the bump (and is dropped) or waits
         // here and then sees the stopped session.
@@ -1798,6 +1811,63 @@ impl Engine {
         for path in expired {
             self.revoke_path_everywhere(&path, &session);
         }
+        Ok(ResponseData::Sharing(session.snapshot()))
+    }
+
+    fn prepare_shared_devices(
+        &self,
+        client_id: u64,
+        params: ShareDevicesParams,
+    ) -> Result<ResponseData, ErrorBody> {
+        let session = self.owner_session(client_id)?;
+        if session.is_stopped() {
+            return Err(ErrorBody::new(
+                ErrorCode::ShuttingDown,
+                "sharing is stopping",
+            ));
+        }
+        let identities = self.validated_shared_identities(&params.devices, &params.expected)?;
+        let token = format!(
+            "rep-{}",
+            self.next_identity_token.fetch_add(1, Ordering::SeqCst)
+        );
+        *self.prepared_share.lock().expect("prepared share lock") = Some(PreparedShare {
+            owner: client_id,
+            token: token.clone(),
+            identities,
+        });
+        Ok(ResponseData::SharePrepared(SharePrepared { token }))
+    }
+
+    fn commit_shared_devices(
+        &self,
+        client_id: u64,
+        params: ShareCommitParams,
+    ) -> Result<ResponseData, ErrorBody> {
+        let session = self.owner_session(client_id)?;
+        if session.is_stopped() {
+            return Err(ErrorBody::new(
+                ErrorCode::ShuttingDown,
+                "sharing is stopping",
+            ));
+        }
+        let prepared = self
+            .prepared_share
+            .lock()
+            .expect("prepared share lock")
+            .take()
+            .filter(|prepared| prepared.owner == client_id && prepared.token == params.token);
+        let Some(prepared) = prepared else {
+            return Err(ErrorBody::new(
+                ErrorCode::BadRequest,
+                "the prepared checklist is no longer available; save again",
+            ));
+        };
+        let (expired, removed) = session.replace(prepared.identities)?;
+        for path in expired.into_iter().chain(removed) {
+            self.revoke_path_everywhere(&path, &session);
+        }
+        self.refresh_shared_instances(&session);
         Ok(ResponseData::Sharing(session.snapshot()))
     }
 
@@ -2119,6 +2189,8 @@ impl Engine {
             | Request::ShareStop
             | Request::ShareCheck(_)
             | Request::ShareReplace(_)
+            | Request::SharePrepare(_)
+            | Request::ShareCommit(_)
             | Request::ShareUncheck(_)
             | Request::ShareStatus => Err(ErrorBody::new(
                 ErrorCode::PermissionDenied,
