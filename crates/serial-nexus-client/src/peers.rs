@@ -28,7 +28,8 @@
 //!
 //! The file path is `SERIAL_NEXUS_MCP_PEERS` when set, else
 //! `$XDG_CONFIG_HOME/serial-nexus/mcp-peers.json`, else
-//! `~/.config/serial-nexus/mcp-peers.json`.
+//! `~/.config/serial-nexus/mcp-peers.json`. When none of those is available the
+//! loader fails rather than reading a relative file from the current directory.
 
 use std::fmt;
 use std::fs::File;
@@ -56,6 +57,11 @@ pub enum PeerError {
         "no remote pairing file at {path}; create it readable by you only (chmod 600) and add one entry per shared endpoint"
     )]
     Missing { path: PathBuf },
+
+    #[error(
+        "no pairing file location: set {PEERS_ENV}, or XDG_CONFIG_HOME or HOME so the default ~/.config/serial-nexus/mcp-peers.json can be found"
+    )]
+    NoConfigDir,
 
     #[error("cannot read the remote pairing file {path}: {source}")]
     Io {
@@ -186,28 +192,45 @@ pub struct Peers {
 
 impl Peers {
     /// The default pairing file: the environment override, else the user's
-    /// configuration directory.
-    pub fn default_path() -> PathBuf {
-        if let Some(path) = std::env::var_os(PEERS_ENV) {
-            return PathBuf::from(path);
+    /// configuration directory. An environment with neither a home nor a
+    /// configuration directory is an error: a relative `mcp-peers.json` would
+    /// be read from whatever directory the MCP host happened to start in.
+    pub fn default_path() -> Result<PathBuf, PeerError> {
+        Self::default_path_from(
+            std::env::var_os(PEERS_ENV),
+            std::env::var_os("XDG_CONFIG_HOME"),
+            std::env::var_os("HOME"),
+        )
+    }
+
+    /// [`Peers::default_path`] with every input explicit, so the precedence
+    /// and the scrubbed-environment refusal can be tested without touching the
+    /// process environment. Empty values count as unset.
+    fn default_path_from(
+        peers: Option<std::ffi::OsString>,
+        xdg: Option<std::ffi::OsString>,
+        home: Option<std::ffi::OsString>,
+    ) -> Result<PathBuf, PeerError> {
+        if let Some(path) = peers.filter(|path| !path.is_empty()) {
+            return Ok(PathBuf::from(path));
         }
-        if let Some(base) = std::env::var_os("XDG_CONFIG_HOME") {
-            return PathBuf::from(base)
+        if let Some(base) = xdg.filter(|base| !base.is_empty()) {
+            return Ok(PathBuf::from(base)
                 .join("serial-nexus")
-                .join("mcp-peers.json");
+                .join("mcp-peers.json"));
         }
-        match std::env::var_os("HOME") {
-            Some(home) => PathBuf::from(home)
+        if let Some(home) = home.filter(|home| !home.is_empty()) {
+            return Ok(PathBuf::from(home)
                 .join(".config")
                 .join("serial-nexus")
-                .join("mcp-peers.json"),
-            None => PathBuf::from("mcp-peers.json"),
+                .join("mcp-peers.json"));
         }
+        Err(PeerError::NoConfigDir)
     }
 
     /// Load [`Peers::default_path`].
     pub fn load_default() -> Result<Self, PeerError> {
-        Self::load(Self::default_path())
+        Self::load(Self::default_path()?)
     }
 
     /// Load a pairing file, refusing anything another user could read.
@@ -330,10 +353,20 @@ fn open_private(path: &Path) -> Result<File, PeerError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Err(PeerError::Missing { path: path.into() })
         }
-        // O_NOFOLLOW reports a symbolic link as ELOOP; say what that means
-        // instead of passing the raw errno along.
+        // O_NOFOLLOW refuses a symbolic link in the final component with
+        // ELOOP. Only say the file is a link when it really is one: a loop in
+        // a parent directory is an honest I/O error about the path, not a
+        // claim about a file that was never opened.
         Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
-            Err(PeerError::NotRegular { path: path.into() })
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    Err(PeerError::NotRegular { path: path.into() })
+                }
+                _ => Err(PeerError::Io {
+                    path: path.into(),
+                    source: error,
+                }),
+            }
         }
         Err(error) => Err(PeerError::Io {
             path: path.into(),
@@ -379,6 +412,42 @@ fn check_private_as(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_scrubbed_environment_names_no_pairing_file() {
+        // Neither the override nor a base directory: refusing is better than
+        // reading `mcp-peers.json` from wherever the host was started.
+        let error = Peers::default_path_from(None, None, None).expect_err("no location");
+        assert!(matches!(error, PeerError::NoConfigDir), "{error}");
+        assert!(error.to_string().contains(PEERS_ENV), "{error}");
+
+        let from_home = Peers::default_path_from(None, None, Some("/home/alvin".into()))
+            .expect("home is enough");
+        assert_eq!(
+            from_home,
+            PathBuf::from("/home/alvin/.config/serial-nexus/mcp-peers.json")
+        );
+        let from_xdg = Peers::default_path_from(
+            None,
+            Some("/home/alvin/.config".into()),
+            Some("/home/alvin".into()),
+        )
+        .expect("xdg wins over home");
+        assert_eq!(
+            from_xdg,
+            PathBuf::from("/home/alvin/.config/serial-nexus/mcp-peers.json")
+        );
+        let from_env = Peers::default_path_from(
+            Some("/tmp/peers.json".into()),
+            Some("/home/alvin/.config".into()),
+            Some("/home/alvin".into()),
+        )
+        .expect("the explicit override wins over both");
+        assert_eq!(from_env, PathBuf::from("/tmp/peers.json"));
+        // An empty variable is not a location.
+        let empty = Peers::default_path_from(Some("".into()), Some("".into()), Some("".into()));
+        assert!(matches!(empty, Err(PeerError::NoConfigDir)));
+    }
 
     #[test]
     fn a_foreign_owner_is_refused() {

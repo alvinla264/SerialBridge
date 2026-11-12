@@ -115,7 +115,8 @@ file, readable by its owner only:
    and copies them is part of the sharing controls work, so until it ships use
    that contract;
 2. create `~/.config/serial-nexus/mcp-peers.json` (`$XDG_CONFIG_HOME` is
-   honoured, and `SERIAL_NEXUS_MCP_PEERS` names another file) with mode `600`:
+   honoured, and `SERIAL_NEXUS_MCP_PEERS` names another file; if none of these
+   is set the server says so instead of reading a relative file) with mode `600`:
 
 ```sh
 install -d -m 700 ~/.config/serial-nexus

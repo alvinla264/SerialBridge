@@ -120,7 +120,8 @@ arguments or history, so the human configures one private file instead.
 `Peers` loads it:
 
 - path: `SERIAL_NEXUS_MCP_PEERS`, else `$XDG_CONFIG_HOME/serial-nexus/mcp-peers.json`,
-  else `~/.config/serial-nexus/mcp-peers.json`;
+  else `~/.config/serial-nexus/mcp-peers.json`; with none of those set the
+  loader fails instead of reading a relative file from the current directory;
 - shape: `{ "version": 1, "peers": [ { "endpoint": {"address", "port"}, "paired": {...}, "secret": {"role", "credential"} } ] }`;
 - it must be a regular file owned by the current user with no group or world
   permission bits; a symlink, another owner or mode `644` is refused

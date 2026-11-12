@@ -242,3 +242,18 @@ fn a_symbolic_link_says_it_is_not_a_regular_file() {
     let error = Peers::load(&link).expect_err("symlink");
     assert!(matches!(error, PeerError::NotRegular { .. }), "{error}");
 }
+
+#[test]
+fn a_symbolic_link_loop_in_a_parent_directory_is_an_io_error_not_a_link() {
+    // The file itself is not a symbolic link and does not exist; O_NOFOLLOW
+    // reports the unresolvable path as ELOOP. The message must describe the
+    // path, not claim the (missing) file is a link or a device.
+    let directory = TempDir::new().expect("tempdir");
+    let looped = directory.path().join("selfloop");
+    std::os::unix::fs::symlink(&looped, &looped).expect("symlink loop");
+    let path = looped.join("peers.json");
+    let error = Peers::load(&path).expect_err("unresolvable path");
+    assert!(matches!(error, PeerError::Io { .. }), "{error}");
+    assert!(!matches!(error, PeerError::NotRegular { .. }), "{error}");
+    assert!(error.to_string().contains("peers.json"), "{error}");
+}
