@@ -195,7 +195,10 @@ fn saving_checks_starts_a_session_and_shows_both_credentials_and_host_authentica
 
     // Debug never prints a credential value.
     let debug = format!("{:?}", human);
-    assert!(!debug.contains(&human.credential), "{debug}");
+    assert!(
+        !debug.contains(&human.credential),
+        "Debug prints no credential"
+    );
 
     app.shutdown();
 }

@@ -148,8 +148,11 @@ fn the_host_checks_a_device_starts_sharing_sees_the_secrets_and_leaves_it_off() 
 
     // The saved file holds preferences only, never a credential.
     let saved = fixture.settings_text();
-    assert!(saved.contains("\"share_port\": 0"), "{saved}");
-    assert!(!saved.contains("credential"), "{saved}");
+    assert!(saved.contains("\"share_port\": 0"), "the saved port is 0");
+    assert!(
+        !saved.contains("credential"),
+        "the settings file holds no secret"
+    );
 
     // The sidebar's Share button starts the session deliberately.
     tui.send(KEY_CTRL_BRACKET);
@@ -167,8 +170,7 @@ fn the_host_checks_a_device_starts_sharing_sees_the_secrets_and_leaves_it_off() 
     tui.wait_for_text("MCP (AI) pairing");
     assert!(
         tui.text().contains("credential:"),
-        "both credentials are shown to the host:\n{}",
-        tui.text()
+        "both credentials are shown to the host"
     );
     assert!(
         !fixture.settings_text().contains("credential"),
@@ -191,8 +193,6 @@ fn the_host_checks_a_device_starts_sharing_sees_the_secrets_and_leaves_it_off() 
         !fixture.settings_text().contains("credential"),
         "no secret was written on the way out"
     );
-    tui.send(KEY_CTRL_BRACKET);
-    tui.wait_for_text("focus: sidebar");
     tui.quit();
 }
 

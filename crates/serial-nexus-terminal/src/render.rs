@@ -705,7 +705,11 @@ fn draw_settings(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u
         let marker = if selected { "▸" } else { " " };
         let (label, value) = match state.settings_kind(row) {
             Some(SettingsRow::Device(_)) => {
-                let checkbox = if value == "on" { "[x]" } else { "[ ]" };
+                let checkbox = if state.draft_device_checked(row) == Some(true) {
+                    "[x]"
+                } else {
+                    "[ ]"
+                };
                 (format!("{marker} {checkbox} {label}"), String::new())
             }
             Some(SettingsRow::ShareAddress | SettingsRow::SharePort) => {

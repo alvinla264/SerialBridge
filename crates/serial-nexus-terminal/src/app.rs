@@ -991,7 +991,9 @@ impl App {
             Ok(()) => {
                 self.state.sharing.clear_session();
                 if self.state.view == View::Pairing {
-                    self.show_live_stream();
+                    // Stop may come from the sidebar; do not hand the keys to
+                    // the stream without an explicit focus change.
+                    self.state.close_pairing_view();
                 }
                 self.state.notice = Some(Notice::info("sharing stopped"));
             }

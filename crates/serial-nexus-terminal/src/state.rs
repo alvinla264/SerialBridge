@@ -50,6 +50,14 @@ pub enum View {
 /// scrollback, the sharing address and the sharing port.
 pub const SETTINGS_FIXED_ROWS: usize = 4;
 
+/// Fixed settings rows in drawing, navigation and label order.
+const FIXED_SETTINGS: [(SettingsRow, &str); SETTINGS_FIXED_ROWS] = [
+    (SettingsRow::LocalEcho, "Local echo"),
+    (SettingsRow::Scrollback, "Scrollback"),
+    (SettingsRow::ShareAddress, "Share address"),
+    (SettingsRow::SharePort, "Share port"),
+];
+
 /// What one settings row edits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsRow {
@@ -477,20 +485,15 @@ impl AppState {
     /// What one settings row edits. The first four rows are fixed; the rest
     /// are one checkbox per detected device.
     pub fn settings_kind(&self, row: usize) -> Option<SettingsRow> {
-        match row {
-            0 => Some(SettingsRow::LocalEcho),
-            1 => Some(SettingsRow::Scrollback),
-            2 => Some(SettingsRow::ShareAddress),
-            3 => Some(SettingsRow::SharePort),
-            _ => {
-                // Only this host's devices can be shared: another host's
-                // checklist is never ours to edit, and equal paths must not
-                // stand in for a local device.
-                let local = self.local_device_indices();
-                let index = *local.get(row.checked_sub(SETTINGS_FIXED_ROWS)?)?;
-                Some(SettingsRow::Device(index))
-            }
+        if let Some((kind, _)) = FIXED_SETTINGS.get(row) {
+            return Some(*kind);
         }
+        // Only this host's devices can be shared: another host's checklist is
+        // never ours to edit, and equal paths must not stand in for a local
+        // device.
+        let local = self.local_device_indices();
+        let index = *local.get(row.checked_sub(SETTINGS_FIXED_ROWS)?)?;
+        Some(SettingsRow::Device(index))
     }
 
     /// The device indices that belong to this machine's core, in list order.
@@ -511,13 +514,7 @@ impl AppState {
 
     /// The name of a fixed settings row. Device rows are labelled by path.
     pub fn settings_row_name(row: usize) -> Option<&'static str> {
-        match row {
-            0 => Some("Local echo"),
-            1 => Some("Scrollback"),
-            2 => Some("Share address"),
-            3 => Some("Share port"),
-            _ => None,
-        }
+        FIXED_SETTINGS.get(row).map(|(_, name)| *name)
     }
 
     /// The label the settings view draws for one row.
