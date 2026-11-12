@@ -963,18 +963,7 @@ impl AppState {
     /// The buttons the sidebar can draw at its current height, in drawing
     /// order. The navigation uses the same list as the renderer.
     pub fn sidebar_buttons(&self) -> Vec<SidebarButton> {
-        if self.cols < 8 || self.rows < 2 {
-            return Vec::new();
-        }
-        if self.rows >= 4 {
-            vec![
-                SidebarButton::Share,
-                SidebarButton::Connect,
-                SidebarButton::Settings,
-            ]
-        } else {
-            vec![SidebarButton::Settings]
-        }
+        crate::render::available_sidebar_buttons(self.rows, self.cols)
     }
 
     /// Select one sidebar row. The shown stream is untouched: choosing a row

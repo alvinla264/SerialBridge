@@ -2,13 +2,12 @@
 //! not depend on a real terminal.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use crossterm::event::MouseEventKind;
 use ratatui::layout::Rect;
-use serial_nexus_client::{Client, ClientError, RemoteClient};
+use serial_nexus_client::{Client, ClientError, RemoteClient, RemoteEndpoint};
 use serial_nexus_protocol::{
     DeviceSummary, ErrorCode, Event, OpenResult, PairedHost, PairingRole, PairingSecret, ShareBind,
     WaitSpec, WriteResult,
@@ -258,7 +257,7 @@ impl App {
     /// endpoint, so two hosts with equal device ids never cross streams.
     pub fn pump(&mut self) {
         while let Ok(event) = self.events.try_recv() {
-            self.handle_event(LOCAL_ENDPOINT, event, None);
+            self.handle_event(LOCAL_ENDPOINT, event);
         }
         let mut overflowed = Vec::new();
         let pending: Vec<(EndpointId, Vec<Event>)> = self
@@ -281,7 +280,7 @@ impl App {
             .collect();
         for (id, events) in pending {
             for event in events {
-                self.handle_event(id, event, Some(id));
+                self.handle_event(id, event);
             }
         }
         for id in overflowed {
@@ -291,9 +290,8 @@ impl App {
         }
     }
 
-    fn handle_event(&mut self, endpoint: EndpointId, event: Event, remote: Option<EndpointId>) {
-        let close_endpoint = remote.unwrap_or(endpoint);
-        let Some(expected) = self.expected_closes_mut(close_endpoint) else {
+    fn handle_event(&mut self, endpoint: EndpointId, event: Event) {
+        let Some(expected) = self.expected_closes_mut(endpoint) else {
             return;
         };
         if let Event::DeviceClosed { device_id, .. } = &event {
@@ -309,7 +307,8 @@ impl App {
             &event,
             Event::TransportClosed { .. } | Event::CoreShutdown { .. }
         ) {
-            if let Some(id) = remote {
+            if endpoint != LOCAL_ENDPOINT {
+                let id = endpoint;
                 let reason = match &event {
                     Event::TransportClosed { reason } => reason.clone(),
                     Event::CoreShutdown { reason } => reason.clone(),
@@ -697,24 +696,6 @@ impl App {
         }
     }
 
-    /// Parse a concrete IPv4/IPv6 address, allowing an IPv6 zone suffix such
-    /// as `fe80::1%3` (the interface index).
-    fn parse_address(text: &str) -> Result<(IpAddr, u32), String> {
-        if let Ok(address) = text.parse::<IpAddr>() {
-            return Ok((address, 0));
-        }
-        let (address, interface) = text
-            .rsplit_once('%')
-            .ok_or_else(|| "the address is not an IPv4 or IPv6 address".to_string())?;
-        let address: std::net::Ipv6Addr = address
-            .parse()
-            .map_err(|_| "the address is not an IPv4 or IPv6 address".to_string())?;
-        let scope = interface
-            .parse::<u32>()
-            .map_err(|_| format!("the IPv6 scope {interface:?} is not an interface index"))?;
-        Ok((IpAddr::V6(address), scope))
-    }
-
     /// Save the draft settings and checklist, then keep the draft and go back
     /// to the shown device's live stream.
     ///
@@ -725,7 +706,7 @@ impl App {
     fn save_settings(&mut self) {
         self.state.end_settings_edit();
         let address_text = self.state.draft.share_address.trim().to_string();
-        let (address, scope) = match Self::parse_address(&address_text) {
+        let (address, scope) = match RemoteEndpoint::parse_address(&address_text) {
             Ok(parsed) => parsed,
             Err(message) => {
                 self.state.notice = Some(Notice::error(format!("settings not saved: {message}")));
@@ -984,7 +965,8 @@ impl App {
 
     /// The saved sharing endpoint, validated as one concrete address.
     fn share_bind(&self) -> Result<ShareBind, String> {
-        let (address, scope) = Self::parse_address(self.state.settings.share_address.trim())?;
+        let (address, scope) =
+            RemoteEndpoint::parse_address(self.state.settings.share_address.trim())?;
         let bind = ShareBind::with_scope(address, self.state.settings.share_port, scope);
         bind.validate()?;
         Ok(bind)
@@ -1108,7 +1090,7 @@ impl App {
     /// Dial and authenticate one host, then register its endpoint. Every
     /// failure leaves nothing behind.
     fn connect_remote(&mut self, form: &ConnectForm) -> Result<(EndpointId, String), String> {
-        let (address, scope) = Self::parse_address(form.address.trim())?;
+        let (address, scope) = RemoteEndpoint::parse_address(form.address.trim())?;
         let port: u16 = form
             .port
             .trim()

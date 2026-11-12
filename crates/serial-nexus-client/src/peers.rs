@@ -126,7 +126,7 @@ impl RemotePeer {
     fn validate(&self) -> Result<(), String> {
         self.endpoint.validate()?;
         let endpoint = RemoteEndpoint::from_socket_addr(self.paired.address).canonical();
-        if endpoint != self.endpoint.canonical() {
+        if !endpoint.same_host(&self.endpoint) {
             return Err(format!(
                 "the pairing is for {} but this entry is for {}",
                 self.paired.address, self.endpoint

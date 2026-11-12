@@ -71,6 +71,20 @@ fn ipv6_endpoints_match_and_read_naturally() {
 }
 
 #[test]
+fn client_local_scope_can_differ_from_the_pairing_host_scope() {
+    let directory = TempDir::new().expect("tempdir");
+    let contents = format!(
+        r#"{{"version":1,"peers":[{{"endpoint":{{"address":"fe80::1","port":7331,"scope_id":3}},"paired":{{"address":"[fe80::1%2]:7331","host_name":"fe80::1","ca_cert_der_b64":"Y2E=","host_cert_fingerprint_sha256":"{}"}},"secret":{{"role":"ai","credential":"{}"}}}}]}}"#,
+        "ab".repeat(32),
+        CREDENTIAL,
+    );
+    let path = write_file(&directory, &contents, 0o600);
+    let peers = Peers::load(&path).expect("load host pairing with client-local scope");
+    let endpoint = RemoteEndpoint::with_scope("fe80::1".parse().unwrap(), 7331, 3);
+    assert!(peers.find(&endpoint).is_ok());
+}
+
+#[test]
 fn a_mapped_ipv6_endpoint_matches_its_ipv4_pairing() {
     let directory = TempDir::new().expect("tempdir");
     let path = write_file(&directory, &peer_json("127.0.0.1", 7443, "ai"), 0o600);

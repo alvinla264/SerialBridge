@@ -46,6 +46,24 @@ fn is_zero(value: &u32) -> bool {
 }
 
 impl RemoteEndpoint {
+    /// Parse an IPv4/IPv6 address with an optional numeric IPv6 interface
+    /// scope, returning the IP and scope separately for socket construction.
+    pub fn parse_address(text: &str) -> Result<(IpAddr, u32), String> {
+        if let Ok(address) = text.parse::<IpAddr>() {
+            return Ok((address, 0));
+        }
+        let (address, interface) = text
+            .rsplit_once('%')
+            .ok_or_else(|| "the address is not an IPv4 or IPv6 address".to_string())?;
+        let address: std::net::Ipv6Addr = address
+            .parse()
+            .map_err(|_| "the address is not an IPv4 or IPv6 address".to_string())?;
+        let scope = interface
+            .parse::<u32>()
+            .map_err(|_| format!("the IPv6 scope {interface:?} is not an interface index"))?;
+        Ok((IpAddr::V6(address), scope))
+    }
+
     pub fn new(address: IpAddr, port: u16) -> Self {
         Self {
             address,
@@ -89,6 +107,13 @@ impl RemoteEndpoint {
     /// ordering treat both spellings as one endpoint.
     pub fn canonical(&self) -> Self {
         Self::with_scope(Self::canonical_ip(self.address), self.port, self.scope_id)
+    }
+
+    /// Whether two endpoints name the same host address and port, ignoring
+    /// their client-local interface scopes.
+    pub fn same_host(&self, other: &Self) -> bool {
+        Self::canonical_ip(self.address) == Self::canonical_ip(other.address)
+            && self.port == other.port
     }
 
     /// Refuse addresses no client can mean: port 0, wildcards, multicast and
@@ -194,7 +219,7 @@ impl RemoteClient {
     ) -> Result<Self, ClientError> {
         endpoint.validate().map_err(ClientError::EndpointMismatch)?;
         let paired_endpoint = RemoteEndpoint::from_socket_addr(paired.address);
-        if endpoint.canonical() != paired_endpoint.canonical() {
+        if !endpoint.same_host(&paired_endpoint) {
             return Err(ClientError::EndpointMismatch(format!(
                 "{endpoint} is not the paired endpoint {paired_endpoint}"
             )));

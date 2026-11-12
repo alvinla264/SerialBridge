@@ -229,13 +229,12 @@ Findings fixed after the additional focused review:
   attempt, including failed ones, and the test asserts the exact
   `write_all` remainder sequence with no later attempt.
 
-## Test-only adapters
+## Client adapter
 
-`serial_nexus_client::RemoteClient` is the client-facing remote adapter: it
-performs the TLS trust and pin checks, authenticates, then exposes
-`list_devices`, `open`, `close`, `read`, `write_bytes`, `status` and
-`subscribe`. The terminal and MCP remote clients should use it (or the same
-`serial_nexus_protocol` types) rather than re-implementing TLS.
+`serial_nexus_client::RemoteClient` is the client-facing production remote
+adapter used by both the terminal and MCP server. It performs the TLS trust and
+pin checks, authenticates, then exposes `list_devices`, `open`, `close`, `read`,
+`write_bytes`, `status` and `subscribe`; these clients do not re-implement TLS.
 
 ## Board gate
 

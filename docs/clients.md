@@ -69,8 +69,8 @@ Errors are `ClientError`. Use `error.code()` to match the core's `ErrorCode`
 `RemoteClient` reaches devices a host shares on the local network. It is used
 by the MCP server and by the terminal's Connect form. It never talks to the
 Unix socket, and a network failure is an error rather than a quiet local retry.
-IPv6 link-local addresses include their numeric interface scope (for example
-`fe80::1%3`) so the connection uses the selected interface.
+IPv6 link-local addresses include the connecting machine's numeric interface
+scope (for example `fe80::1%3`) so the connection uses that local interface.
 
 ```rust
 use std::net::{IpAddr, Ipv4Addr};
@@ -91,7 +91,7 @@ let devices = client.list_devices()?;
 
 | Call | What it does |
 | --- | --- |
-| `RemoteEndpoint::new(ip, port)` | The address and port to dial. `validate()` refuses port 0, wildcards, multicast and broadcast; IPv4-mapped IPv6 is the same endpoint as its IPv4 form. |
+| `RemoteEndpoint::new(ip, port)` | The address and port to dial. Use `with_scope(ip, port, interface_index)` for link-local IPv6. `validate()` refuses port 0, wildcards, multicast and broadcast; IPv4-mapped IPv6 is the same endpoint as its IPv4 form. |
 | `RemoteClient::connect_to(endpoint, paired, secret, name, timeout)` | Dial exactly that endpoint. Refuses an endpoint the pairing does not describe (`ClientError::EndpointMismatch`). |
 | `RemoteClient::connect(paired, secret, name, timeout)` | The same, dialling the pairing's own address. |
 | `list_devices`, `open`, `close`, `read`, `write_bytes`, `status` | Same shapes as `Client`. |

@@ -18,6 +18,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::screen::{Color, Style};
 use crate::state::{
     AppState, ConnectField, Focus, SettingsRow, Severity, SidebarButton, SidebarRow, View,
+    LOCAL_ENDPOINT,
 };
 
 /// The sidebar's preferred narrowest width when both panes are shown.
@@ -148,6 +149,29 @@ pub struct Sidebar {
 
 /// Where the sidebar puts its parts inside `rect`, or `None` when there is no
 /// room.
+pub(crate) fn available_sidebar_buttons(rows: usize, cols: usize) -> Vec<SidebarButton> {
+    let rect = Rect::new(
+        0,
+        0,
+        cols.min(u16::MAX as usize) as u16,
+        rows.min(u16::MAX as usize) as u16,
+    );
+    let Some(layout) = sidebar(rect) else {
+        return Vec::new();
+    };
+    let mut buttons = Vec::new();
+    if layout.share.height > 0 {
+        buttons.push(SidebarButton::Share);
+    }
+    if layout.connect.height > 0 {
+        buttons.push(SidebarButton::Connect);
+    }
+    if layout.button.height > 0 {
+        buttons.push(SidebarButton::Settings);
+    }
+    buttons
+}
+
 pub fn sidebar(rect: Rect) -> Option<Sidebar> {
     if rect.height < 2 || rect.width < 8 {
         return None;
@@ -502,49 +526,42 @@ fn draw_header(state: &AppState, buffer: &mut Buffer, area: Rect) {
 fn draw_sidebar(state: &AppState, buffer: &mut Buffer, rect: Rect) -> Option<(u16, u16)> {
     let sidebar = sidebar(rect)?;
     let list = sidebar.list;
+    let empty_remote_tags: Vec<String> = state
+        .remote_labels
+        .keys()
+        .filter(|endpoint| {
+            !state
+                .devices
+                .iter()
+                .any(|device| device.endpoint == **endpoint)
+        })
+        .map(|endpoint| state.endpoint_tag(*endpoint))
+        .collect();
     // With no room for a device row, the title row carries the highlighted
-    // device instead, so the cursor never points at the Settings button while
-    // a device owns the keys.
+    // device instead, while still showing connected empty hosts.
     let title = if list.height == 0 && state.selected_device().is_some() {
-        match state.selected_device() {
-            Some(device) if !state.remote_labels.is_empty() => {
-                format!("› {} {} ", state.endpoint_tag(device.endpoint), device.path)
+        let selected = match state.selected_device() {
+            Some(device) if device.endpoint != LOCAL_ENDPOINT => {
+                format!("› {} {}", state.endpoint_tag(device.endpoint), device.path)
             }
-            Some(device) => format!("› {} ", device.path),
+            Some(device) => format!("› {}", device.path),
             None => " Devices ".to_string(),
-        }
-    } else {
-        let empty_remote_tags: Vec<String> = state
-            .remote_labels
-            .keys()
-            .filter(|endpoint| {
-                !state
-                    .devices
-                    .iter()
-                    .any(|device| device.endpoint == **endpoint)
-            })
-            .map(|endpoint| state.endpoint_tag(*endpoint))
-            .collect();
+        };
         if empty_remote_tags.is_empty() {
-            format!(" Devices ({}) ", state.devices.len())
+            selected
         } else {
-            format!(
-                " Devices ({}) · Empty host: {} ",
-                state.devices.len(),
-                empty_remote_tags.join(",")
-            )
+            format!("Empty host: {} · {selected}", empty_remote_tags.join(","))
         }
-    };
-    let title_style = if state.focus == Focus::Sidebar {
-        RStyle::default()
-            .fg(RColor::Black)
-            .bg(RColor::Cyan)
-            .add_modifier(Modifier::BOLD)
+    } else if empty_remote_tags.is_empty() {
+        format!(" Devices ({}) ", state.devices.len())
     } else {
-        RStyle::default()
-            .fg(RColor::Cyan)
-            .add_modifier(Modifier::BOLD)
+        format!(
+            " Empty host: {} · Devices ({}) ",
+            empty_remote_tags.join(","),
+            state.devices.len()
+        )
     };
+    let title_style = focus_title_style(state.focus == Focus::Sidebar);
     put(buffer, sidebar.title, 0, &title, title_style);
     if state.devices.is_empty() && list.height > 0 {
         put(
@@ -687,16 +704,7 @@ fn draw_settings(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u
         return None;
     };
     if layout.title.height > 0 {
-        let title_style = if state.focus == Focus::Right {
-            RStyle::default()
-                .fg(RColor::Black)
-                .bg(RColor::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            RStyle::default()
-                .fg(RColor::Cyan)
-                .add_modifier(Modifier::BOLD)
-        };
+        let title_style = focus_title_style(state.focus == Focus::Right);
         put(buffer, layout.title, 0, " Settings ", title_style);
     }
     let first = settings_first_row(state, layout);
@@ -925,16 +933,7 @@ fn draw_connect(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u1
         return Some((area.x + 1, area.y));
     };
     let mut cursor = (area.x, area.y);
-    let title_style = if state.focus == Focus::Right {
-        RStyle::default()
-            .fg(RColor::Black)
-            .bg(RColor::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        RStyle::default()
-            .fg(RColor::Cyan)
-            .add_modifier(Modifier::BOLD)
-    };
+    let title_style = focus_title_style(state.focus == Focus::Right);
     put(buffer, area, 0, " Connect to a remote host ", title_style);
     let error_rows = usize::from(form.error.is_some());
     let available = area.height as usize;
@@ -1256,6 +1255,19 @@ fn row_text_label(label: &str, value: &str, width: usize) -> String {
     line.push(' ');
     line.push_str(value);
     fit(&line, width)
+}
+
+fn focus_title_style(focused: bool) -> RStyle {
+    if focused {
+        RStyle::default()
+            .fg(RColor::Black)
+            .bg(RColor::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        RStyle::default()
+            .fg(RColor::Cyan)
+            .add_modifier(Modifier::BOLD)
+    }
 }
 
 fn highlighted(selected: bool) -> RStyle {
@@ -1607,6 +1619,19 @@ mod tests {
         assert!(selected >= first);
         assert!(selected < first + layout.list.height as usize);
         assert!(screen(&state, 80, 8).join("\\n").contains("Empty host: #1"));
+    }
+
+    #[test]
+    fn a_zero_list_sidebar_still_names_an_empty_connected_host() {
+        let mut state = AppState::new(7, 80);
+        state.set_devices(vec![DeviceEntry::new("/dev/local")]);
+        state
+            .remote_labels
+            .insert(EndpointId(1), "empty host".into());
+
+        let rendered = screen(&state, 80, 7).join("\\n");
+        assert!(rendered.contains("Empty host: #1"), "{rendered}");
+        assert!(rendered.contains("/dev/local"), "{rendered}");
     }
 
     #[test]

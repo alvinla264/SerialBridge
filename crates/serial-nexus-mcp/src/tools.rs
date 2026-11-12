@@ -12,7 +12,6 @@
 //! through tool arguments and is never part of a result.
 
 use std::collections::BTreeMap;
-use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -801,32 +800,9 @@ fn parse_endpoint(ip: &Value, port: &Value) -> Result<RemoteEndpoint, Failure> {
     let text = ip
         .as_str()
         .ok_or_else(|| Failure::Params("ip must be an IPv4 or IPv6 address string".into()))?;
-    let (address, scope_id) = match text.rsplit_once('%') {
-        Some((address, scope)) => {
-            let address = address.parse::<IpAddr>().map_err(|_| {
-                Failure::Params(format!(
-                    "{text:?} is not an IPv4 or IPv6 address (for example 192.0.2.10 or ::1)"
-                ))
-            })?;
-            let IpAddr::V6(address) = address else {
-                return Err(Failure::Params(
-                    "interface scope requires an IPv6 address".into(),
-                ));
-            };
-            let scope_id = scope.parse::<u32>().map_err(|_| {
-                Failure::Params("IPv6 interface scope must be a numeric interface index".into())
-            })?;
-            (IpAddr::V6(address), scope_id)
-        }
-        None => (
-            text.parse::<IpAddr>().map_err(|_| {
-                Failure::Params(format!(
-                    "{text:?} is not an IPv4 or IPv6 address (for example 192.0.2.10 or ::1)"
-                ))
-            })?,
-            0,
-        ),
-    };
+    let (address, scope_id) = RemoteEndpoint::parse_address(text).map_err(|error| {
+        Failure::Params(format!("{text:?} is not an IPv4 or IPv6 address: {error}"))
+    })?;
     let number = as_integral(port)
         .ok_or_else(|| Failure::Params("port must be a TCP port number".into()))?;
     let port = u16::try_from(number)
