@@ -1275,3 +1275,50 @@ fn the_stderr_capture_sees_writes_while_the_server_is_still_running() {
     });
     assert!(session.stderr_text().contains(marker));
 }
+
+#[test]
+fn remote_listing_uses_the_canonical_path_for_a_host_symlink_alias() {
+    let mut device = SimulatedDevice::new();
+    let aliases = TempDir::new().expect("host alias directory");
+    let alias = aliases.path().join("board-by-id");
+    std::os::unix::fs::symlink(&device.path, &alias).expect("host alias symlink");
+    let alias = alias.to_string_lossy().into_owned();
+    // The host terminal itself opens and checks the alias; the core returns
+    // the canonical serial-node path in discovery.
+    let host = SharedHost::start(std::slice::from_ref(&alias));
+    let peers = write_peers(&host.directory, vec![peer_entry(&host.info, &host.info.ai)]);
+    let mut session = spawn(&host.socket, &peers);
+    let listed = session.call_tool("list_devices", remote_args(&host, json!({})));
+    assert!(!listed.is_error, "{}", listed.text);
+    assert!(
+        listed.text.contains(&device.path),
+        "canonical path missing: {}",
+        listed.text
+    );
+    assert!(
+        !listed.text.contains(&alias),
+        "host alias should not replace canonical path: {}",
+        listed.text
+    );
+
+    // A user can pass the canonical path that discovery returned; remote
+    // tools must target that host node rather than assuming the input alias is
+    // the same string the core reports.
+    let connected = session.call_tool(
+        "connect",
+        remote_args(
+            &host,
+            json!({ "path": device.path, "request_control": true }),
+        ),
+    );
+    assert!(!connected.is_error, "{}", connected.text);
+    let sent = session.call_tool(
+        "send",
+        remote_args(
+            &host,
+            json!({ "device": connected.device_id(), "text": "CANONICAL", "lines": 0 }),
+        ),
+    );
+    assert!(!sent.is_error, "{}", sent.text);
+    assert_eq!(device.read_n(9, Duration::from_secs(5)), b"CANONICAL");
+}

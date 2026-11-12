@@ -84,6 +84,9 @@ file is created with mode `0600` in a mode `0700` directory. The test performs
 host open/share setup, remote MCP `list_devices`, `connect`, `send`, and `read`,
 checks the firmware echo, unchecks the device, verifies subsequent MCP read is
 revoked, and scans tool responses and captured MCP stderr for both credentials.
+The host uses the canonical path from the local open result for sharing and
+checks the canonical path reported by remote discovery; a `/dev/serial/by-id`
+input may therefore appear as `/dev/ttyACM*` remotely.
 It prints the bound endpoint and board path, never the pairing values.
 
 Set the serial, bind, baud, probe, and expected echo variables as above using

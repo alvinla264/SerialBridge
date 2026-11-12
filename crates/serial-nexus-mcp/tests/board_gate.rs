@@ -107,8 +107,15 @@ fn real_board_remote_mcp_stdio_gate() {
     let local = owner
         .open(&serial, Some(baud), false)
         .expect("locally open existing board firmware (no flashing)");
+    // The board may have been selected through /dev/serial/by-id or another
+    // symlink. The core reports its canonical node path; that is the stable
+    // path returned by remote discovery and accepted by remote tools.
+    let canonical = local.port.clone();
     let pairing = owner
-        .start_sharing(ShareBind::new(bind.ip(), bind.port()), vec![serial.clone()])
+        .start_sharing(
+            ShareBind::new(bind.ip(), bind.port()),
+            vec![canonical.clone()],
+        )
         .expect("opt in to sharing the checked board");
     let address = pairing.bind;
 
@@ -128,8 +135,8 @@ fn real_board_remote_mcp_stdio_gate() {
     let list = mcp.call_tool("list_devices", remote_args(address, json!({})));
     assert!(!list.is_error, "remote list failed: {}", list.text);
     assert!(
-        list.text.contains(&serial),
-        "shared board absent: {}",
+        list.text.contains(&canonical),
+        "canonical shared board path absent: {}",
         list.text
     );
     assert!(
@@ -142,7 +149,7 @@ fn real_board_remote_mcp_stdio_gate() {
         "connect",
         remote_args(
             address,
-            json!({ "path": serial.clone(), "request_control": true }),
+            json!({ "path": canonical.clone(), "request_control": true }),
         ),
     );
     assert!(
@@ -185,7 +192,7 @@ fn real_board_remote_mcp_stdio_gate() {
     // Revocation is tested over the same actual MCP stdio path. The remote
     // client may still have a cached transport, but can no longer use the node.
     owner
-        .uncheck_shared_devices(vec![serial.clone()])
+        .uncheck_shared_devices(vec![canonical.clone()])
         .expect("owner revokes checked device");
     let revoked = mcp.call_tool(
         "read",
@@ -214,5 +221,5 @@ fn real_board_remote_mcp_stdio_gate() {
     drop(mcp);
     drop(owner);
     drop(core_directory);
-    eprintln!("remote MCP board gate passed: endpoint={address}, board path={serial}, baud={baud}; pairing values were not printed");
+    eprintln!("remote MCP board gate passed: endpoint={address}, canonical board path={canonical}, baud={baud}; pairing values were not printed");
 }

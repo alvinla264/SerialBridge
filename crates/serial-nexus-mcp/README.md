@@ -277,6 +277,14 @@ live process's stderr) rather than only when the server exits.
 Two hosts that share the *same* device path are kept apart end to end: each
 core runs in a private mount namespace with its own PTY bound over one shared
 placeholder, and writes, read history and session state stay with the endpoint
-the call named. Where a machine forbids unprivileged user namespaces, that one
-test says so and skips; the endpoint-keyed bookkeeping unit test still runs. No
-physical hardware is used.
+the call named. A separate host-side symlink alias test checks that remote
+discovery returns the canonical path the MCP client can use. Where a machine
+forbids unprivileged user namespaces, the same-path test says so and skips; the
+endpoint-keyed bookkeeping unit test still runs. No physical hardware is used.
+
+The ignored, never-flashing real-board MCP stdio gate is in
+[`tests/board_gate.rs`](tests/board_gate.rs); exact-head instructions, isolated
+temporary credential/socket setup and safe echo-probe guidance are in
+[`docs/board-gate.md`](../../docs/board-gate.md). The gate uses the canonical
+path reported by the local open / remote discovery, since `/dev/serial/by-id`
+symlinks can appear remotely as `/dev/ttyACM*`.
