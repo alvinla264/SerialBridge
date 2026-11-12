@@ -83,10 +83,14 @@ type:
 - **Allowlist.** The checked list is an in-memory, session-scoped map of
   canonical device path to `DeviceIdentity`. A device may be checked when it is
   enumerated now or already open in the core; it does not need to stay open.
-- **Identity.** `DeviceIdentity` is the node's `(st_dev, st_ino, st_rdev)`
-  plus an `O_PATH` descriptor that pins the node, captured when checked. It is
-  revalidated on `Open`, `Read`, `Write`, `Status`, `Close` and on the open
-  itself: the serial descriptor's `fstat` and the canonical path must both
+- **Identity.** `DeviceIdentity` internally records the node's
+  `(st_dev, st_ino, st_rdev)` and link count plus an `O_PATH` descriptor that
+  pins the node, captured when checked. It also has a process-local opaque
+  generation token; that token, not the stat tuple, is the identity label
+  exchanged by discovery, snapshots and checklist requests. A new capture
+  gets a fresh token, so a recycled inode cannot inherit the old selection.
+  The node is revalidated on `Open`, `Read`, `Write`, `Status`, `Close` and on
+  the open itself: the serial descriptor's `fstat` and canonical path must
   still be that node, and the pinned node's link count must still equal the
   captured value (so an added hard link also expires it).
   A changed node or an unplug expires the entry: access stops at once and
