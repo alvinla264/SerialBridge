@@ -125,7 +125,8 @@ arguments or history, so the human configures one private file instead.
 - it must be a regular file owned by the current user with no group or world
   permission bits; a symlink, another owner or mode `644` is refused
   (`PeerError`), and no error message contains the credential;
-- one entry per endpoint; duplicate endpoints are refused as ambiguous;
+- one entry per endpoint; duplicate endpoints are refused as ambiguous, and a
+  file larger than 64 KiB is refused rather than read whole;
 - the entry's endpoint, the pairing's address and the pairing's TLS name must
   all be the same endpoint, and the certificate fingerprint must be 64
   lowercase hex characters.

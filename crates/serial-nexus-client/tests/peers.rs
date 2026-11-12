@@ -4,7 +4,7 @@
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 
-use serial_nexus_client::{PairingRole, Peers, RemoteEndpoint};
+use serial_nexus_client::{PairingRole, PeerError, Peers, RemoteEndpoint, MAX_PEERS_FILE_BYTES};
 use tempfile::TempDir;
 
 const CREDENTIAL: &str = "c2VjcmV0LWNyZWRlbnRpYWwtZm9yLXRlc3Rz";
@@ -221,4 +221,24 @@ fn role_is_matched_as_configured() {
         .find(&RemoteEndpoint::new("127.0.0.1".parse().unwrap(), 7443))
         .unwrap();
     assert_eq!(peer.secret.role, PairingRole::Human);
+}
+
+#[test]
+fn a_pairing_file_too_large_to_be_sane_is_refused() {
+    let directory = TempDir::new().expect("tempdir");
+    let mut text = r#"{"version":1,"peers":[]}"#.to_string();
+    text.push_str(&" ".repeat(MAX_PEERS_FILE_BYTES));
+    let path = write_file(&directory, &text, 0o600);
+    let error = Peers::load(&path).expect_err("oversized file");
+    assert!(error.to_string().contains("larger than"), "{error}");
+}
+
+#[test]
+fn a_symbolic_link_says_it_is_not_a_regular_file() {
+    let directory = TempDir::new().expect("tempdir");
+    let real = write_file(&directory, &peer_json("127.0.0.1", 7443, "ai"), 0o600);
+    let link = directory.path().join("link.json");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+    let error = Peers::load(&link).expect_err("symlink");
+    assert!(matches!(error, PeerError::NotRegular { .. }), "{error}");
 }

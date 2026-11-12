@@ -145,7 +145,7 @@ $EDITOR ~/.config/serial-nexus/mcp-peers.json
 ```
 
 - One entry per endpoint; two entries for the same address and port are
-  refused as ambiguous. IPv4 and IPv6 are both accepted
+  refused as ambiguous, and a file larger than 64 KiB is refused. IPv4 and IPv6 are both accepted
   (`"address": "::1"`, `"address": "fd00::20"`).
 - Use the **AI** credential (`"role": "ai"`) for this server. A human
   credential is refused: the role is enforced by the host, not chosen here.

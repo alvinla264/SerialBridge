@@ -45,6 +45,10 @@ pub const PEERS_ENV: &str = "SERIAL_NEXUS_MCP_PEERS";
 /// Only version understood by this build.
 pub const PEERS_VERSION: u32 = 1;
 
+/// Most a pairing file may be. It holds a few hundred bytes per endpoint, so
+/// this is generous; the bound keeps a huge file from being read into memory.
+pub const MAX_PEERS_FILE_BYTES: usize = 64 * 1024;
+
 /// Why a pairing file could not be used. No variant carries a credential.
 #[derive(Debug, thiserror::Error)]
 pub enum PeerError {
@@ -220,11 +224,19 @@ impl Peers {
         {
             use std::io::Read;
             let mut file = file;
-            file.read_to_string(&mut text)
+            file.by_ref()
+                .take(MAX_PEERS_FILE_BYTES as u64 + 1)
+                .read_to_string(&mut text)
                 .map_err(|source| PeerError::Io {
                     path: path.clone(),
                     source,
                 })?;
+        }
+        if text.len() > MAX_PEERS_FILE_BYTES {
+            return Err(PeerError::Format {
+                path,
+                reason: format!("the file is larger than {MAX_PEERS_FILE_BYTES} bytes"),
+            });
         }
         // Serde's own message can quote the offending input, and a misconfigured
         // file may hold a credential in the wrong field. Report only where the
@@ -317,6 +329,11 @@ fn open_private(path: &Path) -> Result<File, PeerError> {
         Ok(file) => Ok(file),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Err(PeerError::Missing { path: path.into() })
+        }
+        // O_NOFOLLOW reports a symbolic link as ELOOP; say what that means
+        // instead of passing the raw errno along.
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            Err(PeerError::NotRegular { path: path.into() })
         }
         Err(error) => Err(PeerError::Io {
             path: path.into(),
