@@ -541,6 +541,20 @@ impl Default for AppState {
 }
 
 impl AppState {
+    /// A failed settings save whose checklist rollback also failed must stop
+    /// sharing, restore the effective selection, and retain the attempted
+    /// checklist as an editable draft.
+    pub fn stop_after_failed_settings_compensation(
+        &mut self,
+        original_pending: Checklist,
+        attempted_draft: Checklist,
+    ) {
+        self.sharing.clear_session();
+        self.sharing.pending_checked = original_pending;
+        self.draft_checked = attempted_draft;
+        self.close_pairing_view();
+    }
+
     pub fn new(rows: usize, cols: usize) -> Self {
         Self {
             devices: Vec::new(),
@@ -1932,6 +1946,24 @@ mod sharing_tests {
             remote_clients: 0,
             pending_connections: 0,
         }
+    }
+
+    #[test]
+    fn failed_save_stop_restores_effective_checks_but_keeps_attempted_checklist_draft() {
+        let mut state = state_with_devices();
+        let original: Checklist = ["/dev/ttyUSB0".to_string()].into_iter().collect();
+        let attempted: Checklist = ["/dev/ttyUSB1".to_string()].into_iter().collect();
+        state.sharing.active = true;
+        state.sharing.pending_checked = original.clone();
+        state.draft_checked = attempted.clone();
+        state.view = View::Settings;
+
+        state.stop_after_failed_settings_compensation(original.clone(), attempted.clone());
+
+        assert!(!state.sharing.active);
+        assert!(state.sharing.pending_checked.contains("/dev/ttyUSB0"));
+        assert_eq!(state.draft_checked, attempted);
+        assert!(state.has_unsaved_settings());
     }
 
     #[test]

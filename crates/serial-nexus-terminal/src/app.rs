@@ -870,11 +870,10 @@ impl App {
                         // applied authorization set.
                         match self.client.stop_sharing() {
                             Ok(()) => {
-                                self.state.sharing.clear_session();
-                                self.state.sharing.pending_checked =
-                                    original_pending_checked.clone();
-                                self.state.draft_checked = original_pending_checked.clone();
-                                self.state.close_pairing_view();
+                                self.state.stop_after_failed_settings_compensation(
+                                    original_pending_checked.clone(),
+                                    original_draft_checked.clone(),
+                                );
                                 self.state.notice = Some(Notice::error(format!(
                                     "settings not saved: {error}; checklist rollback failed and sharing was stopped: {rollback_error}"
                                 )));
