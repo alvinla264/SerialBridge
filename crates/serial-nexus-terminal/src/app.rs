@@ -743,19 +743,10 @@ impl App {
         let active = self.state.sharing.active;
         let desired: Vec<String> = draft_checked.iter().cloned().collect();
 
-        // Every checked device needs the identity the owner selected. Without
-        // one the core would fall back to the current node at that path, which
-        // could be a replacement; refuse instead of authorizing it.
+        // drop_replaced_checks reconciles every checked path against current
+        // detection, so this map contains identities captured for surviving
+        // paths only.
         let expected = self.state.draft_checked.identities();
-        if active && expected.len() != desired.len() {
-            self.state
-                .draft_checked
-                .retain(|path| expected.contains_key(path));
-            self.state.notice = Some(Notice::error(
-                "settings not saved: a checked device has no captured identity; refresh and check it again",
-            ));
-            return;
-        }
 
         // Stage the preferences but do not publish them until the core has
         // accepted the checklist. A failed core step leaves the live file

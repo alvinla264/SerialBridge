@@ -694,23 +694,23 @@ impl AppState {
         }
     }
 
+    fn selected_settings_text_mut(&mut self) -> Option<(&mut String, usize)> {
+        match self.settings_kind(self.settings_row)? {
+            SettingsRow::ShareAddress => Some((&mut self.draft.share_address, 64)),
+            SettingsRow::SharePort => Some((&mut self.port_text, 5)),
+            _ => None,
+        }
+    }
+
     /// Start typing into the selected address or port row.
     pub fn begin_settings_edit(&mut self) -> bool {
-        match self.settings_kind(self.settings_row) {
-            Some(SettingsRow::ShareAddress) => {
-                // A text field starts empty, so a value is typed rather than
-                // appended to whatever was there.
-                self.draft.share_address.clear();
-                self.settings_editing = true;
-                true
-            }
-            Some(SettingsRow::SharePort) => {
-                self.port_text.clear();
-                self.settings_editing = true;
-                true
-            }
-            _ => false,
-        }
+        let Some((text, _)) = self.selected_settings_text_mut() else {
+            return false;
+        };
+        // A text field starts empty, so a value is typed rather than appended.
+        text.clear();
+        self.settings_editing = true;
+        true
     }
 
     /// Add one typed character to the selected text row.
@@ -718,29 +718,18 @@ impl AppState {
         if !self.settings_editing || !ch.is_ascii_graphic() {
             return;
         }
-        match self.settings_kind(self.settings_row) {
-            Some(SettingsRow::ShareAddress) if self.draft.share_address.len() < 64 => {
-                self.draft.share_address.push(ch);
+        if let Some((text, limit)) = self.selected_settings_text_mut() {
+            if text.len() < limit {
+                text.push(ch);
             }
-            Some(SettingsRow::SharePort) if self.port_text.len() < 5 => {
-                self.port_text.push(ch);
-            }
-            _ => {}
         }
     }
 
     pub fn settings_edit_backspace(&mut self) {
-        if !self.settings_editing {
-            return;
-        }
-        match self.settings_kind(self.settings_row) {
-            Some(SettingsRow::ShareAddress) => {
-                self.draft.share_address.pop();
+        if self.settings_editing {
+            if let Some((text, _)) = self.selected_settings_text_mut() {
+                text.pop();
             }
-            Some(SettingsRow::SharePort) => {
-                self.port_text.pop();
-            }
-            _ => {}
         }
     }
 

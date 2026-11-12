@@ -932,12 +932,22 @@ fn draw_connect(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u1
         put(buffer, area, 1, "Press c or use the Connect button.", dim());
         return Some((area.x + 1, area.y));
     };
-    let mut cursor = (area.x, area.y);
-    let title_style = focus_title_style(state.focus == Focus::Right);
-    put(buffer, area, 0, " Connect to a remote host ", title_style);
-    let error_rows = usize::from(form.error.is_some());
     let available = area.height as usize;
-    let visible = available.saturating_sub(1 + error_rows).max(1);
+    if available == 0 || area.width == 0 {
+        return None;
+    }
+    let show_error = form.error.is_some() && available >= 2;
+    // Keep the active field visible at every size. The title yields first,
+    // then the error row; at least one row is reserved for editable content.
+    let show_title = available >= 2 + usize::from(show_error);
+    let title_rows = usize::from(show_title);
+    if show_title {
+        let title_style = focus_title_style(state.focus == Focus::Right);
+        put(buffer, area, 0, " Connect to a remote host ", title_style);
+    }
+    let error_rows = usize::from(show_error);
+    let visible = available.saturating_sub(title_rows + error_rows).max(1);
+    let mut cursor = None;
     let selected_index = ConnectField::ALL
         .iter()
         .position(|field| *field == form.field)
@@ -951,7 +961,7 @@ fn draw_connect(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u1
         .skip(first)
         .take(visible)
     {
-        let offset = index - first + 1;
+        let offset = index - first + title_rows;
         let selected = *field == form.field;
         let value = form.value(*field);
         let label = field.name();
@@ -987,24 +997,26 @@ fn draw_connect(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u1
         put(buffer, line, 0, &text, highlighted(selected));
         if selected {
             let column = display_width(&text).min(width as u16).saturating_sub(1);
-            cursor = (area.x + column, line.y);
+            cursor = Some((area.x + column, line.y));
         }
     }
-    if let Some(error) = &form.error {
-        put(
-            buffer,
-            Rect::new(
-                area.x,
-                area.y + area.height.saturating_sub(1),
-                area.width,
-                1,
-            ),
-            0,
-            &format!(" {error} "),
-            RStyle::default().fg(RColor::White).bg(RColor::Red),
-        );
+    if show_error {
+        if let Some(error) = &form.error {
+            put(
+                buffer,
+                Rect::new(
+                    area.x,
+                    area.y + area.height.saturating_sub(1),
+                    area.width,
+                    1,
+                ),
+                0,
+                &format!(" {error} "),
+                RStyle::default().fg(RColor::White).bg(RColor::Red),
+            );
+        }
     }
-    Some(cursor)
+    cursor
 }
 
 fn draw_stream(state: &AppState, buffer: &mut Buffer, area: Rect) -> Option<(u16, u16)> {
@@ -1364,7 +1376,7 @@ fn to_ratatui(colour: Color) -> RColor {
 mod tests {
     use super::*;
     use crate::state::SessionKey;
-    use crate::state::{AppState, DeviceEntry, EndpointId, Focus, View};
+    use crate::state::{AppState, ConnectForm, DeviceEntry, EndpointId, Focus, View};
     use serial_nexus_protocol::Event;
 
     fn screen(state: &AppState, width: u16, height: u16) -> Vec<String> {
@@ -1538,6 +1550,36 @@ mod tests {
             !cell.modifier.contains(Modifier::REVERSED),
             "reverse is removed so the cursor is not invisible: {cell:?}"
         );
+    }
+
+    #[test]
+    fn compact_connect_layout_keeps_the_selected_field_visible() {
+        let mut state = demo();
+        let mut form = ConnectForm::new();
+        form.address = "fe80::1%3".into();
+        state.connect = Some(form);
+        state.view = View::Connect;
+        state.focus = Focus::Right;
+
+        let text = screen(&state, 80, 3).join("\\n");
+        assert!(text.contains("Host address"), "{text}");
+        assert!(text.contains("fe80::1%3"), "{text}");
+    }
+
+    #[test]
+    fn compact_connect_error_does_not_overwrite_the_selected_field() {
+        let mut state = demo();
+        let mut form = ConnectForm::new();
+        form.address = "host.invalid".into();
+        form.error = Some("the host could not be reached".into());
+        state.connect = Some(form);
+        state.view = View::Connect;
+        state.focus = Focus::Right;
+
+        let text = screen(&state, 80, 4).join("\\n");
+        assert!(text.contains("Host address"), "{text}");
+        assert!(text.contains("host.invalid"), "{text}");
+        assert!(text.contains("could not be reached"), "{text}");
     }
 
     #[test]
