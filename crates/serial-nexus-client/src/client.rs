@@ -6,12 +6,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
 use serial_nexus_protocol::{
-    encode_bytes, paths, ClientInfo, DeviceRef, DeviceStatus, DevicesResult, Event, HelloParams,
-    HelloResult, Limits, OpenParams, OpenResult, ReadParams, ReadResult, Request, RequestMessage,
-    ResponseData, ServerMessage, ShareBind, ShareCommitParams, ShareDevicesParams,
-    ShareSessionInfo, ShareStartParams, SharingSnapshot, WaitSpec, WriteParams, WriteResult,
+    encode_bytes, paths, ClientInfo, DeviceRef, DeviceStatus, DevicesResult, Event, GatewayConnect,
+    GatewayHandshake, GatewayTarget, HelloParams, HelloResult, Limits, OpenParams, OpenResult,
+    ReadParams, ReadResult, Request, RequestMessage, ResponseData, ServerMessage, ShareBind,
+    ShareCommitParams, ShareDevicesParams, ShareSessionInfo, ShareStartParams, SharingSnapshot,
+    WaitSpec, WriteParams, WriteResult, GATEWAY_PROTOCOL_VERSION, MAX_GATEWAY_MESSAGE_BYTES,
     MAX_MESSAGE_BYTES, PROTOCOL_VERSION,
 };
 
@@ -26,6 +27,14 @@ const DEFAULT_LIMITS: Limits = Limits {
     control_idle_ms: 300_000,
     history_max_lines: 2000,
 };
+
+fn ensure_local_peer_uid(actual: u32, expected: u32) -> Result<(), ClientError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(ClientError::LocalPeerRejected { actual, expected })
+    }
+}
 
 /// How to reach, identify with, and (if needed) start the core.
 #[derive(Clone, Debug)]
@@ -70,7 +79,12 @@ pub struct Client {
     inner: Arc<Inner>,
 }
 
-type PendingMap = Arc<Mutex<HashMap<u64, Sender<Result<ResponseData, ClientError>>>>>;
+type PendingMap = Arc<Mutex<HashMap<u64, Pending>>>;
+
+struct Pending {
+    sender: Sender<Result<ResponseData, ClientError>>,
+    is_write: bool,
+}
 
 struct Inner {
     writer: Mutex<UnixStream>,
@@ -107,6 +121,72 @@ impl Client {
         Self::from_stream(stream, config)
     }
 
+    /// Connect through the running local terminal gateway without starting
+    /// the core or making a remote connection outside that gateway.
+    pub fn connect_to_gateway(
+        socket: impl Into<PathBuf>,
+        target: GatewayTarget,
+        client: ClientInfo,
+    ) -> Result<Self, ClientError> {
+        Self::connect_to_gateway_with_pairing(socket, target, None, client)
+    }
+
+    /// Gateway connection with an optional owner-only pairing-file path. The
+    /// path crosses the local IPC; pairing credentials are read only by the
+    /// gateway and never sent by the MCP process.
+    pub fn connect_to_gateway_with_pairing(
+        socket: impl Into<PathBuf>,
+        target: GatewayTarget,
+        pairing_file: Option<PathBuf>,
+        client: ClientInfo,
+    ) -> Result<Self, ClientError> {
+        let socket = socket.into();
+        let mut stream = UnixStream::connect(&socket)?;
+        let peer =
+            nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::PeerCredentials)
+                .map_err(|error| ClientError::LocalPeerVerification(error.to_string()))?;
+        ensure_local_peer_uid(peer.uid(), paths::effective_uid())?;
+        let line = serial_nexus_protocol::encode_line(&GatewayConnect {
+            protocol: GATEWAY_PROTOCOL_VERSION,
+            target,
+            pairing_file,
+        })?;
+        if line.len() > MAX_GATEWAY_MESSAGE_BYTES {
+            return Err(ClientError::Protocol(
+                serial_nexus_protocol::ProtocolError::TooLarge {
+                    size: line.len(),
+                    max: MAX_GATEWAY_MESSAGE_BYTES,
+                },
+            ));
+        }
+        stream.write_all(&line)?;
+        let mut handshake_reader = BufReader::new(stream.try_clone()?);
+        let handshake_line =
+            serial_nexus_protocol::read_line(&mut handshake_reader, MAX_GATEWAY_MESSAGE_BYTES)?
+                .ok_or_else(|| {
+                    ClientError::GatewayHandshake(
+                        "gateway closed before acknowledging the protocol".into(),
+                    )
+                })?;
+        let handshake: GatewayHandshake = serial_nexus_protocol::decode_line(&handshake_line)
+            .map_err(|error| {
+                ClientError::GatewayHandshake(format!("invalid gateway acknowledgement: {error}"))
+            })?;
+        if handshake.protocol != GATEWAY_PROTOCOL_VERSION {
+            return Err(ClientError::GatewayHandshake(format!(
+                "gateway speaks protocol {}, this client speaks {}",
+                handshake.protocol, GATEWAY_PROTOCOL_VERSION
+            )));
+        }
+        if let Some(error) = handshake.error {
+            return Err(ClientError::GatewayHandshake(error));
+        }
+        let mut config = ClientConfig::new(client);
+        config.socket = socket;
+        config.auto_start = false;
+        Self::from_stream(stream, config)
+    }
+
     /// Connect to an already-running core without auto-start. Intended for
     /// tests, embedding, and wrappers that manage the core themselves.
     pub fn connect_to_socket(
@@ -122,6 +202,10 @@ impl Client {
     }
 
     fn from_stream(stream: UnixStream, config: ClientConfig) -> Result<Self, ClientError> {
+        let peer =
+            nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::PeerCredentials)
+                .map_err(|error| ClientError::LocalPeerVerification(error.to_string()))?;
+        ensure_local_peer_uid(peer.uid(), paths::effective_uid())?;
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let subscribers: Arc<Mutex<Vec<Sender<Event>>>> = Arc::new(Mutex::new(Vec::new()));
         let connected = Arc::new(AtomicBool::new(true));
@@ -443,6 +527,18 @@ impl Client {
         rx
     }
 
+    /// Subscribe with bounded memory. Events are dropped for this receiver
+    /// when its queue is full; the core connection itself is not blocked.
+    pub fn subscribe_bounded(&self, capacity: usize) -> Receiver<Event> {
+        let (tx, rx) = bounded(capacity.max(1));
+        self.inner
+            .subscribers
+            .lock()
+            .expect("subscribers lock")
+            .push(tx);
+        rx
+    }
+
     fn limits(&self) -> Limits {
         self.inner.hello.lock().expect("hello lock").limits.clone()
     }
@@ -459,32 +555,51 @@ impl Client {
             return Err(ClientError::Disconnected("not connected".into()));
         }
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = bounded(1);
-        self.inner
-            .pending
-            .lock()
-            .expect("pending lock")
-            .insert(id, tx);
+        let is_write = matches!(&request, Request::Write(_));
         let line = serial_nexus_protocol::encode_line(&RequestMessage { id, request })?;
+        let (tx, rx) = bounded(1);
+        self.inner.pending.lock().expect("pending lock").insert(
+            id,
+            Pending {
+                sender: tx,
+                is_write,
+            },
+        );
         {
             let mut writer = self.inner.writer.lock().expect("writer lock");
             if let Err(error) = writer.write_all(&line).and_then(|_| writer.flush()) {
                 self.inner.pending.lock().expect("pending lock").remove(&id);
                 self.inner.connected.store(false, Ordering::SeqCst);
-                return Err(error.into());
+                return Err(if is_write {
+                    ClientError::WriteUncertain(format!(
+                        "write transport failed after submission; bytes may have reached the device: {error}"
+                    ))
+                } else {
+                    error.into()
+                });
             }
         }
         match rx.recv_timeout(timeout) {
             Ok(result) => result,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 self.inner.pending.lock().expect("pending lock").remove(&id);
-                Err(ClientError::Timeout(format!(
-                    "no answer within {timeout:?} (request id {id})"
-                )))
+                let reason = format!("no answer within {timeout:?} (request id {id})");
+                Err(if is_write {
+                    ClientError::WriteUncertain(format!(
+                        "{reason}; bytes may have reached the device"
+                    ))
+                } else {
+                    ClientError::Timeout(reason)
+                })
             }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                Err(ClientError::Disconnected("connection closed".into()))
-            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(if is_write {
+                ClientError::WriteUncertain(
+                    "connection closed before the write answer; bytes may have reached the device"
+                        .into(),
+                )
+            } else {
+                ClientError::Disconnected("connection closed".into())
+            }),
         }
     }
 }
@@ -560,21 +675,16 @@ fn read_loop(
         };
         match message {
             ServerMessage::Response { id, result } => {
-                if let Some(tx) = pending.lock().expect("pending lock").remove(&id) {
-                    let _ = tx.send(Ok(result));
+                if let Some(pending) = pending.lock().expect("pending lock").remove(&id) {
+                    let _ = pending.sender.send(Ok(result));
                 }
             }
             ServerMessage::Error { id, error } => {
-                if let Some(tx) = pending.lock().expect("pending lock").remove(&id) {
-                    let _ = tx.send(Err(ClientError::from(error)));
+                if let Some(pending) = pending.lock().expect("pending lock").remove(&id) {
+                    let _ = pending.sender.send(Err(ClientError::from(error)));
                 }
             }
-            ServerMessage::Event { event } => {
-                subscribers
-                    .lock()
-                    .expect("subscribers lock")
-                    .retain(|tx| tx.send(event.clone()).is_ok());
-            }
+            ServerMessage::Event { event } => broadcast_event(&subscribers, event),
         }
     }
 }
@@ -586,14 +696,45 @@ fn fail(
     reason: &str,
 ) {
     connected.store(false, Ordering::SeqCst);
-    for (_, tx) in pending.lock().expect("pending lock").drain() {
-        let _ = tx.send(Err(ClientError::Disconnected(reason.to_string())));
+    for (_, request) in pending.lock().expect("pending lock").drain() {
+        let error = if request.is_write {
+            ClientError::WriteUncertain(format!(
+                "gateway disconnected before the write answer; bytes may have reached the device: {reason}"
+            ))
+        } else {
+            ClientError::Disconnected(reason.to_string())
+        };
+        let _ = request.sender.send(Err(error));
     }
     let event = Event::TransportClosed {
         reason: reason.to_string(),
     };
+    broadcast_event(subscribers, event);
+}
+
+fn broadcast_event(subscribers: &Arc<Mutex<Vec<Sender<Event>>>>, event: Event) {
     subscribers
         .lock()
         .expect("subscribers lock")
-        .retain(|tx| tx.send(event.clone()).is_ok());
+        .retain(|tx| match tx.try_send(event.clone()) {
+            Ok(()) | Err(TrySendError::Full(_)) => true,
+            Err(TrySendError::Disconnected(_)) => false,
+        });
+}
+
+#[cfg(test)]
+mod local_socket_peer_tests {
+    use super::{ensure_local_peer_uid, ClientError};
+
+    #[test]
+    fn local_socket_peer_must_have_the_current_uid() {
+        assert!(matches!(
+            ensure_local_peer_uid(2000, 1000),
+            Err(ClientError::LocalPeerRejected {
+                actual: 2000,
+                expected: 1000
+            })
+        ));
+        assert!(ensure_local_peer_uid(1000, 1000).is_ok());
+    }
 }

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use serial_nexus_client::{Client, ClientInfo};
-use support::{start_core, wait_until, McpSession, SimulatedDevice, ToolReply};
+use support::{start_core, McpSession, SimulatedDevice, ToolReply};
 
 fn connect_with_control(mcp: &mut McpSession, port: &str) -> ToolReply {
     let reply = mcp.call_tool("connect", json!({"port": port, "request_control": true}));
@@ -30,6 +30,50 @@ fn read_until(mcp: &mut McpSession, device_id: u64, needle: &str) -> ToolReply {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn local_tool_without_gateway_does_not_autostart_core() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("core.sock");
+    let marker = directory.path().join("core-started");
+    let fake_core = directory.path().join("fake-core");
+    std::fs::write(
+        &fake_core,
+        format!("#!/bin/sh\ntouch '{}'\nsleep 5\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_core, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let fake_core = fake_core.to_string_lossy().into_owned();
+    let mut mcp =
+        McpSession::spawn_without_gateway_with_env(&socket, &[("SERIAL_NEXUS_CORE", &fake_core)]);
+
+    let result = mcp.call_tool("list_devices", json!({}));
+    assert!(result.is_error, "{}", result.text);
+    assert!(result.text.contains("gateway"), "{}", result.text);
+    assert!(
+        !marker.exists(),
+        "MCP must not start the configured core binary"
+    );
+    assert!(!socket.exists(), "MCP must not create the core socket");
+}
+
+#[test]
+fn local_tool_requires_terminal_gateway_even_when_core_is_running() {
+    let (_directory, socket) = start_core(Duration::from_secs(30));
+    let mut mcp = McpSession::spawn_without_gateway(&socket);
+
+    let result = mcp.call_tool("list_devices", json!({}));
+    assert!(
+        result.is_error,
+        "local calls without the terminal must fail"
+    );
+    assert!(
+        result.text.contains("gateway"),
+        "unexpected local failure: {}",
+        result.text
+    );
 }
 
 #[test]
@@ -61,6 +105,22 @@ fn stdio_handshake_and_tools_list() {
             tool["inputSchema"]["type"], "object",
             "tool schema not an object: {tool}"
         );
+        let mut properties: Vec<&str> = tool["inputSchema"]["properties"]
+            .as_object()
+            .expect("schema properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        properties.sort_unstable();
+        let expected: &[&str] = match tool["name"].as_str().unwrap() {
+            "list_devices" => &["ip", "port"],
+            "connect" => &["baud", "ip", "path", "port", "request_control"],
+            "disconnect" => &["device", "ip", "port"],
+            "read" => &["device", "ip", "lines", "port"],
+            "send" => &["device", "ip", "lines", "port", "text", "timeout_ms"],
+            name => panic!("unexpected tool {name}"),
+        };
+        assert_eq!(properties, expected, "tool schema changed: {tool}");
     }
 }
 
@@ -555,9 +615,9 @@ fn device_errors_are_reported_not_hidden() {
 }
 
 #[test]
-fn auto_starts_the_core_when_nothing_answers() {
+fn mcp_never_autostarts_a_configured_core_without_the_terminal_gateway() {
     let directory = tempfile::TempDir::new().expect("tempdir");
-    let socket = directory.path().join("auto.sock");
+    let socket = directory.path().join("no-gateway-core.sock");
     let core = std::path::Path::new(env!("CARGO_BIN_EXE_serial-nexus-mcp"))
         .parent()
         .expect("target dir")
@@ -566,17 +626,14 @@ fn auto_starts_the_core_when_nothing_answers() {
         core.is_file(),
         "serial-nexus-core binary missing at {core:?}"
     );
-    let mut mcp = McpSession::spawn_with_env(
+    let mut mcp = McpSession::spawn_without_gateway_with_env(
         &socket,
-        &[
-            ("SERIAL_NEXUS_CORE", core.to_str().expect("utf8 path")),
-            ("SERIAL_NEXUS_GRACE_SECS", "1"),
-        ],
+        &[("SERIAL_NEXUS_CORE", core.to_str().expect("utf8 path"))],
     );
     let listing = mcp.call_tool("list_devices", json!({}));
-    assert!(!listing.is_error, "auto-start failed: {}", listing.text);
-    assert!(listing.json()["devices"].is_array());
-    wait_until(Duration::from_secs(5), || socket.exists());
+    assert!(listing.is_error, "{}", listing.text);
+    assert!(listing.text.contains("gateway"), "{}", listing.text);
+    assert!(!socket.exists(), "MCP must not launch the configured core");
 }
 
 #[test]

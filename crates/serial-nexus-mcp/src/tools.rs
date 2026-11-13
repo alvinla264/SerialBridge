@@ -13,21 +13,17 @@
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::{json, Value};
 use serial_nexus_client::{
-    Client, ClientConfig, ClientError, ClientInfo, ErrorCode, HistoryLine, Limits, OpenResult,
-    PairingRole, Peers, ReadResult, RemoteClient, RemoteEndpoint, Role, Source, WaitSpec,
-    WriteResult,
+    paths, Client, ClientError, ClientInfo, ErrorCode, HistoryLine, RemoteEndpoint, Role, Source,
+    WaitSpec,
 };
-use serial_nexus_protocol::DevicesResult;
+use serial_nexus_protocol::GatewayTarget;
 
 /// Client name this server introduces itself with.
 pub const CLIENT_NAME: &str = "serial-nexus-mcp";
-
-/// How long one remote connection attempt may take.
-const REMOTE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A failed tool call, split by whether the caller's arguments were wrong.
 #[derive(Debug)]
@@ -117,73 +113,6 @@ impl Target {
     }
 }
 
-/// One connected core: local Unix socket or paired remote host.
-enum Link {
-    Local(Client),
-    Remote(RemoteClient),
-}
-
-impl Link {
-    fn list_devices(&self) -> Result<DevicesResult, ClientError> {
-        match self {
-            Self::Local(client) => client.list_devices(),
-            Self::Remote(client) => client.list_devices(),
-        }
-    }
-
-    fn open(
-        &self,
-        port: String,
-        baud: Option<u32>,
-        request_control: bool,
-    ) -> Result<OpenResult, ClientError> {
-        match self {
-            Self::Local(client) => client.open(port, baud, request_control),
-            Self::Remote(client) => client.open(port, baud, request_control),
-        }
-    }
-
-    fn close(&self, device_id: u64) -> Result<(), ClientError> {
-        match self {
-            Self::Local(client) => client.close(device_id),
-            Self::Remote(client) => client.close(device_id),
-        }
-    }
-
-    fn read(&self, device_id: u64, lines: Option<usize>) -> Result<ReadResult, ClientError> {
-        match self {
-            Self::Local(client) => client.read(device_id, lines),
-            Self::Remote(client) => client.read(device_id, lines),
-        }
-    }
-
-    fn write_bytes(
-        &self,
-        device_id: u64,
-        data: &[u8],
-        wait: Option<WaitSpec>,
-    ) -> Result<WriteResult, ClientError> {
-        match self {
-            Self::Local(client) => client.write_bytes(device_id, data, wait),
-            Self::Remote(client) => client.write_bytes(device_id, data, wait),
-        }
-    }
-
-    fn status(&self, device_id: u64) -> Result<serial_nexus_client::DeviceStatus, ClientError> {
-        match self {
-            Self::Local(client) => client.status(device_id),
-            Self::Remote(client) => client.status(device_id),
-        }
-    }
-
-    fn limits(&self) -> Limits {
-        match self {
-            Self::Local(client) => client.hello().limits,
-            Self::Remote(client) => client.limits().clone(),
-        }
-    }
-}
-
 struct Connection {
     port: String,
     baud: u32,
@@ -191,12 +120,12 @@ struct Connection {
 
 type ConnectionKey = (Target, u64);
 
-/// One MCP server run: lazily started core connections (one per endpoint) plus
-/// the devices this session has connected to, kept apart per endpoint so two
+/// One MCP server run: lazy terminal-gateway connections (one per endpoint)
+/// plus the devices this session has connected to, kept apart per endpoint so two
 /// hosts sharing the same device path never share ids, control or history.
 pub struct Session {
     local: Mutex<Option<Client>>,
-    remote: Mutex<BTreeMap<RemoteEndpoint, RemoteClient>>,
+    remote: Mutex<BTreeMap<RemoteEndpoint, Client>>,
     connections: Mutex<BTreeMap<ConnectionKey, Connection>>,
 }
 
@@ -215,8 +144,8 @@ impl Session {
         }
     }
 
-    /// The local core connection, starting the core on the first call and
-    /// replacing a connection that has since closed.
+    /// The local terminal-gateway connection. It never starts the core; local
+    /// MCP operations require the supported terminal to be running.
     fn local_client(&self) -> Result<Client, Failure> {
         let mut guard = self.local.lock().expect("client lock");
         if let Some(client) = guard.as_ref() {
@@ -224,8 +153,16 @@ impl Session {
                 return Ok(client.clone());
             }
         }
-        let client = Client::connect(ClientConfig::new(ClientInfo::ai(CLIENT_NAME)))
-            .map_err(|error| Target::Local.failure(&error, None))?;
+        let client = Client::connect_to_gateway(
+            paths::default_gateway_socket_path(),
+            GatewayTarget::Local,
+            ClientInfo::ai(CLIENT_NAME),
+        )
+        .map_err(|error| {
+            Failure::Tool(format!(
+                "terminal gateway unavailable for local MCP access; start serial-nexus-terminal and retry: {error}"
+            ))
+        })?;
         *guard = Some(client.clone());
         Ok(client)
     }
@@ -233,7 +170,7 @@ impl Session {
     /// The remote connection for one endpoint, pairing again from the private
     /// file when the previous connection closed. A failure here never becomes a
     /// local call.
-    fn remote_client(&self, endpoint: RemoteEndpoint) -> Result<RemoteClient, Failure> {
+    fn remote_client(&self, endpoint: RemoteEndpoint) -> Result<Client, Failure> {
         let mut guard = self.remote.lock().expect("remote lock");
         if let Some(client) = guard.get(&endpoint) {
             if client.is_connected() {
@@ -241,32 +178,30 @@ impl Session {
             }
         }
         guard.remove(&endpoint);
-        let peers = Peers::load_default().map_err(|error| Failure::Tool(error.to_string()))?;
-        let peer = peers
-            .find(&endpoint)
-            .map_err(|error| Failure::Tool(error.to_string()))?;
-        if peer.secret.role != PairingRole::Ai {
-            return Err(Failure::Tool(format!(
-                "the credential for {endpoint} is a {:?} credential; the MCP host needs the AI credential (role \"ai\")",
-                peer.secret.role
-            )));
-        }
-        let client = RemoteClient::connect_to(
-            endpoint,
-            &peer.paired,
-            &peer.secret,
-            Some(CLIENT_NAME.to_string()),
-            REMOTE_TIMEOUT,
+        let pairing_file = serial_nexus_client::Peers::default_path().ok();
+        let client = Client::connect_to_gateway_with_pairing(
+            paths::default_gateway_socket_path(),
+            GatewayTarget::Remote {
+                address: endpoint.address,
+                port: endpoint.port,
+                scope_id: endpoint.scope_id,
+            },
+            pairing_file,
+            ClientInfo::ai(CLIENT_NAME),
         )
-        .map_err(|error| Target::Remote(endpoint).failure(&error, None))?;
+        .map_err(|error| {
+            Failure::Tool(format!(
+                "terminal gateway could not connect to remote {endpoint}; start serial-nexus-terminal and verify the pairing: {error}"
+            ))
+        })?;
         guard.insert(endpoint, client.clone());
         Ok(client)
     }
 
-    fn link(&self, target: Target) -> Result<Link, Failure> {
+    fn link(&self, target: Target) -> Result<Client, Failure> {
         match target {
-            Target::Local => Ok(Link::Local(self.local_client()?)),
-            Target::Remote(endpoint) => Ok(Link::Remote(self.remote_client(endpoint)?)),
+            Target::Local => self.local_client(),
+            Target::Remote(endpoint) => self.remote_client(endpoint),
         }
     }
 
@@ -655,7 +590,7 @@ impl Session {
         let device_id = self.resolve_device(target, &device)?;
         let requested_lines = optional_u64(arguments, "lines")?.unwrap_or(1);
         let client = self.link(target)?;
-        let limits = client.limits();
+        let limits = client.hello().limits;
         // The core caps its wait target silently; do it here so the reply can
         // say what it actually waited for.
         let lines = requested_lines.min(limits.read_max_lines as u64);

@@ -7,8 +7,10 @@ these words in their tool names and user-facing text.
   serial devices and serves clients over a Unix socket. It starts automatically
   when the first client connects and exits after a grace period with no
   clients.
-- **Client**: anything connected to the core. An **AI client** is the MCP
-  server; a **human client** is the terminal.
+- **Client**: anything connected to the core. An **AI client** is an MCP
+  server using AI role; a **human client** uses human role. Local role labels are
+  claims from programs running as the laptop user, not proof of which program
+  made the connection.
 - **Device**: one serial port the core has open (e.g. `/dev/ttyUSB0`). The core
   identifies an open device by a numeric **device id**.
 - **Open**: the first client to use a device chooses its **baud rate**; later
@@ -85,14 +87,29 @@ these words in their tool names and user-facing text.
   core shutdown). Local clients receive events from their subscription onward;
   remote clients receive only authorized device events, from a bounded
   best-effort queue.
-- **Sharing session**: an opt-in TLS listener started by a **local owner** on
-  one concrete IPv4 or IPv6 address and port. It grants remote access only to
-  **checked devices** and lives only while the owner's local terminal
+- **Sharing session**: an opt-in TLS listener started from the laptop user's
+  terminal workflow on one concrete IPv4 or IPv6 address and port. It grants
+  remote access only to **checked devices** and lives only while its owner
   connection is active. Stopping it or losing that connection closes the
   listener, disconnects every **remote client** and revokes the credentials.
-  Off by default; there is no listener until one is started.
-- **Local owner**: the local human terminal connection that started a sharing
-  session. Only it may check, uncheck, inspect or stop sharing.
+  Off by default; there is no listener until the local user starts one.
+- **Local owner**: the local core connection that started a sharing session;
+  the supported workflow is the human terminal. Programs running as the same
+  laptop user are trusted and can claim the same role, so owner status does not
+  authenticate the executable. Other OS users and unpaired remote clients are
+  not trusted by this rule.
+- **Terminal gateway**: the one supported foreground terminal process per
+  laptop that hosts the local MCP IPC socket. Every MCP call—local or to an
+  explicitly paired remote endpoint—uses a separate gateway connection and
+  upstream client for that MCP session. Local MCP needs the terminal but not
+  LAN sharing. A second supported terminal exits clearly. Gateway exit closes
+  its local and outgoing remote MCP sessions; terminal exit also ends any share
+  it owns. This is a supported routing/lifetime rule, not a security barrier
+  against same-user programs.
+- **Same-user trust**: every program running as the laptop user may impersonate
+  the terminal or client role, access local serial through the core, and start
+  or change LAN sharing. The private Unix sockets exclude different OS users;
+  they do not isolate programs owned by the same user.
 - **Checked device**: a detected device path the owner selected in the
   settings checklist for the session's in-memory allowlist. Checking is
   session-only, defaults to none and does not open the device. The core's

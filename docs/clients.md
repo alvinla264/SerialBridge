@@ -2,8 +2,10 @@
 
 ## Using the client library
 
-The MCP server and the terminal both use `serial-nexus-client` rather than
-speaking the socket themselves. The quickest path:
+The terminal and MCP use `serial-nexus-client` rather than speaking local
+IPC themselves. The human terminal connects to the core; MCP connects through
+the terminal's gateway and cannot start the core. The quickest direct-library
+example (for trusted same-user programs) is:
 
 ```rust
 use serial_nexus_client::{Client, ClientConfig, ClientInfo, WaitSpec};
@@ -37,12 +39,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Local trust and terminal gateway
+
+All programs running as the laptop user are trusted. The core socket's UID
+check does not authenticate an executable, and local client kinds are
+self-asserted. A same-UID program can impersonate the terminal, access local
+serial, or enable/change sharing. The terminal gateway is the supported MCP
+route and lifetime owner, not an isolation barrier against those programs.
+Different local OS users cannot use the private per-user socket; remote clients
+are not trusted just because the laptop user is trusted and still need TLS host
+verification, a matching pairing credential/role, and the share allowlist.
+
+The terminal hosts a bounded, versioned per-user IPC socket (default
+`$XDG_RUNTIME_DIR/serial-nexus/gateway.sock`, override with
+`SERIAL_NEXUS_GATEWAY_SOCKET`). The terminal and MCP host must use the same
+path. Every MCP call, including explicit remote endpoints, goes through this
+socket. Each MCP process keeps separate local and per-endpoint sessions, and
+the gateway creates one upstream client for each. Both sides verify the
+peer's effective UID before exchanging protocol messages. MCP sees no sharing
+administration. A local-only MCP call requires the terminal but no active LAN
+share. Gateway/terminal exit disconnects local and outgoing remote MCP sessions;
+terminal exit also stops its owner share and revokes the session credentials.
+
 ### API surface
 
 | Call | What it does |
 | --- | --- |
 | `Client::connect(config)` | Connect, starting the core when needed. |
-| `Client::connect_to_socket(path, info)` | Connect to a running core without auto-start (tests, embedding). |
+| `Client::connect_to_socket(path, info)` | Connect to a running core without auto-start (tests, embedding, trusted same-user programs). |
+| `Client::connect_to_gateway(path, target, info)` | Connect to the running terminal gateway for a local core or paired remote endpoint; no core auto-start or direct network dial. |
 | `hello()` | Core version, client id, socket and `Limits`. |
 | `list_devices()` | `Vec<DeviceSummary>`: every detected device plus open devices (baud, client count, control holder). |
 | `open(port, baud: Option<u32>, request_control)` | Open or join; returns `OpenResult { device_id, port, baud, role, control }`. |
@@ -67,8 +92,10 @@ Errors are `ClientError`. Use `error.code()` to match the core's `ErrorCode`
 ### Remote (LAN) transport
 
 `RemoteClient` reaches devices a host shares on the local network. It is used
-by the MCP server and by the terminal's Connect form. It never talks to the
-Unix socket, and a network failure is an error rather than a quiet local retry.
+by the terminal's Connect form and, for MCP, inside the terminal gateway. The
+MCP process itself does not create a `RemoteClient` or open a network
+connection. `RemoteClient` never talks to the local core socket, and a network
+failure is an error rather than a quiet local retry.
 IPv6 link-local addresses include the connecting machine's numeric interface
 scope (for example `fe80::1%3`) so the connection uses that local interface.
 
@@ -116,8 +143,9 @@ recognizes both that and a host answer carrying the same flag.
 
 ### The private pairing file
 
-An MCP host cannot be trusted to keep a credential out of AI-visible tool
-arguments or history, so the human configures one private file instead.
+The MCP tool schema never accepts credentials. The laptop user configures one
+private file instead. The MCP process sends its path (not its contents) over the
+local terminal gateway; the gateway opens and validates it before connecting.
 `Peers` loads it:
 
 - path: `SERIAL_NEXUS_MCP_PEERS`, else `$XDG_CONFIG_HOME/serial-nexus/mcp-peers.json`,
@@ -139,19 +167,21 @@ shows the file a user writes.
 
 ### Auto-start and packaging
 
-`Client::connect` tries the socket first. If nothing answers and auto-start is
-on, it starts `serial-nexus-core` detached (its own session, so Ctrl-C in the
-client that launched it does not kill the shared core) and polls until the
-socket accepts. The core locks its socket directory, so clients racing to start
-it still end up with one core. `spawn_core()` returns the new process id.
+`Client::connect` (used by the terminal) tries the core socket first. If
+nothing answers and auto-start is on, it starts `serial-nexus-core` detached
+(its own session, so Ctrl-C in the terminal does not kill the shared core) and
+polls until the socket accepts. The core locks its socket directory, so
+clients racing to start it still end up with one core. `spawn_core()` returns
+the new process id. MCP uses `connect_to_gateway` instead and fails clearly
+when the terminal is absent; it never starts the core.
 
 The executable is found in this order:
 
 1. `ClientConfig::core_binary` (an explicit path, for embedding);
 2. `$SERIAL_NEXUS_CORE`;
 3. the path compiled in with `SERIAL_NEXUS_CORE_DEFAULT` at build time (the
-   Nix flake points this at its `serial-nexus-core` store path, so a client
-   installed on its own still starts the core it was built against);
+   Nix flake points this at its `serial-nexus-core` store path, so the
+   terminal can start the core it was built against);
 4. a `serial-nexus-core` next to the current executable (what `cargo build`
    gives);
 5. `serial-nexus-core` on `PATH`.
@@ -162,9 +192,13 @@ public for wrappers with their own launch strategy.
 
 ### Human terminal
 
-`serial-nexus-terminal` is the human client. It connects with `Client::connect`
-(so a missing core is started automatically) as a human client and never takes
-AI write control.
+`serial-nexus-terminal` is the supported human client and sole supported local
+gateway. It connects with `Client::connect` (so a missing core is started
+automatically) as a human client and never takes AI write control. One supported
+terminal runs per laptop; a second exits clearly. MCP local and remote calls
+require this terminal to be running. Local-only MCP does not require LAN
+sharing. Terminal exit closes its local and outgoing remote MCP sessions and
+stops sharing it owns.
 
 - At a usable width the terminal shows the device sidebar on the left and the
   right pane beside it: the shown device's stream, its scrollback, Settings,
@@ -297,9 +331,11 @@ never run it by hand.
 ## MCP server (`serial-nexus-mcp`)
 
 `serial-nexus-mcp` is an MCP server over stdio: the AI host launches it and it
-reaches the devices through `serial-nexus-client` and the core, starting the
-core when needed. It never opens a serial port itself, so the core's rules (one
-AI writer per device, baud conflicts, idle expiry, human writes) still apply.
+routes every local and remote call through the running terminal gateway. The
+MCP process never starts the core, opens a serial port, or dials a remote host.
+The gateway maintains an upstream client per MCP session and endpoint, so the
+core's rules (one AI writer per device, baud conflicts, idle expiry, human
+writes) still apply. Local-only MCP works while LAN sharing is off.
 
 ```json
 {
@@ -324,9 +360,9 @@ one command and no arguments):
 ```
 
 After `nix profile install github:alvinla264/SerialNexus`, or `cargo install` of
-the three crates, `"command": "serial-nexus-mcp"` works too. The core is started
-by the first tool call; the host does not need to launch `serial-nexus-core`
-itself.
+the three crates, `"command": "serial-nexus-mcp"` works too. Start
+`serial-nexus-terminal` before using MCP; if it is absent, calls fail clearly
+and the MCP process does not launch `serial-nexus-core`.
 
 Tools: `list_devices` (paths, open state, baud, control holder), `connect`
 (`port`, optional `baud` and `request_control`; reports active baud and either
@@ -350,9 +386,10 @@ add these values to `~/.config/serial-nexus/mcp-peers.json` (or the configured
 and `secret` JSON fields. Set `secret.role` to `ai`, and use the endpoint's IP
 and listener port in remote tool arguments. The credential is a bearer secret:
 keep it out of shell history, the repository, MCP host configuration arguments,
-and every tool call. The file is read only by the MCP server, never surfaced in
-tool output. Stopping sharing or closing the owner terminal revokes the
-credential; a new session requires updating the pairing file.
+and every tool call. The MCP process sends only the file path through the
+terminal gateway; the gateway reads the file and keeps the credential out of
+MCP tool arguments and output. Stopping sharing or closing the owner terminal
+revokes the credential; a new session requires updating the pairing file.
 
 ### Sharing devices on the LAN from the terminal
 

@@ -18,6 +18,9 @@ use std::time::{Duration, Instant};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::pty::openpty;
 use serde_json::{json, Value};
+use serial_nexus_client::{GatewayConfig, GatewayServer};
+use std::collections::HashMap;
+use std::sync::OnceLock;
 use tempfile::TempDir;
 
 /// A PTY pair: the core opens the slave path as a serial port, the test drives
@@ -145,6 +148,22 @@ pub fn start_core(control_idle: Duration) -> (TempDir, PathBuf) {
     (directory, socket)
 }
 
+fn test_gateway(core_socket: &Path) -> PathBuf {
+    static GATEWAYS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<GatewayServer>>>>> = OnceLock::new();
+    let gateway_socket = core_socket.with_file_name("gateway.sock");
+    let gateways = GATEWAYS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut gateways = gateways.lock().expect("test gateway map lock");
+    if !gateways.contains_key(&gateway_socket) {
+        let gateway = GatewayServer::start(GatewayConfig {
+            socket: gateway_socket.clone(),
+            core_socket: core_socket.to_path_buf(),
+        })
+        .expect("start test terminal gateway");
+        gateways.insert(gateway_socket.clone(), Arc::new(Mutex::new(gateway)));
+    }
+    gateway_socket
+}
+
 pub fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -172,11 +191,33 @@ impl McpSession {
         Self::spawn_with_env(socket, &[])
     }
 
+    pub fn spawn_without_gateway(socket: &Path) -> Self {
+        Self::spawn_without_gateway_with_env(socket, &[])
+    }
+
+    pub fn spawn_without_gateway_with_env(socket: &Path, extra_env: &[(&str, &str)]) -> Self {
+        Self::spawn_config(socket, extra_env, false)
+    }
+
     /// Spawn `serial-nexus-mcp`; `extra_env` is added to the child's environment.
     pub fn spawn_with_env(socket: &Path, extra_env: &[(&str, &str)]) -> Self {
+        Self::spawn_config(socket, extra_env, true)
+    }
+
+    fn spawn_config(socket: &Path, extra_env: &[(&str, &str)], with_gateway: bool) -> Self {
+        let gateway_path = if with_gateway {
+            test_gateway(socket)
+        } else {
+            socket.with_file_name("absent-gateway.sock")
+        };
+        Self::spawn_at_gateway(socket, &gateway_path, extra_env)
+    }
+
+    pub fn spawn_at_gateway(socket: &Path, gateway: &Path, extra_env: &[(&str, &str)]) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_serial-nexus-mcp"));
         command
             .env("SERIAL_NEXUS_SOCKET", socket)
+            .env("SERIAL_NEXUS_GATEWAY_SOCKET", gateway)
             .env_remove("SERIAL_NEXUS_CORE")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

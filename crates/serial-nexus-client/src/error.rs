@@ -33,6 +33,15 @@ pub enum ClientError {
     #[error("core speaks protocol {core}, this client speaks {client}")]
     UnsupportedProtocol { core: u32, client: u32 },
 
+    #[error("terminal gateway handshake failed: {0}")]
+    GatewayHandshake(String),
+
+    #[error("could not verify local socket peer credentials: {0}")]
+    LocalPeerVerification(String),
+
+    #[error("local socket peer uid {actual} does not match current uid {expected}")]
+    LocalPeerRejected { actual: u32, expected: u32 },
+
     #[error("unexpected response from core: {0}")]
     UnexpectedResponse(String),
 

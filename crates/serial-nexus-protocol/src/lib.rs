@@ -17,6 +17,12 @@ pub use share::*;
 /// Version of the client/core protocol.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Version of the per-user terminal gateway handshake.
+pub const GATEWAY_PROTOCOL_VERSION: u32 = 1;
+
+/// Largest accepted line in the per-user terminal gateway protocol.
+pub const MAX_GATEWAY_MESSAGE_BYTES: usize = 1 << 20;
+
 /// Largest accepted JSON line, in bytes, in either direction.
 pub const MAX_MESSAGE_BYTES: usize = 1 << 20;
 
@@ -139,6 +145,43 @@ pub enum Request {
     ShareUncheck(ShareDevicesParams),
     /// The session's state, without secrets. Local owner only.
     ShareStatus,
+}
+
+/// First frame sent to the terminal gateway before the normal core protocol.
+/// It contains no credentials; remote pairing credentials stay in the gateway.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayConnect {
+    pub protocol: u32,
+    pub target: GatewayTarget,
+    /// Optional path to the user's private pairing file. It contains no secret
+    /// itself; the gateway opens and validates it locally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pairing_file: Option<std::path::PathBuf>,
+}
+
+/// Which upstream connection the terminal gateway owns for this client.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GatewayTarget {
+    Local,
+    Remote {
+        address: std::net::IpAddr,
+        port: u16,
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        scope_id: u32,
+    },
+}
+
+/// Acknowledgement of the gateway preface, before the core-protocol hello.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayHandshake {
+    pub protocol: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -648,6 +691,42 @@ mod tests {
     }
 
     #[test]
+    fn gateway_connect_round_trips_versioned_local_and_remote_targets() {
+        let local = GatewayConnect {
+            protocol: GATEWAY_PROTOCOL_VERSION,
+            target: GatewayTarget::Local,
+            pairing_file: None,
+        };
+        let line = encode_line(&local).unwrap();
+        assert_eq!(decode_line::<GatewayConnect>(&line).unwrap(), local);
+
+        let remote = GatewayConnect {
+            protocol: GATEWAY_PROTOCOL_VERSION,
+            target: GatewayTarget::Remote {
+                address: "192.0.2.7".parse().unwrap(),
+                port: 7443,
+                scope_id: 0,
+            },
+            pairing_file: None,
+        };
+        let line = encode_line(&remote).unwrap();
+        assert_eq!(decode_line::<GatewayConnect>(&line).unwrap(), remote);
+        assert!(!String::from_utf8_lossy(&line).contains("credential"));
+    }
+
+    #[test]
+    fn gateway_frame_limit_is_enforced_by_the_bounded_reader() {
+        let input = vec![b'x'; MAX_GATEWAY_MESSAGE_BYTES + 1];
+        let mut reader = std::io::Cursor::new(input);
+        assert_eq!(
+            read_line(&mut reader, MAX_GATEWAY_MESSAGE_BYTES)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
     fn events_round_trip_bytes() {
         let event = Event::device_output(9, &[0xff, 0x00, b'a']);
         let back: Event = decode_line(&encode_line(&ServerMessage::Event { event }).unwrap())
@@ -701,6 +780,7 @@ pub mod paths {
     use std::path::{Path, PathBuf};
 
     pub const SOCKET_ENV: &str = "SERIAL_NEXUS_SOCKET";
+    pub const GATEWAY_SOCKET_ENV: &str = "SERIAL_NEXUS_GATEWAY_SOCKET";
 
     /// Effective user id, used to keep one core and one socket per user.
     pub fn effective_uid() -> u32 {
@@ -724,6 +804,18 @@ pub mod paths {
             Some(dir) => dir.join("serial-nexus"),
             None => temp_dir.join(format!("serial-nexus-{uid}")),
         }
+    }
+
+    /// Default gateway path. Set [`GATEWAY_SOCKET_ENV`] to override it.
+    /// Otherwise it lives in the private per-user SerialNexus runtime directory.
+    pub fn default_gateway_socket_path() -> PathBuf {
+        if let Some(path) = std::env::var_os(GATEWAY_SOCKET_ENV) {
+            let path = PathBuf::from(path);
+            if !path.as_os_str().is_empty() {
+                return path;
+            }
+        }
+        default_socket_dir().join("gateway.sock")
     }
 
     /// Default socket path. Set [`SOCKET_ENV`] to override it.

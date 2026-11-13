@@ -78,6 +78,10 @@ impl TuiSession {
         let mut command = Command::new(env!("CARGO_BIN_EXE_serial-nexus-terminal"));
         command
             .env("SERIAL_NEXUS_SOCKET", socket)
+            .env(
+                "SERIAL_NEXUS_GATEWAY_SOCKET",
+                socket.with_file_name("gateway.sock"),
+            )
             .env("XDG_CONFIG_HOME", xdg)
             .env("HOME", xdg)
             .env("TERM", "xterm-256color")

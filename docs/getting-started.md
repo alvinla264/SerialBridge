@@ -79,26 +79,30 @@ current system only; `nix flake check --all-systems --no-build` evaluates every
 system without building it. Building for the other architecture needs a native
 builder or an emulator.
 
-The two client packages are built against the `serial-nexus-core` they ship
-with: the flake compiles that store path in as `SERIAL_NEXUS_CORE_DEFAULT` (see
-[Auto-start and packaging](clients.md#auto-start-and-packaging)), so a client started
-from anywhere always launches its own matching core. No separate core install
-is needed; set `SERIAL_NEXUS_CORE` to use a different one.
+The terminal package is built against the `serial-nexus-core` it ships with:
+the flake compiles that store path in as `SERIAL_NEXUS_CORE_DEFAULT` (see
+[Auto-start and packaging](clients.md#auto-start-and-packaging)), so the
+terminal can start its matching core. MCP does not start a core; all MCP calls
+require the foreground terminal gateway. No separate core install is needed;
+set `SERIAL_NEXUS_CORE` to make the terminal use a different one.
 
 ## Running
 
-- **The core has no service.** The first client to connect starts it detached
+- **The core has no service.** The foreground terminal starts it detached
   (own session, stdio discarded) on the standard per-user socket; the core exits
-  30 seconds after its last client disconnects. Both the TUI and the MCP server
-  do this, so either can be started first.
+  30 seconds after its last client disconnects. The terminal also hosts the
+  local MCP gateway. Local and remote MCP calls require the terminal to be
+  running; MCP never auto-starts the core or dials remote endpoints directly.
 - **One core per user.** Clients racing to start it still end up sharing one.
   `SERIAL_NEXUS_SOCKET` (or `--socket`) in a fresh parent directory isolates a
   second core for testing; the lock is `core.lock` in that directory, so two
   sockets in one directory still mean one core.
-- **Stopping.** Close the clients (the TUI on `Ctrl+Q`, the MCP host ends its
-  session) and the core goes away after its grace period. To stop it sooner,
-  terminate `serial-nexus-core`; devices close and attached clients see the
-  connection end.
+- **Stopping.** Close the terminal (`Ctrl+Q`) to stop its share, disconnect
+  local and outgoing remote MCP sessions, and release its core connection. MCP
+  can no longer make local or remote calls until the terminal is running again.
+  The core goes away after its grace period when no clients remain. To stop it
+  sooner, terminate `serial-nexus-core`; devices close and attached clients see
+  the connection end.
 - **Human access.** Run `serial-nexus-terminal` whenever you want: it lists the
   same devices as the AI, joins an open one at its active baud, follows the live
   stream from then on, and can always write. It does not replay earlier
@@ -108,8 +112,11 @@ is needed; set `SERIAL_NEXUS_CORE` to use a different one.
 
 ## Behaviour and defaults
 
-All defaults are bounded and reported to clients in the `hello` response
-(`Limits`), so client tools and docs never hard-code different numbers.
+All core defaults are bounded and reported to clients in the `hello` response
+(`Limits`), so client tools and docs never hard-code different numbers. Gateway
+IPC is separately versioned and bounded; all programs running as the laptop
+user are trusted, while different OS users remain excluded by the private
+sockets.
 
 | Setting | Default | Notes |
 | --- | --- | --- |
@@ -120,7 +127,8 @@ All defaults are bounded and reported to clients in the `hello` response
 | History | 2000 lines / 256 KiB per open device | In memory only; discarded when the device closes. Drops are counted and reported. |
 | Read lines | 50 default, 2000 max | The AI chooses per call. |
 | Write wait | 1000 ms default, 30 s max | The AI chooses per call. |
-| Default socket | `$SERIAL_NEXUS_SOCKET`, else `$XDG_RUNTIME_DIR/serial-nexus/core.sock`, else `$TMPDIR/serial-nexus-<uid>/core.sock` | Directory 0700, socket 0600, peer uid checked. |
+| Core socket | `$SERIAL_NEXUS_SOCKET`, else `$XDG_RUNTIME_DIR/serial-nexus/core.sock`, else `$TMPDIR/serial-nexus-<uid>/core.sock` | Directory 0700, socket 0600, peer uid checked. |
+| Terminal gateway socket | `$SERIAL_NEXUS_GATEWAY_SOCKET`, else `$XDG_RUNTIME_DIR/serial-nexus/gateway.sock`, else `$TMPDIR/serial-nexus-<uid>/gateway.sock` | Per-user IPC, socket 0600, same-UID peer checked; terminal lifetime. |
 
 Device rules:
 

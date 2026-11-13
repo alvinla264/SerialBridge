@@ -4,9 +4,10 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 serial-nexus-mcp: an MCP server over stdio for SerialNexus serial devices
 
-The AI host launches it and speaks MCP on stdin/stdout. It connects to the
-local serial-nexus-core (starting it when needed); the socket comes from
-SERIAL_NEXUS_SOCKET like every other SerialNexus client.
+The AI host launches it and speaks MCP on stdin/stdout. All local and remote
+calls require the foreground serial-nexus-terminal gateway to be running.
+MCP does not start serial-nexus-core or dial remote endpoints itself. The
+SERIAL_NEXUS_GATEWAY_SOCKET environment variable overrides the per-user socket.
 
 Usage: serial-nexus-mcp [--help] [--version]
 ";

@@ -6,19 +6,24 @@ and there is no network listener unless a local owner starts one.
 
 ## Lifecycle
 
-1. A **local owner** connects over the Unix socket (a human terminal) and calls
-   `ShareStart` with one concrete `ShareBind` address and port and zero or more
-   detected device paths. Wildcard (`0.0.0.0`, `::`), multicast and broadcast
-   addresses are refused.
+1. A **local owner** connects over the Unix socket and calls `ShareStart` with
+   one concrete `ShareBind` address and port and zero or more detected device
+   paths. The supported human workflow is the terminal. Wildcard (`0.0.0.0`,
+   `::`), multicast and broadcast addresses are refused. The core's local
+   client kind is self-asserted; it does not authenticate the executable.
 2. The core binds the listener synchronously. A bind failure is returned as an
    error and leaves sharing off; no session, credentials or listener exist.
 3. The session lives only while that owner connection lives. Closing it,
    `ShareStop`, a core shutdown or a crash closes the listener, disconnects
    every remote connection and revokes both credentials. Sharing is off until
    started again, with a fresh session id, CA, leaf certificate and credentials.
-4. Only the owner may check, uncheck, inspect or stop the session. Other local
-   clients can use devices as before but cannot control sharing. Remote
-   clients can never control sharing.
+4. Only the owner connection may check, uncheck, inspect or stop its active
+   session. This is connection ownership, not terminal-process authentication:
+   every program running as the laptop user is trusted and can impersonate a
+   human client, access local serial, and start or change sharing. Other OS
+   users cannot connect through the private per-user socket; paired remote
+   clients can use only their role and checked-device permissions and cannot
+   control sharing.
 
 ## Pairing and roles
 
@@ -80,6 +85,19 @@ type:
 
 ## Authorization
 
+### Local trust boundary
+
+All programs running as the laptop user are trusted. The Unix socket restricts
+connections to that user's effective UID, but does not distinguish the
+terminal from another same-UID program. `Hello.client.kind` is supplied by the
+client, not OS-attested. Therefore a same-user program can impersonate the
+terminal, access local serial, and enable/modify sharing. The terminal is the
+supported human control path; its controls are not a security boundary against
+the same user. This trust does not extend to another local OS user or to an
+unpaired remote client. Remote access still requires TLS host verification,
+a valid paired credential and role, and the session's checked-device
+allowlist.
+
 - **Allowlist.** The checked list is an in-memory, session-scoped map of
   canonical device path to `DeviceIdentity`. A device may be checked when it is
   enumerated now or already open in the core; it does not need to stay open.
@@ -116,8 +134,9 @@ type:
   shared devices are untouched. A write already in progress can still finish or
   partially reach the device; there is no rollback and no automatic replay.
 - **ShareStatus when off.** With no active session, `ShareStatus` returns the
-  inactive snapshot to any local client; when a session is active, only its
-  owner may inspect it. `ShareStop` when off returns `was_active: false`.
+  inactive snapshot to a same-UID local client; when a session is active, only
+  its owner connection may inspect it. A different same-UID process can claim
+  human kind when creating its own connection and is trusted under this model. `ShareStop` when off returns `was_active: false`.
 - **Owner loss / stop.** The listener is closed, every remote socket is shut
   down and every device's write generation is bumped, so queued but not yet
   started remote writes are dropped, including writes from clients that have
@@ -148,13 +167,21 @@ type:
   that falls behind loses events rather than growing core memory or blocking
   local clients; it can re-read history through `Read`.
 
-## Local compatibility
+## Local compatibility and terminal gateway
 
-Local clients keep the Unix socket, framing, hello, open/join, control,
-history, close and grace-period behaviour. The uid check, private socket
-directory and one-core-per-user lock are unchanged. Sharing is layered on top
-and never changes local request or event shapes; owner-only start, status,
-check, uncheck, prepare, commit, replace and stop requests are additive.
+Local core clients keep the Unix socket, framing, hello, open/join, control,
+history, close and grace-period behavior. The UID check, per-user socket and
+one-core-per-user lock separate OS users; they do not isolate same-UID
+programs. The foreground terminal hosts a bounded/versioned per-user MCP
+gateway. All MCP calls, including calls to paired remote endpoints, use this
+gateway; one upstream core or remote client is kept per MCP session and
+endpoint. MCP exposes no sharing administration. Local MCP needs a running
+terminal but not an active LAN share. A second supported terminal exits clearly.
+On terminal/gateway exit its local MCP clients and outgoing remote MCP clients
+disconnect, its owner connection stops its share, inbound remote clients are
+closed, and the credentials are revoked. A new share is opt-in and generates
+fresh credentials. The gateway is a supported routing/lifetime rule, not a
+security boundary against trusted same-UID programs.
 
 ## Test seams
 
