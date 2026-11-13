@@ -39,22 +39,28 @@ fn serial_test() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poison| poison.into_inner())
 }
 
-/// The workspace builds every binary before its integration tests run, so the
-/// terminal tests can drive the MCP binary at the same target directory. This
-/// mirrors how `remote_mcp.rs` finds the core binary.
+/// Find the MCP binary Cargo built beside this test executable.
+///
+/// Cargo does not always place an integration-test executable directly under
+/// `target/debug/deps`: with a restored build cache it can run from
+/// `target/debug/build/<package>/<hash>/out`. Walk up from the test executable
+/// to the first directory that holds the MCP binary, which a workspace test
+/// run puts at `target/debug/serial-nexus-mcp`.
+fn find_binary_from(start: &Path) -> Option<PathBuf> {
+    start.ancestors().skip(1).find_map(|directory| {
+        let candidate = directory.join("serial-nexus-mcp");
+        candidate.is_file().then_some(candidate)
+    })
+}
+
 fn mcp_binary() -> PathBuf {
     let test_binary = std::env::current_exe().expect("current test executable");
-    let target = test_binary
-        .parent()
-        .and_then(Path::parent)
-        .expect("target directory");
-    let binary = target.join("serial-nexus-mcp");
-    assert!(
-        binary.exists(),
-        "{} is missing: run cargo test --workspace so the MCP binary is built",
-        binary.display()
-    );
-    binary
+    find_binary_from(&test_binary).unwrap_or_else(|| {
+        panic!(
+            "serial-nexus-mcp is not in any parent of {}: run cargo test --workspace so the MCP binary is built",
+            test_binary.display()
+        )
+    })
 }
 
 /// One real MCP server process, spoken to over its stdio framing.
@@ -921,4 +927,25 @@ fn a_write_larger_than_the_serial_buffer_keeps_the_device_to_itself() {
     drop(human);
     terminal.quit();
     drop(host_core);
+}
+
+#[test]
+fn the_mcp_binary_is_found_from_a_nested_build_directory() {
+    let root = TempDir::new().expect("temp");
+    let debug = root.path().join("debug");
+    let nested = debug.join("build/serial-nexus-terminal/0123456789abcdef/out");
+    std::fs::create_dir_all(&nested).expect("nested build directory");
+    std::fs::write(debug.join("serial-nexus-mcp"), b"binary").expect("binary");
+    let test_executable = nested.join("pty_remote_mcp-0123456789abcdef");
+    std::fs::write(&test_executable, b"test").expect("test executable");
+
+    assert_eq!(
+        find_binary_from(&test_executable),
+        Some(debug.join("serial-nexus-mcp"))
+    );
+    assert_eq!(
+        find_binary_from(&nested.join("not-built")),
+        Some(debug.join("serial-nexus-mcp")),
+        "a stale path under the same build tree still finds it"
+    );
 }

@@ -13,8 +13,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use serial_nexus_client::{Client, ClientInfo, GatewayConfig, GatewayServer};
-use serial_nexus_protocol::{PairingSecret, ShareBind, ShareSessionInfo};
+use serial_nexus_client::{Client, ClientError, ClientInfo, GatewayConfig, GatewayServer};
+use serial_nexus_protocol::{ErrorCode, PairingSecret, ShareBind, ShareSessionInfo};
 use support::{start_core, wait_until, McpSession, SimulatedDevice};
 use tempfile::TempDir;
 
@@ -71,6 +71,30 @@ fn peer_entry(info: &ShareSessionInfo, secret: &PairingSecret) -> Value {
         "paired": info.host,
         "secret": { "role": secret.role, "credential": secret.credential },
     })
+}
+
+/// Restart sharing on the host's port. The port is a released ephemeral port,
+/// which another listener in this parallel test process can claim for a
+/// moment; only `EADDRINUSE` is retried, within a bounded time.
+fn restart_on_the_same_port(host: &SharedHost, devices: &[String]) -> ShareSessionInfo {
+    let bind = ShareBind::new(
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        host.info.bind.port(),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match host.owner.start_sharing(bind.clone(), devices.to_vec()) {
+            Ok(info) => return info,
+            Err(ClientError::Server(error))
+                if error.code == ErrorCode::DeviceFailed
+                    && error.message.contains("Address already in use")
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("restart: {error}"),
+        }
+    }
 }
 
 fn write_peers(directory: &TempDir, entries: Vec<Value>) -> PathBuf {
@@ -880,20 +904,10 @@ fn rotated_credentials_are_reported_and_a_repair_is_used_on_the_next_call() {
     );
     assert!(!connected.is_error, "{}", connected.text);
 
-    // Restart sharing: a fresh CA, leaf certificate and credentials.
+    // Restart sharing on the same address and port, so only the fresh
+    // certificate and credentials differ and the old pairing is stale.
     host.owner.stop_sharing().expect("stop");
-    let fresh = host
-        .owner
-        .start_sharing(
-            // Same address and port, so only the fresh certificate and
-            // credentials differ: the old pairing is now stale.
-            ShareBind::new(
-                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                host.info.bind.port(),
-            ),
-            vec![device.path.clone()],
-        )
-        .expect("restart");
+    let fresh = restart_on_the_same_port(&host, std::slice::from_ref(&device.path));
 
     let stale = session.call_tool(
         "list_devices",

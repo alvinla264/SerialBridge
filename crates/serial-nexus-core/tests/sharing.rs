@@ -2265,3 +2265,63 @@ fn a_large_local_write_still_succeeds_while_sharing() {
         .expect("local write keeps its 1 MiB budget");
     assert!(!device.read_available(Duration::from_millis(200)).is_empty());
 }
+
+#[test]
+fn sharing_restarts_on_the_same_port_right_after_a_connection_closes() {
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let mut device = SimulatedDevice::new();
+    owner
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    let mut bind = ShareBind::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+
+    for round in 0..3 {
+        let info = owner
+            .start_sharing(bind.clone(), vec![device.path.clone()])
+            .unwrap_or_else(|error| panic!("round {round} could not start: {error}"));
+        if round == 0 {
+            bind = ShareBind::new(info.bind.ip(), info.bind.port());
+        }
+        assert_eq!(info.bind, bind.socket_addr());
+        // The server closes this connection when sharing stops, so the port
+        // holds a TIME_WAIT socket while the next session tries to bind it.
+        let human = remote(&info, PairingRole::Human, "restart-human").expect("pair");
+        let opened = human.open(&device.path, None, false).expect("open remote");
+        human
+            .write_bytes(opened.device_id, b"restart", None)
+            .expect("write");
+        device.read_until(b"restart", Duration::from_secs(2));
+        owner.stop_sharing().expect("stop");
+        wait_disconnected(&human);
+    }
+}
+
+#[test]
+fn sharing_restarts_on_the_same_port_while_an_old_connection_is_half_closed() {
+    // The stop path shuts a remote socket down but the peer may not have
+    // closed yet. Rebinding the same port must work even with that socket
+    // still around; without SO_REUSEADDR the kernel reports EADDRINUSE.
+    let core = shared_core();
+    let owner = local_owner(&core);
+    let mut device = SimulatedDevice::new();
+    owner
+        .open(&device.path, Some(115_200), false)
+        .expect("open");
+    let info = owner
+        .start_sharing(localhost_bind(), vec![device.path.clone()])
+        .expect("start");
+    let bind = ShareBind::new(info.bind.ip(), info.bind.port());
+
+    let raw = TcpStream::connect(info.bind).expect("raw peer connects");
+    // Let the listener accept it before stopping.
+    std::thread::sleep(Duration::from_millis(100));
+    owner.stop_sharing().expect("stop");
+
+    let restarted = owner
+        .start_sharing(bind.clone(), vec![device.path.clone()])
+        .expect("restart on the same port");
+    assert_eq!(restarted.bind, info.bind);
+    drop(raw);
+    owner.stop_sharing().expect("stop again");
+}
