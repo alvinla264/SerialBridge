@@ -172,6 +172,38 @@ fn reconnecting_to_an_already_connected_endpoint_does_not_duplicate_the_group() 
 }
 
 #[test]
+fn reconnecting_to_a_live_endpoint_still_validates_the_submitted_pairing() {
+    let _guard = serial_test();
+    let device = SimulatedDevice::new();
+    let host = start_host(
+        &[&device.path],
+        Arc::new(Mutex::new(vec![PathBuf::from(&device.path)])),
+    );
+    let (_local, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let mut terminal = Terminal::new(&socket);
+    terminal.connect(&host.info);
+    assert_eq!(terminal.app.state.remote_labels.len(), 1);
+
+    let mut invalid_pairing = host.info.clone();
+    invalid_pairing.human.credential = "invalid-credential".into();
+    terminal.connect(&invalid_pairing);
+
+    assert_eq!(terminal.app.state.remote_labels.len(), 1);
+    let form = terminal
+        .app
+        .state
+        .connect
+        .as_ref()
+        .expect("failed pairing remains in the form");
+    assert!(
+        form.error
+            .as_deref()
+            .is_some_and(|error| error.contains("not connected")),
+        "a live endpoint must not make invalid pairing data appear successful"
+    );
+}
+
+#[test]
 fn a_new_connection_does_not_hide_existing_host_disconnects() {
     let _guard = serial_test();
     let (_local, local_socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);

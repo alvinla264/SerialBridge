@@ -750,6 +750,29 @@ impl App {
         self.state.draft.share_address = address_text;
         self.state.draft.share_port = port;
 
+        // A temporary loss of identity must not turn an unrelated settings
+        // save into an implicit removal from the core's active allowlist. The
+        // human can retry after discovery recovers, or explicitly uncheck it.
+        if let Some(snapshot) = self
+            .state
+            .sharing
+            .snapshot
+            .as_ref()
+            .filter(|_| self.state.sharing.active)
+        {
+            let detected = self.state.detected_local_identities();
+            let unverified_checked = snapshot.checked.iter().any(|device| {
+                self.state.draft_checked.contains(&device.path)
+                    && !matches!(detected.get(&device.path), Some(Some(_)))
+            });
+            if unverified_checked {
+                self.state.notice = Some(Notice::error(
+                    "settings not saved: cannot verify an active shared device identity; refresh discovery and try again, or uncheck that device",
+                ));
+                return;
+            }
+        }
+
         // Preserve the human's draft for every failed save, even if current
         // device discovery requires pruning it before authorization.
         let original_draft_checked = self.state.draft_checked.clone();
@@ -1168,13 +1191,11 @@ impl App {
             credential: form.credential.trim().to_string(),
         };
         let endpoint = RemoteEndpoint::from_socket_addr(paired.address).canonical();
-        if let Some(existing) = self
+        let existing_id = self
             .remotes
             .iter()
             .find(|link| link.endpoint == endpoint && link.client.is_connected())
-        {
-            return Ok((existing.id, format!("Remote {endpoint}")));
-        }
+            .map(|link| link.id);
         let remote_client = serial_nexus_client::RemoteClient::connect_to(
             endpoint,
             &paired,
@@ -1183,6 +1204,14 @@ impl App {
             Duration::from_secs(5),
         )
         .map_err(|error| format!("not connected: {error}"))?;
+        if let Some(existing_id) = existing_id.filter(|existing_id| {
+            self.remotes.iter().any(|link| {
+                link.id == *existing_id && link.endpoint == endpoint && link.client.is_connected()
+            })
+        }) {
+            drop(remote_client);
+            return Ok((existing_id, format!("Remote {endpoint}")));
+        }
         let id = EndpointId(self.next_endpoint);
         self.next_endpoint += 1;
         let label = format!("Remote {}", paired.address);

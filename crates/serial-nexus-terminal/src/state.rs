@@ -124,6 +124,16 @@ impl Checklist {
         self.entries.contains_key(path)
     }
 
+    pub fn insert(&mut self, path: String) -> bool {
+        use std::collections::btree_map::Entry;
+        if let Entry::Vacant(entry) = self.entries.entry(path) {
+            entry.insert(None);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn insert_with_identity(&mut self, path: String, identity: String) -> bool {
         use std::collections::btree_map::Entry;
         if let Entry::Vacant(entry) = self.entries.entry(path) {
@@ -1355,15 +1365,60 @@ impl AppState {
                 self.draft_checked.remove(path);
             }
             let detected = self.detected_local_identities();
+            let pending_before_sync = self.sharing.pending_checked.clone();
+            let pending_identities = pending_before_sync.identities();
             self.sharing.pending_checked = Checklist::new();
             for device in &snapshot.checked {
-                if let Some(Some(identity)) = detected.get(&device.path) {
-                    self.sharing
-                        .pending_checked
-                        .insert_with_identity(device.path.clone(), identity.clone());
+                match detected.get(&device.path) {
+                    Some(Some(identity)) => {
+                        let previous_identity = pending_identities.get(&device.path);
+                        if previous_identity.is_none_or(|previous| previous == identity) {
+                            self.sharing
+                                .pending_checked
+                                .insert_with_identity(device.path.clone(), identity.clone());
+                        }
+                    }
+                    Some(None) | None => {
+                        if let Some(previous_identity) = pending_identities.get(&device.path) {
+                            self.sharing.pending_checked.insert_with_identity(
+                                device.path.clone(),
+                                previous_identity.clone(),
+                            );
+                        } else {
+                            self.sharing.pending_checked.insert(device.path.clone());
+                        }
+                    }
                 }
             }
-            self.reconcile_share_checks(&detected);
+            let draft_before_sync = self.draft_checked.clone();
+            let draft_identities = draft_before_sync.identities();
+            self.draft_checked.sync(&detected);
+            for device in &snapshot.checked {
+                if !draft_before_sync.contains(&device.path) {
+                    continue;
+                }
+                match detected.get(&device.path) {
+                    Some(Some(identity)) => {
+                        if draft_identities
+                            .get(&device.path)
+                            .is_none_or(|previous| previous == identity)
+                        {
+                            self.draft_checked
+                                .insert_with_identity(device.path.clone(), identity.clone());
+                        }
+                    }
+                    Some(None) | None => {
+                        if let Some(previous_identity) = draft_identities.get(&device.path) {
+                            self.draft_checked.insert_with_identity(
+                                device.path.clone(),
+                                previous_identity.clone(),
+                            );
+                        } else {
+                            self.draft_checked.insert(device.path.clone());
+                        }
+                    }
+                }
+            }
         }
         // An inactive snapshot says only that sharing is off; the session-only
         // checked selection stays for this launch, as an explicit stop does.
@@ -2002,6 +2057,32 @@ mod sharing_tests {
         assert!(lost.is_empty());
         assert!(state.sharing.pending_checked.contains("/dev/ttyUSB0"));
         assert!(!state.sharing.active);
+    }
+
+    #[test]
+    fn an_active_snapshot_preserves_a_selected_path_until_the_core_revokes_it() {
+        let mut state = state_with_devices();
+        let mut active = snapshot(&["/dev/ttyUSB0"]);
+        let identity = active.checked[0].identity.clone();
+        state.sharing.active = true;
+        state.sharing.snapshot = Some(active.clone());
+        state
+            .sharing
+            .pending_checked
+            .insert_with_identity("/dev/ttyUSB0".into(), identity.clone());
+        state
+            .draft_checked
+            .insert_with_identity("/dev/ttyUSB0".into(), identity);
+        state.devices.retain(|device| device.path != "/dev/ttyUSB0");
+
+        state.apply_sharing_snapshot(active.clone());
+
+        assert!(state.sharing.pending_checked.contains("/dev/ttyUSB0"));
+        assert!(state.draft_checked.contains("/dev/ttyUSB0"));
+        active.checked.clear();
+        state.apply_sharing_snapshot(active);
+        assert!(!state.sharing.pending_checked.contains("/dev/ttyUSB0"));
+        assert!(!state.draft_checked.contains("/dev/ttyUSB0"));
     }
 
     #[test]

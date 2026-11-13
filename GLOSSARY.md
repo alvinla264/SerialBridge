@@ -4,9 +4,10 @@ Terms used by SerialNexus. The client tasks (MCP server, terminal) should use
 these words in their tool names and user-facing text.
 
 - **Core** (`serial-nexus-core`): the one process per local user that owns
-  serial devices and serves clients over a Unix socket. It starts automatically
-  when the first client connects and exits after a grace period with no
-  clients.
+  serial devices and serves clients over a Unix socket. In the supported
+  workflow, the foreground terminal starts it for local access; MCP requires
+  that terminal's gateway and does not start the core itself. The core exits
+  after a grace period with no clients.
 - **Client**: anything connected to the core. An **AI client** is an MCP
   server using AI role; a **human client** uses human role. Local role labels are
   claims from programs running as the laptop user, not proof of which program

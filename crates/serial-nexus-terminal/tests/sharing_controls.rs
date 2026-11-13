@@ -644,6 +644,54 @@ fn leaving_the_terminal_stops_sharing_and_revokes_the_credentials() {
 }
 
 #[test]
+fn saving_preferences_does_not_revoke_a_shared_device_during_temporary_identity_loss() {
+    let (fixture, devices) = Fixture::new();
+    let mut app = fixture.app();
+    let path = devices[0].path.clone();
+    check_device(&mut app, &path);
+    set_bind(&mut app, "127.0.0.1", 0);
+    save(&mut app);
+    app.start_sharing();
+    assert!(app.state.sharing.active);
+    assert!(app.state.sharing.checked().contains(&path));
+
+    let index = app
+        .state
+        .devices
+        .iter()
+        .position(|device| device.path == path)
+        .expect("detected device");
+    app.state.devices[index].identity = None;
+    let snapshot = app
+        .state
+        .sharing
+        .snapshot
+        .clone()
+        .expect("active sharing snapshot");
+    app.state.apply_sharing_snapshot(snapshot);
+    assert!(
+        app.state.sharing.pending_checked.contains(&path),
+        "the core-authoritative selection survives a transient missing identity"
+    );
+
+    app.state.begin_settings();
+    app.state.draft.local_echo = false;
+    save(&mut app);
+
+    assert!(app.state.sharing.active);
+    assert!(app.state.sharing.checked().contains(&path));
+    assert!(app.state.sharing.pending_checked.contains(&path));
+    assert!(app.state.settings.local_echo);
+    assert!(
+        app.state.notice.as_ref().is_some_and(|notice| {
+            notice.severity == Severity::Error && notice.text.contains("cannot verify")
+        }),
+        "save must refuse rather than silently revoke the checked device"
+    );
+    app.shutdown();
+}
+
+#[test]
 fn sharing_does_not_start_when_a_checked_device_has_no_current_identity() {
     let (fixture, devices) = Fixture::new();
     let mut app = fixture.app();
