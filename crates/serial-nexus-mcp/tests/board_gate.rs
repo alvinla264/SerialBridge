@@ -127,15 +127,12 @@ fn real_board_remote_mcp_stdio_gate() {
 
     let mcp_config = TempDir::new().expect("isolated MCP configuration");
     let peers = write_private_pairing_file(&mcp_config, address, &pairing.ai, &pairing.host);
-    let socket_text = socket.to_string_lossy().into_owned();
-    let gateway_socket_text = gateway_socket.to_string_lossy().into_owned();
     let peers_text = peers.to_string_lossy().into_owned();
     let config_text = mcp_config.path().to_string_lossy().into_owned();
-    let mut mcp = McpSession::spawn_with_env(
+    let mut mcp = McpSession::spawn_at_gateway(
         &socket,
+        &gateway_socket,
         &[
-            ("SERIAL_NEXUS_SOCKET", &socket_text),
-            ("SERIAL_NEXUS_GATEWAY_SOCKET", &gateway_socket_text),
             ("SERIAL_NEXUS_MCP_PEERS", &peers_text),
             ("XDG_CONFIG_HOME", &config_text),
         ],

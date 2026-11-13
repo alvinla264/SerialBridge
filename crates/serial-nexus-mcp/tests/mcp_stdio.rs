@@ -6,7 +6,7 @@ mod support;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use serial_nexus_client::{Client, ClientInfo};
+use serial_nexus_client::{Client, ClientInfo, GatewayConfig, GatewayServer};
 use support::{start_core, McpSession, SimulatedDevice, ToolReply};
 
 fn connect_with_control(mcp: &mut McpSession, port: &str) -> ToolReply {
@@ -73,6 +73,27 @@ fn local_tool_requires_terminal_gateway_even_when_core_is_running() {
         result.text.contains("gateway"),
         "unexpected local failure: {}",
         result.text
+    );
+}
+
+#[test]
+fn mcp_uses_an_already_running_terminal_gateway_without_starting_a_duplicate() {
+    let (_directory, socket) = start_core(Duration::from_secs(30));
+    let gateway_socket = socket.with_file_name("gateway.sock");
+    let _gateway = GatewayServer::start(GatewayConfig {
+        socket: gateway_socket.clone(),
+        core_socket: socket.clone(),
+    })
+    .expect("start terminal gateway for the core");
+
+    // Match the board gate's topology: it owns the gateway lifetime, then
+    // starts MCP against that existing socket rather than starting another.
+    let mut mcp = McpSession::spawn_at_gateway(&socket, &gateway_socket, &[]);
+    let listed = mcp.call_tool("list_devices", json!({}));
+    assert!(
+        !listed.is_error,
+        "MCP should use the already running gateway: {}",
+        listed.text
     );
 }
 
