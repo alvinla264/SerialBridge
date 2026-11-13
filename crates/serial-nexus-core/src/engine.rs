@@ -9,8 +9,8 @@ use serial_nexus_protocol::{
     decode_bytes, ClientKind, ControlReleaseReason, ControlState, DeviceStatus, DeviceSummary,
     ErrorBody, ErrorCode, Event, HelloParams, HelloResult, HistoryLine, Holder, OpenParams,
     OpenResult, ReadParams, ReadResult, Request, ResponseData, Role, ServerMessage,
-    ShareDevicesParams, ShareStartParams, Source, WriteParams, WriteResult, MAX_SHARED_DEVICES,
-    PROTOCOL_VERSION,
+    ShareCommitParams, ShareDevicesParams, SharePrepared, ShareStartParams, Source, WriteParams,
+    WriteResult, MAX_SHARED_DEVICES, PROTOCOL_VERSION,
 };
 
 use crate::config::CoreConfig;
@@ -172,6 +172,20 @@ pub struct Engine {
     /// keyed by device id with its canonical path. Kept until the I/O threads
     /// exit so revocation also reaches a device that already left the state.
     live_writes: Mutex<HashMap<u64, (String, device::WriteEpoch)>>,
+    /// The pinned node behind each currently listed device, keyed by path and
+    /// carrying the opaque token the terminal selected. Holding the identity
+    /// keeps the kernel from recycling its inode before a later ShareStart.
+    detected_tokens: Mutex<HashMap<String, (String, DeviceIdentity)>>,
+    next_engine_token: AtomicU64,
+    /// A checklist validated by SharePrepare, waiting for the owner to publish
+    /// its preferences and then commit it.
+    prepared_share: Mutex<Option<PreparedShare>>,
+}
+
+struct PreparedShare {
+    owner: u64,
+    token: String,
+    identities: Vec<DeviceIdentity>,
 }
 
 impl Engine {
@@ -198,6 +212,9 @@ impl Engine {
             sharing: Mutex::new(None),
             share_gate: RwLock::new(()),
             live_writes: Mutex::new(HashMap::new()),
+            detected_tokens: Mutex::new(HashMap::new()),
+            next_engine_token: AtomicU64::new(1),
+            prepared_share: Mutex::new(None),
         })
     }
 
@@ -406,6 +423,9 @@ impl Engine {
             Request::ShareStart(params) => self.start_sharing(client_id, params),
             Request::ShareStop => self.stop_sharing_from_owner(client_id),
             Request::ShareCheck(params) => self.check_shared_devices(client_id, params),
+            Request::ShareReplace(params) => self.replace_shared_devices(client_id, params),
+            Request::SharePrepare(params) => self.prepare_shared_devices(client_id, params),
+            Request::ShareCommit(params) => self.commit_shared_devices(client_id, params),
             Request::ShareUncheck(params) => self.uncheck_shared_devices(client_id, params),
             Request::ShareStatus => self.sharing_status(client_id),
         }
@@ -444,6 +464,12 @@ impl Engine {
         let state = self.state.lock().expect("state lock");
         let mut devices: Vec<DeviceSummary> = Vec::new();
         let mut seen = HashSet::new();
+        // Keep the last published cache available until the replacement is
+        // complete. Owner validation may run concurrently with discovery and
+        // must not observe a transiently empty map for unchanged devices.
+        let mut token_cache = self.detected_tokens.lock().expect("detected tokens lock");
+        let previous = token_cache.clone();
+        let mut tokens: HashMap<String, (String, DeviceIdentity)> = HashMap::new();
         for port in ports {
             seen.insert(port.path.clone());
             match state
@@ -454,26 +480,70 @@ impl Engine {
                 Some(device) => {
                     let mut entry = summary(device);
                     entry.description = port.description;
+                    entry.identity = Some(self.detected_token(
+                        &port.path,
+                        device.identity.clone(),
+                        &previous,
+                        &mut tokens,
+                    ));
                     devices.push(entry);
                 }
-                None => devices.push(DeviceSummary {
-                    path: port.path,
-                    description: port.description,
-                    open: false,
-                    device_id: None,
-                    baud: None,
-                    client_count: 0,
-                    control_holder: None,
-                }),
+                None => {
+                    let captured = DeviceIdentity::capture(&port.path).ok();
+                    let token = captured.as_ref().map(|identity| {
+                        self.detected_token(&port.path, identity.clone(), &previous, &mut tokens)
+                    });
+                    devices.push(DeviceSummary {
+                        path: port.path.clone(),
+                        description: port.description,
+                        identity: token,
+                        open: false,
+                        device_id: None,
+                        baud: None,
+                        client_count: 0,
+                        control_holder: None,
+                    });
+                }
             }
         }
         for device in state.devices.values() {
             if !seen.contains(&device.path) {
-                devices.push(summary(device));
+                let mut entry = summary(device);
+                entry.identity = Some(self.detected_token(
+                    &device.path,
+                    device.identity.clone(),
+                    &previous,
+                    &mut tokens,
+                ));
+                devices.push(entry);
             }
         }
+        *token_cache = tokens;
         devices.sort_by(|a, b| a.path.cmp(&b.path));
         serial_nexus_protocol::DevicesResult { devices }
+    }
+
+    /// Reuse a live node's token so a device the terminal checked keeps the
+    /// same identity across discovery; a different node gets a fresh token.
+    fn detected_token(
+        &self,
+        path: &str,
+        identity: DeviceIdentity,
+        previous: &HashMap<String, (String, DeviceIdentity)>,
+        tokens: &mut HashMap<String, (String, DeviceIdentity)>,
+    ) -> String {
+        let token = previous
+            .get(path)
+            .filter(|(_, cached)| cached.still_valid() && cached.canonical == identity.canonical)
+            .map(|(token, _)| token.clone())
+            .unwrap_or_else(|| {
+                format!(
+                    "snx-{}",
+                    self.next_engine_token.fetch_add(1, Ordering::SeqCst)
+                )
+            });
+        tokens.insert(path.to_string(), (token.clone(), identity));
+        token
     }
 
     fn open(&self, client_id: u64, params: OpenParams) -> Result<ResponseData, ErrorBody> {
@@ -1416,8 +1486,9 @@ impl Engine {
         }
     }
 
-    /// Mark already-open engine devices whose path is checked, so their events
-    /// and discovery entries are visible to remote clients.
+    /// Recompute every open device's sharing marker from the session in one
+    /// state-lock hold. Remote discovery never sees a half-updated list while
+    /// an allowlist replacement keeps most devices checked.
     fn refresh_shared_instances(&self, session: &SharingSession) {
         let checked: Vec<String> = session
             .snapshot()
@@ -1425,20 +1496,21 @@ impl Engine {
             .into_iter()
             .map(|device| device.path)
             .collect();
+        let authorized: HashMap<String, DeviceIdentity> = checked
+            .iter()
+            .filter_map(|path| session.authorize(path).ok().map(|id| (path.clone(), id)))
+            .collect();
         let mut state = self.state.lock().expect("state lock");
-        for path in checked {
-            let identity = session.authorize(&path).ok();
-            for device in state.devices.values_mut() {
-                if device.path == path {
-                    device.shared = identity
-                        .clone()
-                        .filter(|identity| device_matches_identity(device, identity));
-                    if device.shared.is_none() {
-                        // The open instance is not the checked node; never
-                        // authorize it for sharing.
-                        session.revoke_path(&device.path);
-                    }
-                }
+        for device in state.devices.values_mut() {
+            let allowed = authorized
+                .get(&device.path)
+                .cloned()
+                .filter(|identity| device_matches_identity(device, identity));
+            device.shared = allowed;
+            if device.shared.is_none() && checked.contains(&device.path) {
+                // The open instance is not the checked node; never authorize
+                // it for sharing.
+                session.revoke_path(&device.path);
             }
         }
     }
@@ -1471,6 +1543,17 @@ impl Engine {
         Ok(session)
     }
 
+    fn active_owner_session(&self, client_id: u64) -> Result<Arc<SharingSession>, ErrorBody> {
+        let session = self.owner_session(client_id)?;
+        if session.is_stopped() {
+            return Err(ErrorBody::new(
+                ErrorCode::ShuttingDown,
+                "sharing is stopping",
+            ));
+        }
+        Ok(session)
+    }
+
     /// Capture a detected device's identity. Checking never opens the device.
     fn detected_device(&self, path: &str) -> Result<DeviceIdentity, ErrorBody> {
         let identity = DeviceIdentity::capture(path).map_err(|error| {
@@ -1496,6 +1579,71 @@ impl Engine {
             ));
         }
         Ok(identity)
+    }
+
+    /// Validate and resolve a selected device set: every path must still be
+    /// the node the owner selected, an open instance must be the same node,
+    /// and duplicates collapse to one canonical path.
+    fn validated_shared_identities(
+        &self,
+        paths: &[String],
+        expected: &BTreeMap<String, String>,
+    ) -> Result<Vec<DeviceIdentity>, ErrorBody> {
+        let mut identities = Vec::new();
+        let mut seen = HashSet::new();
+        for path in paths {
+            // Detection is required even with a cached token: a device that
+            // vanished from enumeration must not be shared from stale state.
+            let detected = self.detected_device(path)?;
+            let expected_token = expected.get(path);
+            let identity = if let Some(expected_token) = expected_token {
+                // Resolve both discovery tokens and snapshot identity tokens
+                // through the current pinned discovery cache. A stale pin is
+                // rejected even if the kernel reuses its stat tuple.
+                let cached = self
+                    .detected_tokens
+                    .lock()
+                    .expect("detected tokens lock")
+                    .get(path)
+                    .filter(|(token, identity)| {
+                        token == expected_token || identity.token() == *expected_token
+                    })
+                    .map(|(_, identity)| identity.clone())
+                    .filter(|identity| {
+                        identity.still_valid() && identity.canonical == detected.canonical
+                    });
+                match cached {
+                    Some(identity) => identity,
+                    None => {
+                        return Err(ErrorBody::new(
+                            ErrorCode::DeviceFailed,
+                            format!("the device at {path} changed; check it again"),
+                        ))
+                    }
+                }
+            } else {
+                detected
+            };
+            let canonical = identity.canonical.clone();
+            let stale_open = {
+                let state = self.state.lock().expect("state lock");
+                state
+                    .devices
+                    .values()
+                    .find(|device| device.path == canonical)
+                    .map(|device| !device_matches_identity(device, &identity))
+            };
+            if stale_open == Some(true) {
+                return Err(ErrorBody::new(
+                    ErrorCode::DeviceFailed,
+                    "an open instance at this path is a different device; close it first",
+                ));
+            }
+            if seen.insert(canonical) {
+                identities.push(identity);
+            }
+        }
+        Ok(identities)
     }
 
     fn start_sharing(
@@ -1537,29 +1685,7 @@ impl Engine {
                 format!("at most {MAX_SHARED_DEVICES} devices may be shared"),
             ));
         }
-        let mut identities = Vec::new();
-        let mut seen = HashSet::new();
-        for path in &params.devices {
-            let identity = self.detected_device(path)?;
-            if let Some(device) = self
-                .state
-                .lock()
-                .expect("state lock")
-                .devices
-                .values()
-                .find(|device| device.path == identity.canonical)
-            {
-                if !device_matches_identity(device, &identity) {
-                    return Err(ErrorBody::new(
-                        ErrorCode::DeviceFailed,
-                        "an open instance at this path is a different device; close it first",
-                    ));
-                }
-            }
-            if seen.insert(identity.canonical.clone()) {
-                identities.push(identity);
-            }
-        }
+        let identities = self.validated_shared_identities(&params.devices, &params.expected)?;
         // Binding is synchronous: a failure here leaves sharing off.
         let prepared = share::prepare(client_id, &params, identities, self.share_limits())
             .map_err(|message| ErrorBody::new(ErrorCode::DeviceFailed, message))?;
@@ -1575,7 +1701,6 @@ impl Engine {
         drop(guard);
         drop(dead);
         // Only the new session's checked devices may be visible.
-        self.clear_shared_instances();
         self.refresh_shared_instances(&prepared.session);
         Ok(ResponseData::ShareStarted(prepared.info))
     }
@@ -1611,6 +1736,7 @@ impl Engine {
     /// Stop sharing: close the listener, disconnect every remote client and
     /// revoke the session's credentials.
     pub fn stop_sharing(&self) {
+        *self.prepared_share.lock().expect("prepared share lock") = None;
         // Hold the gate while revoking and stopping: a remote write admitted
         // concurrently either queued before the bump (and is dropped) or waits
         // here and then sees the stopped session.
@@ -1657,42 +1783,104 @@ impl Engine {
         client_id: u64,
         params: ShareDevicesParams,
     ) -> Result<ResponseData, ErrorBody> {
-        let session = self.owner_session(client_id)?;
-        if session.is_stopped() {
-            return Err(ErrorBody::new(
-                ErrorCode::ShuttingDown,
-                "sharing is stopping",
-            ));
-        }
-        for path in &params.devices {
-            let identity = self.detected_device(path)?;
-            let canonical = identity.canonical.clone();
-            let stale_open = {
-                let mut state = self.state.lock().expect("state lock");
-                state
+        let session = self.active_owner_session(client_id)?;
+        // Validate every path first, then add the whole batch at once. A
+        // failed batch leaves the allowlist exactly as it was.
+        let identities = self.validated_shared_identities(&params.devices, &params.expected)?;
+        let expired = session.check_many(identities.clone())?;
+        {
+            let mut state = self.state.lock().expect("state lock");
+            for identity in &identities {
+                if let Some(device) = state
                     .devices
                     .values_mut()
-                    .find(|device| device.path == canonical)
-                    .map(|device| {
-                        let matches = device_matches_identity(device, &identity);
-                        if matches {
-                            device.shared = Some(identity.clone());
-                        }
-                        !matches
-                    })
-            };
-            if stale_open == Some(true) {
-                return Err(ErrorBody::new(
-                    ErrorCode::DeviceFailed,
-                    "an open instance at this path is a different device; close it first",
-                ));
-            }
-            let expired = session.check(identity)?;
-            for path in expired {
-                self.revoke_path_everywhere(&path, &session);
+                    .find(|device| device.path == identity.canonical)
+                {
+                    if device_matches_identity(device, identity) {
+                        device.shared = Some(identity.clone());
+                    }
+                }
             }
         }
+        for path in expired {
+            let _ = self.revoke_path_everywhere(&path, &session, true);
+        }
         Ok(ResponseData::Sharing(session.snapshot()))
+    }
+
+    fn prepare_shared_devices(
+        &self,
+        client_id: u64,
+        params: ShareDevicesParams,
+    ) -> Result<ResponseData, ErrorBody> {
+        let _session = self.active_owner_session(client_id)?;
+        let identities = self.validated_shared_identities(&params.devices, &params.expected)?;
+        if identities.len() > MAX_SHARED_DEVICES {
+            return Err(ErrorBody::new(
+                ErrorCode::LimitExceeded,
+                format!("at most {MAX_SHARED_DEVICES} devices may be shared"),
+            ));
+        }
+        let token = format!(
+            "rep-{}",
+            self.next_engine_token.fetch_add(1, Ordering::SeqCst)
+        );
+        *self.prepared_share.lock().expect("prepared share lock") = Some(PreparedShare {
+            owner: client_id,
+            token: token.clone(),
+            identities,
+        });
+        Ok(ResponseData::SharePrepared(SharePrepared { token }))
+    }
+
+    fn commit_shared_devices(
+        &self,
+        client_id: u64,
+        params: ShareCommitParams,
+    ) -> Result<ResponseData, ErrorBody> {
+        let session = self.active_owner_session(client_id)?;
+        let prepared = self
+            .prepared_share
+            .lock()
+            .expect("prepared share lock")
+            .take()
+            .filter(|prepared| prepared.owner == client_id && prepared.token == params.token);
+        let Some(prepared) = prepared else {
+            return Err(ErrorBody::new(
+                ErrorCode::BadRequest,
+                "the prepared checklist is no longer available; save again",
+            ));
+        };
+        self.apply_shared_identities(&session, prepared.identities)
+    }
+
+    fn apply_shared_identities(
+        &self,
+        session: &SharingSession,
+        identities: Vec<DeviceIdentity>,
+    ) -> Result<ResponseData, ErrorBody> {
+        // Serialize authorization removal and write-epoch invalidation against
+        // remote admission. A command is either queued before the bump (then
+        // dropped by the writer) or admitted after the revoked ACL (denied).
+        let _gate = self.share_gate.write().expect("share gate");
+        let (expired, removed) = session.replace(identities)?;
+        for path in expired.into_iter().chain(removed) {
+            let _ = self.revoke_path_everywhere(&path, session, true);
+        }
+        self.refresh_shared_instances(session);
+        Ok(ResponseData::Sharing(session.snapshot()))
+    }
+
+    fn replace_shared_devices(
+        &self,
+        client_id: u64,
+        params: ShareDevicesParams,
+    ) -> Result<ResponseData, ErrorBody> {
+        let session = self.active_owner_session(client_id)?;
+        let identities = self.validated_shared_identities(&params.devices, &params.expected)?;
+        // Revoke while the removed instances still carry their shared marker;
+        // revalidation needs it to detach remote clients and cancel waits.
+        self.apply_shared_identities(&session, identities)
     }
 
     fn uncheck_shared_devices(
@@ -1701,38 +1889,18 @@ impl Engine {
         params: ShareDevicesParams,
     ) -> Result<ResponseData, ErrorBody> {
         let session = self.owner_session(client_id)?;
+        let gate = self.share_gate.write().expect("share gate");
         let mut revoked = Vec::new();
         for path in &params.devices {
             if let Some(identity) = session.uncheck(path) {
-                let device_ids: Vec<u64> = self
-                    .state
-                    .lock()
-                    .expect("state lock")
-                    .devices
-                    .iter()
-                    .filter(|(_, device)| device.path == identity.canonical)
-                    .map(|(id, _)| *id)
-                    .collect();
-                // Invalidate queued remote writes for this device even when
-                // their client has already detached.
-                {
-                    let mut state = self.state.lock().expect("state lock");
-                    let live = self.live_writes.lock().expect("live writes lock");
-                    for (path, epoch) in live.values().map(|(path, epoch)| (path, epoch)) {
-                        if *path == identity.canonical {
-                            epoch.fetch_add(1, Ordering::SeqCst);
-                        }
-                    }
-                    for device_id in &device_ids {
-                        if let Some(device) = state.devices.get_mut(device_id) {
-                            device.write_epoch.fetch_add(1, Ordering::SeqCst);
-                            device.shared = None;
-                        }
-                    }
-                }
-                revoked.extend(device_ids);
+                // Share replacement and individual unchecks use the same
+                // authorization, attached-instance, and queued-write revoke.
+                revoked.extend(self.revoke_path_everywhere(&identity.canonical, &session, false));
             }
         }
+        // Authorization and epochs are now revoked atomically with write
+        // admission. Drop the gate before queue notifications or serial cleanup.
+        drop(gate);
         // Revoke every requested device before any blocking serial cleanup, so
         // a stalled first device cannot delay authorization removal for later
         // ones. Local clients and other devices are untouched.
@@ -1745,26 +1913,9 @@ impl Engine {
         match self.sharing_session() {
             Some(session) if session.owner_client_id() == client_id => {
                 for path in session.expire_invalid() {
-                    let ids: Vec<u64> = self
-                        .state
-                        .lock()
-                        .expect("state lock")
-                        .devices
-                        .iter()
-                        .filter(|(_, device)| device.path == path)
-                        .map(|(id, _)| *id)
-                        .collect();
-                    for id in ids {
-                        self.revalidate_shared_instance(id, &session);
-                    }
-                    // The device may already be out of the open map but still
-                    // draining in the live-writes registry.
-                    let live = self.live_writes.lock().expect("live writes lock");
-                    for (registered, epoch) in live.values() {
-                        if *registered == path {
-                            epoch.fetch_add(1, Ordering::SeqCst);
-                        }
-                    }
+                    // Revoke open instances and queued writes through the same
+                    // path used by allowlist replacement.
+                    let _ = self.revoke_path_everywhere(&path, &session, true);
                 }
                 Ok(ResponseData::Sharing(session.snapshot()))
             }
@@ -1868,11 +2019,28 @@ impl Engine {
             let removed_device = !removed.is_empty();
             self.cleanup_devices_async(removed);
             if !removed_device {
-                self.emit(vec![Event::DeviceClosed {
-                    device_id,
-                    path: path.clone(),
-                    reason: "device is no longer shared".into(),
-                }]);
+                // The device stays open for local clients, so only the remote
+                // clients that were attached get the closure. Sending it to
+                // everyone would look like an unplug locally.
+                let event = ServerMessage::Event {
+                    event: Event::DeviceClosed {
+                        device_id,
+                        path: path.clone(),
+                        reason: "device is no longer shared".into(),
+                    },
+                };
+                let receivers: Vec<Sender<ServerMessage>> = self
+                    .clients
+                    .lock()
+                    .expect("clients lock")
+                    .iter()
+                    .filter(|(id, _)| remote_ids.contains(id))
+                    .map(|(_, record)| record.tx.clone())
+                    .collect();
+                for tx in receivers {
+                    // A full slow-peer queue must never stall local revocation.
+                    let _ = tx.try_send(event.clone());
+                }
             }
             session.clear_vacated(&path);
         }
@@ -1928,7 +2096,13 @@ impl Engine {
                     }
                 });
                 for path in expired_paths {
-                    self.revoke_path_everywhere(&path, &session);
+                    let _ = self.revoke_path_everywhere(&path, &session, true);
+                }
+                // Identity tokens are owner-only pinning data. A remote sees
+                // which checked devices it may use, never how many other nodes
+                // the host has pinned.
+                for device in &mut devices.devices {
+                    device.identity = None;
                 }
                 Ok(ResponseData::Devices(devices))
             }
@@ -1973,6 +2147,9 @@ impl Engine {
             Request::ShareStart(_)
             | Request::ShareStop
             | Request::ShareCheck(_)
+            | Request::ShareReplace(_)
+            | Request::SharePrepare(_)
+            | Request::ShareCommit(_)
             | Request::ShareUncheck(_)
             | Request::ShareStatus => Err(ErrorBody::new(
                 ErrorCode::PermissionDenied,
@@ -2012,7 +2189,12 @@ impl Engine {
         self.begin_write(client_id, params)
     }
 
-    fn revoke_path_everywhere(&self, path: &str, session: &SharingSession) {
+    fn revoke_path_everywhere(
+        &self,
+        path: &str,
+        session: &SharingSession,
+        revalidate_instances: bool,
+    ) -> Vec<u64> {
         let ids: Vec<u64> = self
             .state
             .lock()
@@ -2022,8 +2204,18 @@ impl Engine {
             .filter(|(_, device)| device.path == path)
             .map(|(id, _)| *id)
             .collect();
-        for id in ids {
-            self.revalidate_shared_instance(id, session);
+        if revalidate_instances {
+            for id in &ids {
+                self.revalidate_shared_instance(*id, session);
+            }
+        } else {
+            let mut state = self.state.lock().expect("state lock");
+            for id in &ids {
+                if let Some(device) = state.devices.get_mut(id) {
+                    device.shared = None;
+                    device.write_epoch.fetch_add(1, Ordering::SeqCst);
+                }
+            }
         }
         let live = self.live_writes.lock().expect("live writes lock");
         for (registered, epoch) in live.values() {
@@ -2031,6 +2223,7 @@ impl Engine {
                 epoch.fetch_add(1, Ordering::SeqCst);
             }
         }
+        ids
     }
 
     fn detach_remote_path(&self, path: &str, reason: &str) {
@@ -2406,6 +2599,7 @@ fn summary(device: &Device) -> DeviceSummary {
     DeviceSummary {
         path: device.path.clone(),
         description: None,
+        identity: Some(device.identity.token()),
         open: true,
         device_id: Some(device.id),
         baud: Some(device.baud),
@@ -2570,6 +2764,26 @@ fn record_written_lines(device: &mut Device, source: Source, data: &[u8]) {
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+
+    #[test]
+    fn an_expected_identity_rejects_a_replacement_node() {
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let path = directory.path().join("node");
+        std::fs::write(&path, b"a").expect("node");
+        let path_text = path.to_string_lossy().into_owned();
+        let old = DeviceIdentity::capture(&path_text).expect("old");
+        let expected = old.token();
+        assert_eq!(expected, old.clone().token());
+
+        std::fs::remove_file(&path).expect("unlink old node");
+        std::fs::write(&path, b"b").expect("replacement node");
+        let new = DeviceIdentity::capture(&path_text).expect("new");
+        assert_ne!(
+            new.token(),
+            expected,
+            "a replacement must not inherit the selected identity"
+        );
+    }
 
     #[test]
     fn an_open_instance_only_matches_its_own_live_node() {

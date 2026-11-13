@@ -7,7 +7,7 @@ use crossterm::event::{self, KeyEventKind, MouseEvent};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
-use serial_nexus_client::{Client, ClientConfig, ClientInfo};
+use serial_nexus_client::{Client, ClientConfig, ClientInfo, GatewayConfig, GatewayServer};
 use serial_nexus_terminal::app::App;
 use serial_nexus_terminal::input::translate;
 use serial_nexus_terminal::render::{render, stream_body_area};
@@ -26,6 +26,10 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Own the per-user MCP gateway for exactly this foreground terminal
+    // lifetime. A second supported terminal fails before touching the core.
+    let gateway = GatewayServer::start(GatewayConfig::default())?;
+
     // The client library's connect seam starts serial-nexus-core when needed.
     let config = ClientConfig::new(ClientInfo::human("serial-nexus-terminal"));
     let client = Client::connect(config)?;
@@ -57,6 +61,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let result = event_loop(&mut terminal, &mut app);
 
     app.shutdown();
+    drop(gateway);
     drop(terminal);
     // Drop the guard before printing an error, so it lands on a sane terminal.
     drop(guard);

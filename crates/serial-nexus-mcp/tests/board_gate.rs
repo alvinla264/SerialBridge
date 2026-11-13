@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use serial_nexus_client::{Client, ClientInfo};
+use serial_nexus_client::{Client, ClientInfo, GatewayConfig, GatewayServer};
 use serial_nexus_protocol::{PairingSecret, ShareBind};
 use support::{start_core, McpSession};
 use tempfile::TempDir;
@@ -102,6 +102,12 @@ fn real_board_remote_mcp_stdio_gate() {
     // Both locations are fresh temp paths. The MCP child is explicitly pinned
     // to this host's core and cannot autostart a default/user core.
     let (core_directory, socket) = start_core(Duration::from_secs(30));
+    let gateway_socket = core_directory.path().join("gateway.sock");
+    let _gateway = GatewayServer::start(GatewayConfig {
+        socket: gateway_socket.clone(),
+        core_socket: socket.clone(),
+    })
+    .expect("start gateway for this board-gate core");
     let owner = Client::connect_to_socket(&socket, ClientInfo::human("board-gate-owner"))
         .expect("local owner connects");
     let local = owner
@@ -121,13 +127,12 @@ fn real_board_remote_mcp_stdio_gate() {
 
     let mcp_config = TempDir::new().expect("isolated MCP configuration");
     let peers = write_private_pairing_file(&mcp_config, address, &pairing.ai, &pairing.host);
-    let socket_text = socket.to_string_lossy().into_owned();
     let peers_text = peers.to_string_lossy().into_owned();
     let config_text = mcp_config.path().to_string_lossy().into_owned();
-    let mut mcp = McpSession::spawn_with_env(
+    let mut mcp = McpSession::spawn_at_gateway(
         &socket,
+        &gateway_socket,
         &[
-            ("SERIAL_NEXUS_SOCKET", &socket_text),
             ("SERIAL_NEXUS_MCP_PEERS", &peers_text),
             ("XDG_CONFIG_HOME", &config_text),
         ],

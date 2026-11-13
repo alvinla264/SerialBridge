@@ -19,9 +19,9 @@ and one real LAN address, and never flashes the board or changes firmware.
    still works after sharing stops.
 
 It does not test firmware behaviour beyond what the existing firmware prints or
-echoes, the terminal sharing UI (a follow-on task), or NAT/firewalls. The
-`serial-nexus-mcp` crate adds a companion ignored gate that exercises the actual
-MCP-over-stdio path against the same existing board echo firmware.
+echoes, the terminal UI workflow itself, or NAT/firewalls. The `serial-nexus-mcp`
+crate adds a companion ignored gate that exercises the actual MCP-over-stdio
+pairing-file path against the same existing board echo firmware.
 
 ## Prerequisites
 

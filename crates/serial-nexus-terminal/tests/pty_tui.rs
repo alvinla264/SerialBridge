@@ -12,12 +12,13 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use serial_nexus_client::{Client, ClientInfo};
+use serial_nexus_client::{Client, ClientInfo, GatewayConfig, GatewayServer};
+use serial_nexus_protocol::GatewayTarget;
 use support::tui::{
     TuiSession, KEY_CTRL_BRACKET, KEY_CTRL_Q, KEY_CTRL_S, KEY_DOWN, KEY_ENTER, KEY_ESC,
     KEY_PAGE_UP, KEY_TAB, KEY_UP, STEP,
 };
-use support::{connect, start_core, SimulatedDevice};
+use support::{connect, start_core, wait_until, SimulatedDevice};
 use tempfile::TempDir;
 
 const ROWS: u16 = 24;
@@ -66,6 +67,51 @@ impl Fixture {
     fn settings(&self) -> String {
         fs::read_to_string(self.settings_file()).unwrap_or_default()
     }
+}
+
+#[test]
+fn terminal_owns_a_single_gateway_and_exit_disconnects_its_mcp_clients() {
+    let fixture = Fixture::new();
+    let mut tui = fixture.tui();
+    tui.wait_for_text("focus: sidebar");
+    let gateway_path = fixture.socket.with_file_name("gateway.sock");
+    wait_until(Duration::from_secs(3), || gateway_path.exists());
+    let mcp = Client::connect_to_gateway(
+        &gateway_path,
+        GatewayTarget::Local,
+        ClientInfo::ai("gateway-lifecycle-test"),
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "MCP client connects through the running terminal: {error}; {}",
+            tui.text()
+        )
+    });
+    let devices = mcp.list_devices().unwrap().devices;
+    assert!(devices.iter().any(|entry| entry.path == fixture.first.path));
+    assert!(devices
+        .iter()
+        .any(|entry| entry.path == fixture.second.path));
+
+    let duplicate = match GatewayServer::start(GatewayConfig {
+        socket: gateway_path.clone(),
+        core_socket: fixture.socket.clone(),
+    }) {
+        Err(error) => error,
+        Ok(_) => panic!("a second supported terminal must be rejected"),
+    };
+    assert_eq!(duplicate.kind(), std::io::ErrorKind::AddrInUse);
+    assert!(duplicate.to_string().contains("already running"));
+
+    tui.quit();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while mcp.is_connected() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !mcp.is_connected(),
+        "terminal exit must close gateway clients"
+    );
 }
 
 /// The screen row of a device in the sidebar's list.

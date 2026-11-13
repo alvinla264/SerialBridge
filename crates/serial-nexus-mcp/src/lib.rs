@@ -2,19 +2,22 @@
 //! stdio.
 //!
 //! The server is launched by the AI host. It speaks newline-delimited
-//! JSON-RPC 2.0 on stdin/stdout and connects to the one local `serial-nexus-core`
-//! through `serial-nexus-client` (starting it when nothing answers). All
-//! device rules - one AI writer per device, baud conflicts, history, partial
-//! lines, waited writes, idle expiry - belong to the core; this crate only
-//! offers `list_devices`, `connect`, `disconnect`, `read` and `send`.
+//! JSON-RPC 2.0 on stdin/stdout and routes every local or explicit remote
+//! endpoint through the running foreground terminal's bounded, versioned
+//! per-user gateway. MCP never auto-starts the core or dials remote hosts.
+//! Each MCP session/endpoint gets its own upstream client; gateway exit closes
+//! local and outgoing remote sessions. The gateway has no sharing controls.
 //!
-//! A tool call may name an `ip` and `port` instead of using the local core, in
-//! which case it reaches a device another host shares. The credential for that
-//! endpoint comes from the human's private pairing file and never travels
-//! through tool arguments or results.
+//! Remote pairing credentials stay in the laptop user's private pairing file;
+//! only its path and the requested endpoint cross local IPC, never a
+//! credential. Sharing is opt-in and local-only MCP operations do not require
+//! it. Same-user programs are trusted and can impersonate the terminal or
+//! enable sharing; the gateway is a supported routing/lifetime rule, not a
+//! same-UID security barrier.
 //!
 //! ```text
-//! AI host  <-- MCP over stdio -->  serial-nexus-mcp  <-- Unix socket -->  serial-nexus-core
+//! AI host <-- MCP stdio --> serial-nexus-mcp <-- bounded IPC --> terminal gateway
+//!                                                      <-- core socket / verified TLS --> upstream
 //! ```
 
 pub mod jsonrpc;

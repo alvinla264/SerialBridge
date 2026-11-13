@@ -4,11 +4,14 @@ Terms used by SerialNexus. The client tasks (MCP server, terminal) should use
 these words in their tool names and user-facing text.
 
 - **Core** (`serial-nexus-core`): the one process per local user that owns
-  serial devices and serves clients over a Unix socket. It starts automatically
-  when the first client connects and exits after a grace period with no
-  clients.
-- **Client**: anything connected to the core. An **AI client** is the MCP
-  server; a **human client** is the terminal.
+  serial devices and serves clients over a Unix socket. In the supported
+  workflow, the foreground terminal starts it for local access; MCP requires
+  that terminal's gateway and does not start the core itself. The core exits
+  after a grace period with no clients.
+- **Client**: anything connected to the core. An **AI client** is an MCP
+  server using AI role; a **human client** uses human role. Local role labels are
+  claims from programs running as the laptop user, not proof of which program
+  made the connection.
 - **Device**: one serial port the core has open (e.g. `/dev/ttyUSB0`). The core
   identifies an open device by a numeric **device id**.
 - **Open**: the first client to use a device chooses its **baud rate**; later
@@ -45,8 +48,9 @@ these words in their tool names and user-facing text.
   (`list_devices`, `connect`, `disconnect`, `read`, `send`). It returns one
   bounded result; there is no continuous stream.
 - **Settings**: the human terminal's own preferences, stored per user in
-  `terminal.json` (`local_echo` and `scrollback`, both on by default). Not core
-  configuration.
+  `terminal.json` (`local_echo`, `scrollback`, `share_address` and `share_port`).
+  Echo and scrollback default on; sharing defaults to loopback at port 7331. The
+  checked-device list and pairing credentials are session-only, not settings.
 - **Local echo**: showing the keys a human types in the **stream** in the
   terminal's own view. On by default; the `local_echo` **setting** turns it off
   for a device that echoes what it receives.
@@ -84,26 +88,43 @@ these words in their tool names and user-facing text.
   core shutdown). Local clients receive events from their subscription onward;
   remote clients receive only authorized device events, from a bounded
   best-effort queue.
-- **Sharing session**: opt-in LAN access to a set of **checked devices**,
-  started by a **local owner** and alive only while that owner's local terminal
-  connection is. It has its own TLS certificate authority, host certificate and
-  pairing credentials; stopping it, or losing the owner connection, closes the
+- **Sharing session**: an opt-in TLS listener started from the laptop user's
+  terminal workflow on one concrete IPv4 or IPv6 address and port. It grants
+  remote access only to **checked devices** and lives only while its owner
+  connection is active. Stopping it or losing that connection closes the
   listener, disconnects every **remote client** and revokes the credentials.
-  Off by default; there is no listener until one is started.
-- **Local owner**: the local human terminal connection that started a sharing
-  session. Only it may check, uncheck, inspect or stop sharing.
-- **Checked device**: a detected device the owner added to the session's
-  in-memory allowlist. The checked list is the whole of what remote clients may
-  see or use; a checked device need not be open locally.
-- **Device identity**: the concrete device node behind a path, captured as
-  `(st_dev, st_ino, st_rdev)` and an `O_PATH` descriptor that pins the node,
-  captured when the device is checked. It is revalidated at authorization,
-  open time and before a checked device is listed to remote clients; an
-  unplugged, replaced, or relinked device (link count changed) loses its
-  authorization (the entry expires and must be checked again) instead of
-  letting a replacement inherit it. An
-  ordinary last-detach close keeps the entry while the pinned node is still
-  the same live device.
+  Off by default; there is no listener until the local user starts one.
+- **Local owner**: the local core connection that started a sharing session;
+  the supported workflow is the human terminal. Programs running as the same
+  laptop user are trusted and can claim the same role, so owner status does not
+  authenticate the executable. Other OS users and unpaired remote clients are
+  not trusted by this rule.
+- **Terminal gateway**: the one supported foreground terminal process per
+  laptop that hosts the local MCP IPC socket. Every MCP call—local or to an
+  explicitly paired remote endpoint—uses a separate gateway connection and
+  upstream client for that MCP session. Local MCP needs the terminal but not
+  LAN sharing. A second supported terminal exits clearly. Gateway exit closes
+  its local and outgoing remote MCP sessions; terminal exit also ends any share
+  it owns. This is a supported routing/lifetime rule, not a security barrier
+  against same-user programs.
+- **Same-user trust**: every program running as the laptop user may impersonate
+  the terminal or client role, access local serial through the core, and start
+  or change LAN sharing. The private Unix sockets exclude different OS users;
+  they do not isolate programs owned by the same user.
+- **Checked device**: a detected device path the owner selected in the
+  settings checklist for the session's in-memory allowlist. Checking is
+  session-only, defaults to none and does not open the device. The core's
+  checked list, not the UI, authorizes what remote clients may see or use.
+- **Device identity**: the concrete device node behind a path, internally
+  captured as `(st_dev, st_ino, st_rdev)` and link count with an `O_PATH`
+  descriptor pinning the node. A process-local opaque generation token labels
+  that capture on discovery, snapshots and checklist requests; a fresh capture
+  gets a fresh token, so a recycled inode cannot inherit the old selection.
+  It is revalidated at authorization, open time and before a checked device is
+  listed to remote clients; an unplugged, replaced, or relinked device (link
+  count changed) loses its authorization (the entry expires and must be checked
+  again) instead of letting a replacement inherit it. An ordinary last-detach
+  close keeps the entry while the pinned node is still the same live device.
 - **Unchecked**: a device removed from the allowlist. Remote access to it is
   revoked immediately, remote work pending on it fails, and local clients and
   other checked devices keep working. Checking it again is explicit.
@@ -120,13 +141,33 @@ these words in their tool names and user-facing text.
 - **Remote frame**: one length-prefixed JSON message on a remote connection
   (4-byte big-endian length, then that many bytes), bounded to keep one peer
   from exhausting memory.
-- **Remote endpoint**: the exact IP address and TCP port of a **sharing
-  session**'s listener. It, not a device path or a device id, identifies a
-  **remote session**, so two hosts may share the same path without colliding.
+
+LAN sharing and remote-client terms (the core contract is in
+[docs/sharing.md](docs/sharing.md)):
+
+- **Checklist draft**: the checked set being edited in the settings view. Save
+  applies it (and writes the preferences); Cancel throws it away; a failed save
+  applies neither.
+- **Pairing information**: what a remote client needs for one session: the
+  bound endpoint, host name, CA certificate, pinned host certificate
+  fingerprint and one credential. Shown only to the owner.
+- **Human credential** and **MCP credential**: the two distinct secrets a
+  session generates. The core derives the remote client's role from which one
+  matched; neither is persisted by the host or sent to a device.
+- **Pairing view**: the owner-only right-pane view (`p`) showing the bound
+  address, host authentication data, both credentials and the checked devices.
+- **Connect form**: the remote terminal's memory-only form for a host address,
+  port, CA certificate, fingerprint and human credential. A wrong certificate
+  is refused rather than trusted.
+- **Endpoint**: one connected host. `Local` is this machine's core; each
+  connected remote host is a separate endpoint with its own transport and
+  grouping heading. A **session key** is an endpoint plus that host's device
+  id, so equal paths or ids on two hosts cannot collide.
+- **Remote endpoint**: the exact IP address and TCP port of a sharing session's
+  listener. It, not a device path or device id, identifies a remote session.
 - **Pairing file**: the MCP host user's private per-endpoint file
-  (`mcp-peers.json`) with one **paired host** and **pairing credential** per
-  **remote endpoint**. Readable by its owner only; never an AI tool argument
-  and never part of a tool result.
-- **Remote session**: one MCP server's connection to one **remote endpoint**,
-  with its own device ids, control and history, separate from the local core
-  and from every other endpoint.
+  (`mcp-peers.json`) with one paired host and MCP pairing credential per remote
+  endpoint. Readable by its owner only; never an AI tool argument or tool result.
+- **Remote session**: one MCP server's connection to one remote endpoint, with
+  its own device ids, control and history, separate from the local core and
+  every other endpoint.

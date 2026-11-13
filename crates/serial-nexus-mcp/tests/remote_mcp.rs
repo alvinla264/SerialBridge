@@ -13,7 +13,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use serial_nexus_client::{Client, ClientInfo};
+use serial_nexus_client::{Client, ClientInfo, GatewayConfig, GatewayServer};
 use serial_nexus_protocol::{PairingSecret, ShareBind, ShareSessionInfo};
 use support::{start_core, wait_until, McpSession, SimulatedDevice};
 use tempfile::TempDir;
@@ -91,7 +91,10 @@ fn spawn(socket: &Path, peers: &Path) -> McpSession {
 }
 
 fn remote_args(host: &SharedHost, rest: Value) -> Value {
-    let (address, port) = host.endpoint();
+    remote_args_at(host.endpoint(), rest)
+}
+
+fn remote_args_at((address, port): (IpAddr, u16), rest: Value) -> Value {
     let mut object = rest.as_object().cloned().unwrap_or_default();
     object.insert("ip".into(), json!(address.to_string()));
     object.insert("port".into(), json!(port));
@@ -220,6 +223,217 @@ fn assert_no_secret(session: &McpSession, text: &str, info: &ShareSessionInfo) {
     let stderr = session.stderr_text();
     assert!(!stderr.contains(&info.ai.credential), "secret in stderr");
     assert!(!stderr.contains(&info.human.credential), "secret in stderr");
+}
+
+#[test]
+fn gateway_exit_disconnects_local_and_outgoing_remote_mcp_sessions() {
+    let mut device = SimulatedDevice::new();
+    let host = SharedHost::start(std::slice::from_ref(&device.path));
+    let peers = write_peers(&host.directory, vec![peer_entry(&host.info, &host.info.ai)]);
+    let gateway_path = host.directory.path().join("owned-gateway.sock");
+    let gateway = GatewayServer::start(GatewayConfig {
+        socket: gateway_path.clone(),
+        core_socket: host.socket.clone(),
+    })
+    .expect("start terminal gateway");
+    let duplicate = match GatewayServer::start(GatewayConfig {
+        socket: gateway_path.clone(),
+        core_socket: host.socket.clone(),
+    }) {
+        Err(error) => error,
+        Ok(_) => panic!("a second supported terminal must be rejected"),
+    };
+    assert_eq!(duplicate.kind(), std::io::ErrorKind::AddrInUse);
+    assert!(duplicate.to_string().contains("already running"));
+    let gateway_probe = Client::connect_to_gateway(
+        &gateway_path,
+        serial_nexus_protocol::GatewayTarget::Local,
+        ClientInfo::ai("gateway-policy-test"),
+    )
+    .expect("gateway policy probe");
+    let denied = [
+        gateway_probe
+            .start_sharing(ShareBind::new("127.0.0.1".parse().unwrap(), 0), vec![])
+            .unwrap_err(),
+        gateway_probe.stop_sharing().unwrap_err(),
+        gateway_probe.check_shared_devices(vec![]).unwrap_err(),
+        gateway_probe
+            .replace_shared_devices_expected(vec![], Default::default())
+            .unwrap_err(),
+        gateway_probe
+            .prepare_shared_devices_expected(vec![], Default::default())
+            .unwrap_err(),
+        gateway_probe
+            .commit_shared_devices("invalid-token".into())
+            .unwrap_err(),
+        gateway_probe.uncheck_shared_devices(vec![]).unwrap_err(),
+        gateway_probe.sharing_status().unwrap_err(),
+    ];
+    for error in denied {
+        assert_eq!(
+            error.code(),
+            Some(serial_nexus_client::ErrorCode::PermissionDenied),
+            "every sharing-administration request must be refused by the gateway"
+        );
+    }
+    drop(gateway_probe);
+    let peers = peers.to_string_lossy().into_owned();
+    let mut session = McpSession::spawn_at_gateway(
+        &host.socket,
+        &gateway_path,
+        &[("SERIAL_NEXUS_MCP_PEERS", &peers)],
+    );
+
+    let local = call(
+        &mut session,
+        "connect",
+        json!({"port": device.path, "request_control": false}),
+    );
+    let (local_text, local_error) = reply(&local);
+    assert!(!local_error, "{local_text}");
+    let remote = call(
+        &mut session,
+        "connect",
+        remote_args(&host, json!({"path": device.path, "request_control": true})),
+    );
+    assert!(
+        remote.get("result").is_some(),
+        "remote JSON-RPC error: {remote}"
+    );
+    let (remote_text, remote_error) = reply(&remote);
+    assert!(!remote_error, "{remote_text}");
+    let remote_id = remote["result"]["structuredContent"]["device_id"]
+        .as_u64()
+        .expect("remote device id");
+    let pending_write = session.start_request(
+        "tools/call",
+        json!({
+            "name": "send",
+            "arguments": remote_args(&host, json!({
+                "device": remote_id,
+                "text": "NO-RETRY",
+                "lines": 1,
+                "timeout_ms": 30_000,
+            })),
+        }),
+    );
+    assert_eq!(device.read_n(8, Duration::from_secs(5)), b"NO-RETRY");
+
+    let owner_device = host
+        .owner
+        .list_devices()
+        .unwrap()
+        .devices
+        .into_iter()
+        .find(|entry| entry.path == device.path)
+        .and_then(|entry| entry.device_id)
+        .expect("owner device id");
+    assert_eq!(host.owner.status(owner_device).unwrap().client_count, 3);
+    wait_until(Duration::from_secs(3), || {
+        host.owner
+            .sharing_status()
+            .is_ok_and(|snapshot| snapshot.remote_clients == 1)
+    });
+    let endpoint = host.endpoint();
+
+    // The terminal owns both the gateway and sharing-owner connection. Its
+    // exit closes all gateway sessions and then revokes the share.
+    drop(gateway);
+    drop(host.owner);
+    let write_response = session.response_for(&pending_write);
+    let (write_text, write_error) = reply(&write_response);
+    assert!(write_error, "gateway-exit write must fail: {write_text}");
+    assert!(
+        write_text.contains("uncertain") || write_text.contains("may have reached"),
+        "{write_text}"
+    );
+    assert!(
+        write_text.contains("not sent again") || write_text.contains("not replayed"),
+        "{write_text}"
+    );
+    assert!(device.read_for(Duration::from_millis(200)).is_empty());
+    wait_until(Duration::from_secs(5), || {
+        let observer = Client::connect_to_socket(&host.socket, ClientInfo::other("test-observer"))
+            .expect("observer");
+        observer
+            .sharing_status()
+            .is_ok_and(|snapshot| !snapshot.active)
+    });
+    let observer = Client::connect_to_socket(&host.socket, ClientInfo::other("test-observer"))
+        .expect("observer");
+    assert!(
+        observer
+            .list_devices()
+            .unwrap()
+            .devices
+            .iter()
+            .all(|entry| entry.path != device.path || !entry.open),
+        "gateway exit must detach local MCP from the serial device"
+    );
+    assert_eq!(observer.sharing_status().unwrap().remote_clients, 0);
+
+    let local_after = call(&mut session, "list_devices", json!({}));
+    let (local_after_text, local_after_error) = reply(&local_after);
+    assert!(
+        local_after_error,
+        "local MCP must be disconnected: {local_after_text}"
+    );
+    assert!(local_after_text.contains("gateway"), "{local_after_text}");
+    let remote_after = call(
+        &mut session,
+        "list_devices",
+        remote_args_at(endpoint, json!({})),
+    );
+    let (remote_after_text, remote_after_error) = reply(&remote_after);
+    assert!(
+        remote_after_error,
+        "remote MCP must be disconnected: {remote_after_text}"
+    );
+    assert!(remote_after_text.contains("gateway"), "{remote_after_text}");
+}
+
+#[test]
+fn remote_mcp_requires_gateway_and_never_dials_endpoint_directly() {
+    let device = SimulatedDevice::new();
+    let host = SharedHost::start(std::slice::from_ref(&device.path));
+    let peers = write_peers(&host.directory, vec![peer_entry(&host.info, &host.info.ai)]);
+    let peers = peers.to_string_lossy().into_owned();
+    let mut session = McpSession::spawn_without_gateway_with_env(
+        &host.socket,
+        &[("SERIAL_NEXUS_MCP_PEERS", &peers)],
+    );
+
+    let result = call(&mut session, "list_devices", remote_args(&host, json!({})));
+    let (text, is_error) = reply(&result);
+    assert!(is_error, "remote MCP without a terminal must fail: {text}");
+    assert!(text.contains("gateway"), "{text}");
+    assert_eq!(host.owner.sharing_status().unwrap().remote_clients, 0);
+}
+
+#[test]
+fn a_scrubbed_mcp_environment_does_not_inherit_the_gateway_pairing_file() {
+    let device = SimulatedDevice::new();
+    let host = SharedHost::start(std::slice::from_ref(&device.path));
+    let mut session = McpSession::spawn_with_env(
+        &host.socket,
+        &[
+            ("SERIAL_NEXUS_MCP_PEERS", ""),
+            ("XDG_CONFIG_HOME", ""),
+            ("HOME", ""),
+        ],
+    );
+
+    let result = call(&mut session, "list_devices", remote_args(&host, json!({})));
+    let (text, is_error) = reply(&result);
+    assert!(
+        is_error,
+        "remote MCP without its own pairing path must fail: {text}"
+    );
+    assert!(
+        text.contains("cannot locate the MCP pairing file"),
+        "{text}"
+    );
+    assert_eq!(host.owner.sharing_status().unwrap().remote_clients, 0);
 }
 
 #[test]

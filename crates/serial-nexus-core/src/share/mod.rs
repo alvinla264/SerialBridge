@@ -95,6 +95,21 @@ struct AuthorizedDevice {
     expired: bool,
 }
 
+fn insert_authorized_devices(
+    entries: &mut BTreeMap<String, AuthorizedDevice>,
+    identities: impl IntoIterator<Item = DeviceIdentity>,
+) {
+    for identity in identities {
+        entries.insert(
+            identity.canonical.clone(),
+            AuthorizedDevice {
+                identity,
+                expired: false,
+            },
+        );
+    }
+}
+
 struct SessionState {
     /// Canonical path to the identity authorized at check time.
     devices: BTreeMap<String, AuthorizedDevice>,
@@ -166,15 +181,7 @@ pub fn prepare(
     debug_assert!(!human.matches(&ai_credential));
 
     let mut allowlist = BTreeMap::new();
-    for identity in devices {
-        allowlist.insert(
-            identity.canonical.clone(),
-            AuthorizedDevice {
-                identity,
-                expired: false,
-            },
-        );
-    }
+    insert_authorized_devices(&mut allowlist, devices);
 
     let session = Arc::new(SharingSession {
         id: session_id.clone(),
@@ -217,6 +224,15 @@ pub fn prepare(
         },
     };
     Ok(Prepared { session, info })
+}
+
+fn mark_expired(state: &mut SessionState, expired: &mut Vec<String>) {
+    for entry in state.devices.values_mut() {
+        if !entry.expired && !entry.identity.still_valid() {
+            entry.expired = true;
+            expired.push(entry.identity.canonical.clone());
+        }
+    }
 }
 
 impl SharingSession {
@@ -319,38 +335,68 @@ impl SharingSession {
 
     /// Add one detected device to the allowlist (or refresh an expired entry).
     pub fn check(&self, identity: DeviceIdentity) -> Result<Vec<String>, ErrorBody> {
+        self.check_many(vec![identity])
+    }
+
+    /// Add several devices as one batch. The whole batch is refused before any
+    /// entry is inserted when it would exceed the limit, so a failed batch
+    /// never leaves a partial authorization behind.
+    pub fn check_many(&self, identities: Vec<DeviceIdentity>) -> Result<Vec<String>, ErrorBody> {
         let mut state = self.state.lock().expect("share state lock");
         // Mark vanished entries expired first, then drop them; otherwise a
         // sequence of unplugged checks retains descriptors without bound.
         let mut expired = Vec::new();
-        for entry in state.devices.values_mut() {
-            if !entry.expired && !entry.identity.still_valid() {
-                entry.expired = true;
-                expired.push(entry.identity.canonical.clone());
-            }
-        }
+        mark_expired(&mut state, &mut expired);
         state.devices.retain(|_, entry| !entry.expired);
-        if !state.devices.contains_key(&identity.canonical) {
-            let live = state
-                .devices
-                .values()
-                .filter(|entry| !entry.expired && entry.identity.still_valid())
-                .count();
-            if live >= MAX_SHARED_DEVICES {
-                return Err(ErrorBody::new(
-                    ErrorCode::LimitExceeded,
-                    format!("at most {MAX_SHARED_DEVICES} devices may be shared"),
-                ));
+        let live = state.devices.len();
+        let mut additions = 0;
+        let mut seen = std::collections::HashSet::new();
+        for identity in &identities {
+            if !state.devices.contains_key(&identity.canonical)
+                && seen.insert(identity.canonical.clone())
+            {
+                additions += 1;
             }
         }
-        state.devices.insert(
-            identity.canonical.clone(),
-            AuthorizedDevice {
-                identity,
-                expired: false,
-            },
-        );
+        if live.saturating_add(additions) > MAX_SHARED_DEVICES {
+            return Err(ErrorBody::new(
+                ErrorCode::LimitExceeded,
+                format!("at most {MAX_SHARED_DEVICES} devices may be shared"),
+            ));
+        }
+        insert_authorized_devices(&mut state.devices, identities);
         Ok(expired)
+    }
+
+    /// Replace the whole allowlist in one step. Nothing is inserted or
+    /// removed when the new set is too large, so a failed Save has no effect.
+    /// Returns the expired and removed canonical paths for revocation.
+    pub fn replace(
+        &self,
+        identities: Vec<DeviceIdentity>,
+    ) -> Result<(Vec<String>, Vec<String>), ErrorBody> {
+        let mut state = self.state.lock().expect("share state lock");
+        let mut expired = Vec::new();
+        mark_expired(&mut state, &mut expired);
+        let keep: std::collections::HashSet<String> = identities
+            .iter()
+            .map(|identity| identity.canonical.clone())
+            .collect();
+        if keep.len() > MAX_SHARED_DEVICES {
+            return Err(ErrorBody::new(
+                ErrorCode::LimitExceeded,
+                format!("at most {MAX_SHARED_DEVICES} devices may be shared"),
+            ));
+        }
+        let removed: Vec<String> = state
+            .devices
+            .keys()
+            .filter(|path| !keep.contains(*path) && !expired.contains(path))
+            .cloned()
+            .collect();
+        state.devices.retain(|path, _| keep.contains(path));
+        insert_authorized_devices(&mut state.devices, identities);
+        Ok((expired, removed))
     }
 
     /// Remove one device from the allowlist and return it when it was checked.
@@ -445,12 +491,7 @@ impl SharingSession {
     pub fn expire_invalid(&self) -> Vec<String> {
         let mut state = self.state.lock().expect("share state lock");
         let mut expired = Vec::new();
-        for entry in state.devices.values_mut() {
-            if !entry.expired && !entry.identity.still_valid() {
-                entry.expired = true;
-                expired.push(entry.identity.canonical.clone());
-            }
-        }
+        mark_expired(&mut state, &mut expired);
         expired
     }
 
@@ -466,7 +507,7 @@ impl SharingSession {
                 .filter(|entry| !entry.expired)
                 .map(|entry| SharedDevice {
                     path: entry.identity.canonical.clone(),
-                    identity: entry.identity.describe(),
+                    identity: entry.identity.token(),
                 })
                 .collect(),
             remote_clients: state.authenticated,

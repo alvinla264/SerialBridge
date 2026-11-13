@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 pub const SETTINGS_FILE: &str = "terminal.json";
 
 /// Preferences the terminal keeps between launches.
+///
+/// The sharing address and port are preferences; the list of shared devices
+/// is deliberately not here: checking a device is session-only and defaults to
+/// none.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TerminalSettings {
@@ -20,6 +24,10 @@ pub struct TerminalSettings {
     pub local_echo: bool,
     /// Keep device output around for scrolling back.
     pub scrollback: bool,
+    /// The concrete IPv4 or IPv6 address the host shares on. Not a secret.
+    pub share_address: String,
+    /// The port the host shares on; 0 asks the operating system for one.
+    pub share_port: u16,
 }
 
 impl Default for TerminalSettings {
@@ -27,6 +35,10 @@ impl Default for TerminalSettings {
         Self {
             local_echo: true,
             scrollback: true,
+            // Loopback is the safe default: reaching it from another machine
+            // takes a deliberate change of address.
+            share_address: "127.0.0.1".to_string(),
+            share_port: 7331,
         }
     }
 }
@@ -99,9 +111,64 @@ impl SettingsStore {
     /// file the terminal loaded. The staging file is created exclusively, so
     /// an existing entry (even a symlink) cannot redirect the write.
     pub fn save(&self, settings: &TerminalSettings) -> Result<(), SettingsError> {
+        let staging = self.stage(settings)?;
+        self.publish(staging)
+    }
+
+    /// Write `settings` to a staging file and return it. The live file is
+    /// untouched until [`publish`] succeeds, so a Save that fails later leaves
+    /// the previous preferences in place.
+    pub fn stage(&self, settings: &TerminalSettings) -> Result<PathBuf, SettingsError> {
         self.create_directory()?;
         let text = serde_json::to_string_pretty(settings)? + "\n";
-        write_atomic(&self.path, &staging_path(&self.path), &text)
+        let staging = staging_path(&self.path);
+        write_staging(&staging, &text)?;
+        Ok(staging)
+    }
+
+    /// Publish settings while keeping an exact rollback copy of the old file.
+    /// Call `confirm` only after the coordinated core change succeeds.
+    pub fn publish_reversibly(
+        &self,
+        staging: PathBuf,
+    ) -> Result<SettingsPublication, SettingsError> {
+        let backup = backup_path(&staging);
+        let previous = match fs::read(&self.path) {
+            Ok(bytes) => match write_staging_bytes(&backup, &bytes) {
+                Ok(()) => Some(backup),
+                Err(error) => {
+                    let _ = fs::remove_file(staging);
+                    return Err(error);
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                let _ = fs::remove_file(staging);
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = publish_staging(&staging, &self.path) {
+            if let Some(previous) = previous {
+                let _ = fs::remove_file(previous);
+            }
+            return Err(error);
+        }
+        Ok(SettingsPublication {
+            path: self.path.clone(),
+            previous,
+            confirmed: false,
+        })
+    }
+
+    /// Rename a staged file onto the live settings file.
+    pub fn publish(&self, staging: PathBuf) -> Result<(), SettingsError> {
+        self.publish_reversibly(staging)?.confirm();
+        Ok(())
+    }
+
+    /// Drop a staged file without touching the live settings.
+    pub fn discard(&self, staging: PathBuf) {
+        let _ = fs::remove_file(staging);
     }
 
     /// Write the defaults only when no file exists yet: a concurrent launch
@@ -130,8 +197,13 @@ impl SettingsStore {
 /// Write `text` to `temporary`, then rename it onto `path`. The staging file
 /// is created exclusively, so an existing entry (even a symlink) cannot
 /// redirect the write or make it destroy another file.
+#[cfg(test)]
 fn write_atomic(path: &Path, temporary: &Path, text: &str) -> Result<(), SettingsError> {
     write_staging(temporary, text)?;
+    publish_staging(temporary, path)
+}
+
+fn publish_staging(temporary: &Path, path: &Path) -> Result<(), SettingsError> {
     if let Err(error) = fs::rename(temporary, path) {
         let _ = fs::remove_file(temporary);
         return Err(error.into());
@@ -139,16 +211,12 @@ fn write_atomic(path: &Path, temporary: &Path, text: &str) -> Result<(), Setting
     Ok(())
 }
 
-/// Write `text` to an exclusively created staging file.
-fn write_staging(temporary: &Path, text: &str) -> Result<(), SettingsError> {
+fn write_staging_bytes(temporary: &Path, bytes: &[u8]) -> Result<(), SettingsError> {
     let mut staging = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(temporary)?;
-    if let Err(error) = staging
-        .write_all(text.as_bytes())
-        .and_then(|()| staging.sync_all())
-    {
+    if let Err(error) = staging.write_all(bytes).and_then(|()| staging.sync_all()) {
         drop(staging);
         let _ = fs::remove_file(temporary);
         return Err(error.into());
@@ -156,8 +224,65 @@ fn write_staging(temporary: &Path, text: &str) -> Result<(), SettingsError> {
     Ok(())
 }
 
+/// A published settings file that can still be rolled back until confirmed.
+pub struct SettingsPublication {
+    path: PathBuf,
+    previous: Option<PathBuf>,
+    confirmed: bool,
+}
+
+impl SettingsPublication {
+    /// Keep the newly published settings and remove the rollback link.
+    pub fn confirm(mut self) {
+        self.confirmed = true;
+        if let Some(previous) = self.previous.take() {
+            let _ = fs::remove_file(previous);
+        }
+    }
+
+    /// Restore the prior file, or remove the newly created file if none existed.
+    pub fn rollback(mut self) -> Result<(), SettingsError> {
+        let result = self.restore();
+        if result.is_ok() {
+            self.confirmed = true;
+        }
+        result
+    }
+
+    fn restore(&mut self) -> Result<(), SettingsError> {
+        if let Some(previous) = &self.previous {
+            fs::rename(previous, &self.path)?;
+            self.previous = None;
+        } else {
+            match fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SettingsPublication {
+    fn drop(&mut self) {
+        if !self.confirmed {
+            let _ = self.restore();
+        }
+    }
+}
+
+/// Write `text` to an exclusively created staging file.
+fn write_staging(temporary: &Path, text: &str) -> Result<(), SettingsError> {
+    write_staging_bytes(temporary, text.as_bytes())
+}
+
 /// The staging file next to `path`. The name is unique to this process and
 /// moment, so a leftover staging file from a killed run does not block saves.
+fn backup_path(staging: &Path) -> PathBuf {
+    staging.with_extension("bak")
+}
+
 fn staging_path(path: &Path) -> PathBuf {
     let name = path
         .file_name()
@@ -198,6 +323,7 @@ mod tests {
         TerminalSettings {
             local_echo: false,
             scrollback: false,
+            ..TerminalSettings::default()
         }
     }
 
@@ -240,6 +366,38 @@ mod tests {
             .expect("load")
             .expect("file");
         assert_eq!(loaded, both_off());
+    }
+
+    #[test]
+    fn an_older_settings_file_keeps_the_sharing_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal.json");
+        std::fs::write(&path, "{\"local_echo\":false,\"scrollback\":false}").unwrap();
+        let settings = SettingsStore::at(&path)
+            .load()
+            .expect("load")
+            .expect("file");
+        assert_eq!(settings.share_address, "127.0.0.1");
+        assert_eq!(settings.share_port, 7331);
+    }
+
+    #[test]
+    fn sharing_preferences_round_trip_and_hold_no_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal.json");
+        let settings = TerminalSettings {
+            share_address: "::1".into(),
+            share_port: 9123,
+            ..TerminalSettings::default()
+        };
+        SettingsStore::at(&path).save(&settings).expect("save");
+        assert_eq!(
+            SettingsStore::at(&path).load().unwrap(),
+            Some(settings.clone())
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("9123"));
+        assert!(!text.contains("credential"));
     }
 
     #[test]
@@ -298,6 +456,36 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from("terminal.json")]);
+    }
+
+    #[test]
+    fn a_failed_coordinated_save_restores_the_exact_previous_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal.json");
+        let original = "{ \"local_echo\": true, \"custom\": \"kept\" }\n";
+        std::fs::write(&path, original).unwrap();
+        let store = SettingsStore::at(&path);
+
+        let staging = store.stage(&both_off()).unwrap();
+        let published = store.publish_reversibly(staging).unwrap();
+        assert_eq!(store.load().unwrap(), Some(both_off()));
+        published.rollback().unwrap();
+
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn rolling_back_a_first_save_removes_the_new_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/terminal.json");
+        let store = SettingsStore::at(&path);
+
+        let staging = store.stage(&both_off()).unwrap();
+        let published = store.publish_reversibly(staging).unwrap();
+        assert!(path.exists());
+        published.rollback().unwrap();
+
+        assert!(!path.exists());
     }
 
     #[test]

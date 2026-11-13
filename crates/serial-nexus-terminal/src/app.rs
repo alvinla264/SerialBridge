@@ -2,28 +2,112 @@
 //! not depend on a real terminal.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use crossterm::event::MouseEventKind;
 use ratatui::layout::Rect;
-use serial_nexus_client::{Client, ClientError};
-use serial_nexus_protocol::{DeviceSummary, Event};
+use serial_nexus_client::{Client, ClientError, RemoteClient, RemoteEndpoint};
+use serial_nexus_protocol::{
+    DeviceSummary, ErrorCode, Event, OpenResult, PairedHost, PairingRole, PairingSecret, ShareBind,
+    WaitSpec, WriteResult,
+};
 
 use crate::input::{echo_key, map_key, Action, Key};
-use crate::render::{hit_test, panes, settings_hit_test, Hit, SettingsHit};
+use crate::render::{hit_test, pairing_max_scroll, panes, settings_hit_test, Hit, SettingsHit};
 use crate::settings::{SettingsStore, TerminalSettings};
-use crate::state::{short_holder, AppState, DeviceEntry, Focus, Notice, View, SETTINGS_ROWS};
+use crate::state::{
+    short_holder, AppState, ConnectForm, DeviceEntry, EndpointId, Focus, Notice, SessionKey,
+    SidebarButton, View, LOCAL_ENDPOINT,
+};
+
+/// A disconnected or revoked remote session no longer belongs in the sidebar.
+fn remote_session_is_gone(error: &ClientError) -> bool {
+    error.is_device_gone()
+        || matches!(error, ClientError::Server(body) if body.code == ErrorCode::PermissionDenied)
+}
 
 /// Two clicks on the same cell within this long count as a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
+/// The device operations both transports share, so endpoint policy is chosen
+/// once instead of in every close/write/open site.
+trait EndpointTransport {
+    fn open(
+        &self,
+        path: &str,
+        baud: Option<u32>,
+        request_control: bool,
+    ) -> Result<OpenResult, ClientError>;
+    fn close(&self, device_id: u64) -> Result<(), ClientError>;
+    fn write_bytes(
+        &self,
+        device_id: u64,
+        bytes: &[u8],
+        wait: Option<WaitSpec>,
+    ) -> Result<WriteResult, ClientError>;
+}
+
+impl EndpointTransport for Client {
+    fn open(
+        &self,
+        path: &str,
+        baud: Option<u32>,
+        request_control: bool,
+    ) -> Result<OpenResult, ClientError> {
+        Client::open(self, path, baud, request_control)
+    }
+
+    fn close(&self, device_id: u64) -> Result<(), ClientError> {
+        Client::close(self, device_id)
+    }
+
+    fn write_bytes(
+        &self,
+        device_id: u64,
+        bytes: &[u8],
+        wait: Option<WaitSpec>,
+    ) -> Result<WriteResult, ClientError> {
+        Client::write_bytes(self, device_id, bytes, wait)
+    }
+}
+
+impl EndpointTransport for RemoteClient {
+    fn open(
+        &self,
+        path: &str,
+        baud: Option<u32>,
+        request_control: bool,
+    ) -> Result<OpenResult, ClientError> {
+        RemoteClient::open(self, path, baud, request_control)
+    }
+
+    fn close(&self, device_id: u64) -> Result<(), ClientError> {
+        RemoteClient::close(self, device_id)
+    }
+
+    fn write_bytes(
+        &self,
+        device_id: u64,
+        bytes: &[u8],
+        wait: Option<WaitSpec>,
+    ) -> Result<WriteResult, ClientError> {
+        RemoteClient::write_bytes(self, device_id, bytes, wait)
+    }
+}
 
 /// What the first click of a possible double-click landed on. It is kept by
 /// identity, not by cell: the first click can move the sidebar's viewport, so
 /// hit-testing the second click at the same cell would find another row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ClickTarget {
-    Device(String),
+    /// A device by endpoint and path. The endpoint keeps equal paths on two
+    /// hosts apart, so a double-click never opens the wrong one.
+    Device(EndpointId, String),
+    Share,
+    Connect,
     Settings,
 }
 
@@ -32,6 +116,17 @@ struct LastClick {
     column: u16,
     row: u16,
     target: Option<ClickTarget>,
+}
+
+/// One connected remote host. The link's own client and event stream keep its
+/// sessions and failures apart from every other host.
+struct RemoteLink {
+    id: EndpointId,
+    endpoint: RemoteEndpoint,
+    client: RemoteClient,
+    events: Receiver<Event>,
+    critical_event_overflow: Arc<AtomicBool>,
+    expected_closes: HashSet<u64>,
 }
 
 /// Wire the app to a connected core. The core is started by
@@ -46,6 +141,10 @@ pub struct App {
     settings_store: Option<SettingsStore>,
     /// The last click, for recognising a double-click on a device row.
     last_click: Option<LastClick>,
+    /// Remote hosts this terminal connected to, each with its own transport.
+    remotes: Vec<RemoteLink>,
+    /// The next endpoint number a remote link gets.
+    next_endpoint: u64,
 }
 
 impl App {
@@ -84,6 +183,8 @@ impl App {
             expected_closes: HashSet::new(),
             settings_store: store,
             last_click: None,
+            remotes: Vec::new(),
+            next_endpoint: 1,
         };
         app.refresh_devices();
         app
@@ -98,28 +199,233 @@ impl App {
         &self.client
     }
 
-    /// Re-read the device list from the core.
+    /// Re-read every connected host's device list. A remote host that fails
+    /// is dropped with its own sessions only; local devices and other remote
+    /// hosts keep working.
     pub fn refresh_devices(&mut self) {
+        let mut failures = Vec::new();
         match self.client.list_devices() {
             Ok(result) => {
-                let entries = result.devices.into_iter().map(device_entry).collect();
-                self.state.set_devices(entries);
+                let entries: Vec<DeviceEntry> =
+                    result.devices.into_iter().map(device_entry).collect();
+                self.state.set_endpoint_devices(LOCAL_ENDPOINT, entries);
+                self.state
+                    .reconcile_share_checks(&self.state.detected_local_identities());
             }
-            Err(error) => self.state.notice = Some(Notice::error(error.to_string())),
+            Err(error) => failures.push(error.to_string()),
+        }
+        failures.extend(self.refresh_remotes());
+        if !failures.is_empty() {
+            self.state.notice = Some(Notice::error(failures.join("; ")));
+        }
+        if self.state.sharing.active {
+            self.sync_share_status();
         }
     }
 
-    /// Drain live events into the state.
+    /// Re-list the devices of every remote host. A disconnected host is
+    /// removed without touching any other endpoint's sessions.
+    fn refresh_remotes(&mut self) -> Vec<String> {
+        let mut failed = Vec::new();
+        for link in &self.remotes {
+            match link.client.list_devices() {
+                Ok(result) => {
+                    let entries: Vec<DeviceEntry> = result
+                        .devices
+                        .into_iter()
+                        .map(|device| device_entry_on(link.id, device))
+                        .collect();
+                    self.state.set_endpoint_devices(link.id, entries);
+                }
+                Err(error) => failed.push((link.id, error)),
+            }
+        }
+        let mut notices = Vec::with_capacity(failed.len());
+        for (id, error) in failed {
+            let notice = format!(
+                "remote host unreachable: {}: {error}",
+                self.state.endpoint_label(id)
+            );
+            self.drop_remote(id, &notice);
+            notices.push(notice);
+        }
+        notices
+    }
+
+    /// Remove one remote host: its sessions, its devices and its link. Other
+    /// endpoints are untouched.
+    fn drop_remote(&mut self, id: EndpointId, reason: &str) {
+        self.state.remove_endpoint(id);
+        self.remotes.retain(|link| link.id != id);
+        // An open Connect form belongs to a host that is not connected yet, so
+        // an unrelated host going away must not close it (and redirect the
+        // credentials being typed into the shown device's stream).
+        self.state.notice = Some(Notice::error(reason.to_string()));
+    }
+
+    fn expected_closes_mut(&mut self, endpoint: EndpointId) -> Option<&mut HashSet<u64>> {
+        if endpoint == LOCAL_ENDPOINT {
+            Some(&mut self.expected_closes)
+        } else {
+            self.remotes
+                .iter_mut()
+                .find(|link| link.id == endpoint)
+                .map(|link| &mut link.expected_closes)
+        }
+    }
+
+    /// Drain live events from every host into the state. Events carry their
+    /// endpoint, so two hosts with equal device ids never cross streams.
     pub fn pump(&mut self) {
         while let Ok(event) = self.events.try_recv() {
-            if let Event::DeviceClosed { device_id, .. } = &event {
-                if self.expected_closes.remove(device_id) {
-                    self.state.remove_session(*device_id);
-                    continue;
-                }
-            }
-            self.state.apply_event(&event);
+            self.handle_event(LOCAL_ENDPOINT, event);
         }
+        let mut disconnected: Vec<EndpointId> = self
+            .remotes
+            .iter()
+            .filter(|link| !link.client.is_connected())
+            .map(|link| link.id)
+            .collect();
+        let overflowed: Vec<EndpointId> = self
+            .remotes
+            .iter()
+            .filter(|link| link.critical_event_overflow.swap(false, Ordering::SeqCst))
+            .map(|link| link.id)
+            .collect();
+        let pending: Vec<(EndpointId, Vec<Event>)> = self
+            .remotes
+            .iter()
+            .map(|link| {
+                let mut events = Vec::new();
+                loop {
+                    match link.events.try_recv() {
+                        Ok(event) => events.push(event),
+                        Err(crossbeam_channel::TryRecvError::Empty) => break,
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                            disconnected.push(link.id);
+                            break;
+                        }
+                    }
+                }
+                (link.id, events)
+            })
+            .collect();
+        for (id, events) in pending {
+            for event in events {
+                self.handle_event(id, event);
+            }
+        }
+        disconnected.sort_unstable();
+        disconnected.dedup();
+        for id in disconnected {
+            if self.remotes.iter().any(|link| link.id == id) {
+                self.drop_remote(id, "remote host disconnected: its event stream closed");
+            }
+        }
+        for id in overflowed {
+            if self.remotes.iter().any(|link| link.id == id) {
+                self.reconcile_remote_after_event_overflow(id);
+            }
+        }
+    }
+
+    fn reconcile_remote_after_event_overflow(&mut self, id: EndpointId) {
+        let Some(client) = self
+            .remotes
+            .iter()
+            .find(|link| link.id == id)
+            .map(|link| link.client.clone())
+        else {
+            return;
+        };
+        if !client.is_connected() {
+            self.drop_remote(id, "remote host disconnected: its event stream closed");
+            return;
+        }
+        let sessions: Vec<SessionKey> = self
+            .state
+            .sessions
+            .keys()
+            .filter(|key| key.endpoint == id)
+            .copied()
+            .collect();
+        let mut closed = Vec::new();
+        let mut failed = Vec::new();
+        for key in sessions {
+            let path = self
+                .state
+                .sessions
+                .get(&key)
+                .map(|session| session.path.clone())
+                .unwrap_or_default();
+            match client.status(key.device_id) {
+                Ok(status) => {
+                    if let Some(session) = self.state.sessions.get_mut(&key) {
+                        session.control = status.control.holder.as_ref().map(short_holder);
+                        session.control_id = status
+                            .control
+                            .holder
+                            .as_ref()
+                            .map(|holder| holder.client_id);
+                    }
+                }
+                Err(error) if remote_session_is_gone(&error) => {
+                    self.state.remove_session(key);
+                    closed.push(path);
+                }
+                Err(error) => failed.push(format!("{path}: {error}")),
+            }
+        }
+        self.state.notice = Some(if !closed.is_empty() {
+            Notice::error(format!(
+                "remote session closed while its event queue was full: {}",
+                closed.join(", ")
+            ))
+        } else if !failed.is_empty() {
+            Notice::error(format!(
+                "remote event queue overflowed; session status could not be fully refreshed: {}",
+                failed.join("; ")
+            ))
+        } else {
+            Notice::info("remote event queue overflowed; active session status was refreshed")
+        });
+    }
+
+    fn handle_event(&mut self, endpoint: EndpointId, event: Event) {
+        let Some(expected) = self.expected_closes_mut(endpoint) else {
+            return;
+        };
+        if let Event::DeviceClosed { device_id, .. } = &event {
+            if expected.remove(device_id) {
+                self.state.remove_session(SessionKey {
+                    endpoint,
+                    device_id: *device_id,
+                });
+                return;
+            }
+        }
+        if matches!(
+            &event,
+            Event::TransportClosed { .. } | Event::CoreShutdown { .. }
+        ) {
+            if endpoint != LOCAL_ENDPOINT {
+                let id = endpoint;
+                let reason = match &event {
+                    Event::TransportClosed { reason } => reason.clone(),
+                    Event::CoreShutdown { reason } => reason.clone(),
+                    _ => String::new(),
+                };
+                self.drop_remote(id, &format!("remote host disconnected: {reason}"));
+                return;
+            }
+            // A read failure does not necessarily close the writer socket;
+            // explicitly tear down the owner transport so the core observes
+            // EOF and revokes the listener and credentials.
+            self.client.shutdown_transport();
+            self.state.sharing.clear_session();
+            self.state.close_pairing_view();
+        }
+        self.state.apply_endpoint_event(endpoint, &event);
     }
 
     /// Handle one key. In the focused stream, keys go to the shown device and
@@ -133,13 +439,7 @@ impl App {
         match action {
             Action::Quit => self.state.quit = true,
             Action::Select(delta) => self.select_row(delta),
-            Action::OpenSelected => {
-                if self.state.settings_button_selected() {
-                    self.open_settings();
-                } else {
-                    self.open_selected();
-                }
-            }
+            Action::OpenSelected => self.activate_selected(),
             Action::DisconnectSelected => self.disconnect_selected(),
             Action::StartBaudPrompt => self.start_baud_prompt(),
             Action::ToggleFocus => self.toggle_focus(),
@@ -160,8 +460,24 @@ impl App {
             Action::SettingsToggle => {
                 self.state.toggle_draft();
             }
+            Action::SettingsBeginEdit => {
+                self.state.begin_settings_edit();
+            }
+            Action::SettingsEditChar(ch) => self.state.settings_edit_push(ch),
+            Action::SettingsEditBackspace => self.state.settings_edit_backspace(),
+            Action::SettingsEditDone => self.state.end_settings_edit(),
             Action::SettingsSave => self.save_settings(),
             Action::SettingsCancel => self.state.cancel_settings(),
+            Action::ShareToggle => self.toggle_sharing(),
+            Action::OpenPairing => self.open_pairing(),
+            Action::ConnectRemote => self.start_connect(),
+            Action::ConnectChar(ch) => self.connect_push(ch),
+            Action::ConnectBackspace => self.connect_backspace(),
+            Action::ConnectNext(delta) => self.connect_next_field(delta),
+            Action::ConnectSubmit => self.submit_connect(),
+            Action::ConnectCancel => self.leave_connect(),
+            Action::LeavePairing => self.leave_pairing(),
+            Action::PairingScroll(delta) => self.scroll_pairing(delta),
             Action::Ignore => {}
         }
     }
@@ -192,12 +508,15 @@ impl App {
             ));
             return;
         };
-        let device_id = session.device_id;
+        let key = SessionKey {
+            endpoint: session.endpoint,
+            device_id: session.device_id,
+        };
         if !self.state.settings.scrollback {
             self.state.notice = Some(Notice::error("scrollback is off in the settings"));
             return;
         }
-        self.state.show_device(device_id);
+        self.state.show_device(key);
         if let Some(session) = self.state.shown_session_mut() {
             session.screen.scroll_to_bottom();
         }
@@ -223,13 +542,17 @@ impl App {
         self.state.focus = Focus::Right;
     }
 
-    /// Show one attached session in the right pane and give it the keyboard.
-    fn show_session(&mut self, device_id: u64) {
+    /// Show one attached session (a test seam for a user switching streams).
+    pub fn show_session_now(&mut self, key: SessionKey) {
+        self.focus_session(key);
+    }
+
+    fn focus_session(&mut self, key: SessionKey) {
         // A device opened or joined by mouse or keyboard is the surface the
         // human now works on; a baud prompt for another row must not keep the
         // keys.
         self.state.prompt = None;
-        self.state.show_device(device_id);
+        self.state.show_device(key);
         self.show_live_stream();
     }
 
@@ -290,6 +613,17 @@ impl App {
                 self.select_row_index(index);
                 return;
             }
+            Some(Hit::Share) => {
+                self.state.select_index(self.state.devices.len());
+                self.toggle_sharing();
+                return;
+            }
+            Some(Hit::Connect) => {
+                self.state
+                    .select_index(self.state.devices.len().saturating_add(1));
+                self.start_connect();
+                return;
+            }
             Some(Hit::Settings) => {
                 self.open_settings();
                 return;
@@ -308,13 +642,23 @@ impl App {
             self.state.focus = Focus::Right;
             if self.state.view == View::Settings {
                 match settings_hit_test(&self.state, right, column, row) {
-                    Some(SettingsHit::Flag(index)) => {
-                        self.state.settings_row = index.min(SETTINGS_ROWS - 1);
-                        self.state.toggle_draft();
+                    Some(SettingsHit::Flag(index)) if index < self.state.settings_row_count() => {
+                        self.state.settings_row = index;
+                        self.state.end_settings_edit();
+                        match self.state.settings_kind(index) {
+                            Some(row) if row.is_toggle() => {
+                                self.state.toggle_draft();
+                            }
+                            Some(row) if row.is_text_field() => {
+                                self.state.begin_settings_edit();
+                            }
+                            None => {}
+                            _ => unreachable!("settings row classification is exhaustive"),
+                        }
                     }
                     Some(SettingsHit::Save) => self.save_settings(),
                     Some(SettingsHit::Cancel) => self.state.cancel_settings(),
-                    None => {}
+                    Some(SettingsHit::Flag(_)) | None => {}
                 }
             }
         }
@@ -341,7 +685,15 @@ impl App {
                 });
                 if double {
                     let target = self.last_click.take().and_then(|last| last.target);
-                    self.activate_target(target);
+                    // A device needs the second click to open it, and Settings
+                    // is idempotent. Share and Connect acted on the first
+                    // click; running them again would undo or reset it.
+                    if !matches!(
+                        target,
+                        Some(ClickTarget::Share) | Some(ClickTarget::Connect)
+                    ) {
+                        self.activate_target(target);
+                    }
                 } else {
                     // Remember what this click landed on before it moves the
                     // sidebar's viewport; the second click of a double-click
@@ -369,7 +721,9 @@ impl App {
                 .state
                 .devices
                 .get(index)
-                .map(|device| ClickTarget::Device(device.path.clone())),
+                .map(|device| ClickTarget::Device(device.endpoint, device.path.clone())),
+            Some(Hit::Share) => Some(ClickTarget::Share),
+            Some(Hit::Connect) => Some(ClickTarget::Connect),
             Some(Hit::Settings) => Some(ClickTarget::Settings),
             None => None,
         }
@@ -385,20 +739,22 @@ impl App {
 
     fn activate_target(&mut self, target: Option<ClickTarget>) {
         match target {
-            Some(ClickTarget::Device(path)) => {
+            Some(ClickTarget::Device(endpoint, path)) => {
                 self.state.prompt = None;
                 self.state.focus = Focus::Sidebar;
                 if let Some(index) = self
                     .state
                     .devices
                     .iter()
-                    .position(|device| device.path == path)
+                    .position(|device| device.endpoint == endpoint && device.path == path)
                 {
                     self.state.select_index(index);
                     self.open_selected();
                 }
             }
             Some(ClickTarget::Settings) => self.open_settings(),
+            Some(ClickTarget::Share) => self.toggle_sharing(),
+            Some(ClickTarget::Connect) => self.start_connect(),
             // The first click already did all there is to do (focus a pane).
             None => {}
         }
@@ -429,26 +785,599 @@ impl App {
         false
     }
 
-    /// Save the draft settings, then keep the draft and go back to the shown
-    /// device's live stream.
+    /// Activate the highlighted sidebar row: a device opens or joins, a button
+    /// does what it says.
+    fn activate_selected(&mut self) {
+        match self.state.selected_button() {
+            Some(SidebarButton::Share) => self.toggle_sharing(),
+            Some(SidebarButton::Connect) => self.start_connect(),
+            Some(SidebarButton::Settings) => self.open_settings(),
+            None => self.open_selected(),
+        }
+    }
+
+    /// Save the draft settings and checklist, then keep the draft and go back
+    /// to the shown device's live stream.
     ///
-    /// The draft becomes the settings in effect only after the file was
-    /// written: a failed save, or no settings file to write, leaves the
-    /// options as they were and stays in the settings so the draft is not
-    /// lost. The terminal never claims a save it did not make.
+    /// The draft becomes the settings in effect only after both the core
+    /// accepted the checklist and the file was written. A refused checklist
+    /// change or a failed write leaves the options as they were and stays in
+    /// the settings, so nothing is claimed that did not happen.
+    fn restore_settings_checklists(
+        &mut self,
+        draft_checked: crate::state::Checklist,
+        pending_checked: crate::state::Checklist,
+    ) {
+        self.state.draft_checked = draft_checked;
+        self.state.sharing.pending_checked = pending_checked;
+    }
+
     fn save_settings(&mut self) {
+        self.state.end_settings_edit();
+        let address_text = self.state.draft.share_address.trim().to_string();
+        let (address, scope) = match RemoteEndpoint::parse_address(&address_text) {
+            Ok(parsed) => parsed,
+            Err(message) => {
+                self.state.notice = Some(Notice::error(format!("settings not saved: {message}")));
+                return;
+            }
+        };
+        let port: u16 = match self.state.port_text.trim().parse() {
+            Ok(port) => port,
+            Err(_) => {
+                self.state.notice = Some(Notice::error(
+                    "settings not saved: the share port is not a number from 0 to 65535",
+                ));
+                return;
+            }
+        };
+        let bind = ShareBind::with_scope(address, port, scope);
+        if let Err(message) = bind.validate() {
+            self.state.notice = Some(Notice::error(format!("settings not saved: {message}")));
+            return;
+        }
+        self.state.draft.share_address = address_text;
+        self.state.draft.share_port = port;
+
+        // A temporary loss of identity must not turn an unrelated settings
+        // save into an implicit removal from the core's active allowlist. The
+        // human can retry after discovery recovers, or explicitly uncheck it.
+        if let Some(snapshot) = self
+            .state
+            .sharing
+            .snapshot
+            .as_ref()
+            .filter(|_| self.state.sharing.active)
+        {
+            let detected = self.state.detected_local_identities();
+            let expected = self.state.draft_checked.identities();
+            let unverified_checked = snapshot.checked.iter().any(|device| {
+                self.state.draft_checked.contains(&device.path)
+                    && !matches!(
+                        (detected.get(&device.path), expected.get(&device.path)),
+                        (Some(Some(current)), Some(recorded)) if current == recorded
+                    )
+            });
+            if unverified_checked {
+                self.state.notice = Some(Notice::error(
+                    "settings not saved: cannot verify an active shared device identity; refresh discovery and try again, or uncheck that device",
+                ));
+                return;
+            }
+        }
+
+        // Preserve the human's draft for every failed save, even if current
+        // device discovery requires pruning it before authorization.
+        let original_draft_checked = self.state.draft_checked.clone();
+        let original_pending_checked = self.state.sharing.pending_checked.clone();
+        // A replacement at a reused path must be checked again; stale UI state
+        // is never turned into an authorization.
+        self.state.drop_replaced_checks();
+
         let draft = self.state.draft.clone();
-        let Some(store) = &self.settings_store else {
+        let draft_checked = self.state.draft_checked.clone();
+        let Some(store) = self.settings_store.clone() else {
+            self.restore_settings_checklists(original_draft_checked, original_pending_checked);
             self.state.notice = Some(Notice::error("settings not saved: no settings file"));
             return;
         };
-        match store.save(&draft) {
-            Ok(()) => {
-                self.state.commit_settings();
-                self.state.notice = Some(Notice::info("settings saved"));
+        let active = self.state.sharing.active;
+        let desired: Vec<String> = draft_checked.iter().cloned().collect();
+
+        // drop_replaced_checks reconciles every checked path against current
+        // detection, so this map contains identities captured for surviving
+        // paths only.
+        let expected = self.state.draft_checked.identities();
+
+        let mut staged = Some(match store.stage(&draft) {
+            Ok(staged) => staged,
+            Err(error) => {
+                self.restore_settings_checklists(
+                    original_draft_checked.clone(),
+                    original_pending_checked.clone(),
+                );
+                self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
+                return;
+            }
+        });
+
+        let mut prepared = None;
+        if active {
+            match self
+                .client
+                .prepare_shared_devices_expected(desired.clone(), expected)
+            {
+                Ok(token) => prepared = Some(token),
+                Err(error) => {
+                    if let Some(staged) = staged.take() {
+                        store.discard(staged);
+                    }
+                    self.restore_settings_checklists(
+                        original_draft_checked.clone(),
+                        original_pending_checked.clone(),
+                    );
+                    self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
+                    return;
+                }
+            }
+        }
+
+        // Publish the preferences before committing the checklist, but keep an
+        // exact rollback copy until the core confirms. A filesystem failure
+        // must never detach sessions for a checklist whose Save failed.
+        let mut published = match store.publish_reversibly(staged.take().expect("staged settings"))
+        {
+            Ok(published) => Some(published),
+            Err(error) => {
+                self.restore_settings_checklists(
+                    original_draft_checked.clone(),
+                    original_pending_checked.clone(),
+                );
+                self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
+                return;
+            }
+        };
+
+        let mut committed_checklist = false;
+        if let Some(token) = prepared {
+            match self.client.commit_shared_devices(token) {
+                Ok(snapshot) => {
+                    let _ = self.state.apply_sharing_snapshot(snapshot);
+                    committed_checklist = true;
+                }
+                Err(error) => {
+                    let uncertain = matches!(
+                        error,
+                        ClientError::Timeout(_) | ClientError::WriteUncertain(_)
+                    );
+                    if uncertain {
+                        self.sync_share_status();
+                        committed_checklist = self.state.sharing.active
+                            && draft_checked == self.state.sharing.checked();
+                    }
+                    if !committed_checklist {
+                        let rollback = published
+                            .take()
+                            .expect("published settings before core commit")
+                            .rollback();
+                        self.state.draft_checked = original_draft_checked.clone();
+                        if !uncertain {
+                            self.state.sharing.pending_checked = original_pending_checked.clone();
+                        }
+                        let message = match rollback {
+                            Ok(()) if uncertain => format!(
+                                "settings save is unknown: {error}; the core may have applied the checklist — check it and save again"
+                            ),
+                            Ok(()) => format!("settings not saved: {error}"),
+                            Err(rollback_error) => format!(
+                                "settings save is unknown: {error}; previous preferences could not be restored: {rollback_error}"
+                            ),
+                        };
+                        self.state.notice = Some(Notice::error(message));
+                        return;
+                    }
+                }
+            }
+        }
+
+        published
+            .take()
+            .expect("settings publication remains live")
+            .confirm();
+        if committed_checklist {
+            // The accepted snapshot is authoritative; only now replace the
+            // user's attempted draft with the core's committed checklist.
+            self.state.draft_checked = self.state.sharing.pending_checked.clone();
+        }
+        self.state.commit_settings();
+        self.state.notice = Some(Notice::info("settings saved"));
+    }
+
+    pub fn toggle_sharing(&mut self) {
+        if self.state.sharing.active {
+            self.stop_sharing();
+        } else {
+            self.start_sharing();
+        }
+    }
+
+    /// Turn sharing on deliberately. At least one device must be checked and
+    /// the saved bind address must be one concrete IPv4 or IPv6 address; a
+    /// bind failure is shown and leaves sharing off.
+    pub fn start_sharing(&mut self) {
+        if self.state.sharing.active {
+            self.state.notice = Some(Notice::info("sharing is already on"));
+            return;
+        }
+        if self.refuse_if_unsaved_settings() {
+            return;
+        }
+        self.state.drop_replaced_checks();
+        let devices: Vec<String> = self.state.sharing.pending_checked.iter().cloned().collect();
+        if devices.is_empty() {
+            self.state.notice = Some(Notice::error(
+                "check at least one device in Settings before starting to share",
+            ));
+            return;
+        }
+        let bind = match self.share_bind() {
+            Ok(bind) => bind,
+            Err(message) => {
+                self.state.notice = Some(Notice::error(format!("sharing not started: {message}")));
+                return;
+            }
+        };
+        let expected = self.state.sharing.pending_checked.identities();
+        match self.client.start_sharing_expected(bind, devices, expected) {
+            Ok(info) => {
+                self.state.sharing.active = true;
+                self.state.sharing.pairing = Some(info);
+                self.sync_share_status();
+                self.state.view = View::Pairing;
+                self.state.focus = Focus::Right;
+                self.state.prompt = None;
+                self.state.pairing_scroll = 0;
+                self.state.notice = Some(Notice::info(
+                    "sharing on — the pairing view shows the credentials",
+                ));
             }
             Err(error) => {
-                self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
+                if matches!(
+                    error,
+                    ClientError::Timeout(_) | ClientError::WriteUncertain(_)
+                ) {
+                    // The core may have accepted ShareStart before the answer
+                    // was lost. Keep the stop control available and ask the
+                    // core what is really true instead of claiming it is off.
+                    self.state.sharing.active = true;
+                    self.sync_share_status();
+                    if self.state.sharing.active {
+                        // The start response is the only copy of the fresh
+                        // credentials. If it was lost, stop the session rather
+                        // than leave an active listener whose pairing cannot
+                        // be shown to its owner.
+                        self.stop_sharing();
+                    }
+                    self.state.notice = Some(Notice::error(if self.state.sharing.active {
+                        format!(
+                            "sharing start is unknown: {error}; pairing information was lost — press s to stop the session"
+                        )
+                    } else {
+                        format!(
+                            "sharing start response was lost: {error}; the session was stopped because pairing information is unavailable — start sharing again"
+                        )
+                    }));
+                } else {
+                    self.state.sharing.clear_session();
+                    self.state.notice =
+                        Some(Notice::error(format!("sharing not started: {error}")));
+                }
+            }
+        }
+    }
+
+    /// The saved sharing endpoint, validated as one concrete address.
+    fn share_bind(&self) -> Result<ShareBind, String> {
+        let (address, scope) =
+            RemoteEndpoint::parse_address(self.state.settings.share_address.trim())?;
+        let bind = ShareBind::with_scope(address, self.state.settings.share_port, scope);
+        bind.validate()?;
+        Ok(bind)
+    }
+
+    /// Stop sharing, which revokes both credentials and disconnects every
+    /// remote client. The checked selection stays for this launch only.
+    pub fn stop_sharing(&mut self) {
+        if !self.state.sharing.active {
+            self.state.notice = Some(Notice::info("sharing is already off"));
+            return;
+        }
+        match self.client.stop_sharing() {
+            Ok(()) => {
+                self.state.sharing.clear_session();
+                if self.state.view == View::Pairing {
+                    // Stop may come from the sidebar; do not hand the keys to
+                    // the stream without an explicit focus change.
+                    self.state.close_pairing_view();
+                }
+                self.state.notice = Some(Notice::info("sharing stopped"));
+            }
+            Err(error) => {
+                self.state.notice = Some(Notice::error(format!("sharing not stopped: {error}")));
+                self.sync_share_status();
+            }
+        }
+    }
+
+    /// Show the owner's pairing information. Only the terminal that started
+    /// the session may see it, and only while the session is running.
+    pub fn open_pairing(&mut self) {
+        if !self.state.sharing.active {
+            self.state.notice = Some(Notice::error(
+                "sharing is off: press s or use the Share button to start it",
+            ));
+            return;
+        }
+        if self.refuse_if_unsaved_settings() {
+            return;
+        }
+        self.state.prompt = None;
+        self.state.view = View::Pairing;
+        self.state.focus = Focus::Right;
+        self.state.pairing_scroll = 0;
+    }
+
+    fn leave_pairing(&mut self) {
+        self.show_live_stream();
+    }
+
+    fn scroll_pairing(&mut self, delta: i32) {
+        let next = self.state.pairing_scroll as i32 + delta;
+        let max = pairing_max_scroll(&self.state);
+        self.state.pairing_scroll = next.clamp(0, max as i32) as usize;
+    }
+
+    /// Ask a remote host for its address, port and pairing information. The
+    /// form's values stay in memory; nothing is written to the settings file
+    /// or sent to a serial device.
+    pub fn start_connect(&mut self) {
+        if self.refuse_if_unsaved_settings() {
+            return;
+        }
+        self.state.prompt = None;
+        if let Some(form) = &mut self.state.connect {
+            form.error = None;
+        } else {
+            self.state.connect = Some(ConnectForm::new());
+        }
+        self.state.view = View::Connect;
+        self.state.focus = Focus::Right;
+    }
+
+    fn leave_connect(&mut self) {
+        self.state.connect = None;
+        self.show_live_stream();
+        self.state.focus = Focus::Sidebar;
+    }
+
+    pub fn connect_push(&mut self, ch: char) {
+        if let Some(form) = &mut self.state.connect {
+            form.push(ch);
+        }
+    }
+
+    pub fn connect_backspace(&mut self) {
+        if let Some(form) = &mut self.state.connect {
+            form.backspace();
+        }
+    }
+
+    pub fn connect_next_field(&mut self, delta: i32) {
+        if let Some(form) = &mut self.state.connect {
+            form.next_field(delta);
+        }
+    }
+
+    /// Authenticate the encrypted host and add its approved devices. A wrong
+    /// certificate, address, port or credential keeps the form open with the
+    /// reason and never silently trusts the host.
+    pub fn submit_connect(&mut self) {
+        let Some(mut form) = self.state.connect.take() else {
+            return;
+        };
+        let result = self.connect_remote(&form);
+        match result {
+            Ok((id, label)) => {
+                let existing_notice = self.state.notice.clone();
+                self.state.remote_labels.insert(id, label.clone());
+                self.state.connect = None;
+                self.show_live_stream();
+                self.state.focus = Focus::Sidebar;
+                let refresh_failures = self.refresh_remotes();
+                if self.remotes.iter().any(|link| link.id == id) {
+                    if refresh_failures.is_empty() {
+                        if existing_notice.is_none() || self.state.notice == existing_notice {
+                            self.state.notice = Some(Notice::info(format!(
+                                "connected to {label}: its checked devices are in the sidebar"
+                            )));
+                        }
+                    } else {
+                        let mut notices = refresh_failures;
+                        if let Some(Notice { text, .. }) = existing_notice {
+                            if !notices.iter().any(|notice| notice == &text) {
+                                notices.insert(0, text);
+                            }
+                        }
+                        self.state.notice = Some(Notice::error(format!(
+                            "connected to {label}; {}",
+                            notices.join("; ")
+                        )));
+                    }
+                }
+            }
+            Err(error) => {
+                form.error = Some(error);
+                self.state.connect = Some(form);
+            }
+        }
+    }
+
+    /// Dial and authenticate one host, then register its endpoint. Every
+    /// failure leaves nothing behind.
+    fn connect_remote(&mut self, form: &ConnectForm) -> Result<(EndpointId, String), String> {
+        let (address, scope) = RemoteEndpoint::parse_address(form.address.trim())?;
+        let port: u16 = form
+            .port
+            .trim()
+            .parse()
+            .map_err(|_| "the port is not a number from 1 to 65535".to_string())?;
+        if port == 0 {
+            return Err("the port must be between 1 and 65535".to_string());
+        }
+        let fingerprint = form.fingerprint.trim().to_ascii_lowercase();
+        if fingerprint.len() != 64 || !fingerprint.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Err("the host fingerprint is not a SHA-256 hex value".to_string());
+        }
+        if form.ca.trim().is_empty() {
+            return Err("enter the host's CA certificate from its pairing view".to_string());
+        }
+        if form.credential.trim().is_empty() {
+            return Err("enter the host's human pairing credential".to_string());
+        }
+        let host_name = address.to_string();
+        let paired = PairedHost {
+            address: ShareBind::with_scope(address, port, scope).socket_addr(),
+            host_name,
+            ca_cert_der_b64: form.ca.trim().to_string(),
+            host_cert_fingerprint_sha256: fingerprint,
+        };
+        let secret = PairingSecret {
+            role: PairingRole::Human,
+            credential: form.credential.trim().to_string(),
+        };
+        let endpoint = RemoteEndpoint::from_socket_addr(paired.address).canonical();
+        let existing_id = self
+            .remotes
+            .iter()
+            .find(|link| link.endpoint == endpoint)
+            .map(|link| link.id);
+        if let Some(existing_id) = existing_id.filter(|existing_id| {
+            self.remotes.iter().any(|link| {
+                link.id == *existing_id
+                    && link.endpoint == endpoint
+                    && link.client.is_connected()
+                    && link.client.matches_pairing(endpoint, &paired, &secret)
+            })
+        }) {
+            return Ok((existing_id, format!("Remote {endpoint}")));
+        }
+        let remote_client = serial_nexus_client::RemoteClient::connect_to(
+            endpoint,
+            &paired,
+            &secret,
+            Some("serial-nexus-terminal".to_string()),
+            Duration::from_secs(5),
+        )
+        .map_err(|error| format!("not connected: {error}"))?;
+        if let Some(existing_id) = existing_id {
+            if self.remotes.iter().any(|link| link.id == existing_id) {
+                self.state.remove_endpoint(existing_id);
+                let (events, critical_event_overflow) =
+                    remote_client.subscribe_bounded_with_overflow(1024);
+                let link = self
+                    .remotes
+                    .iter_mut()
+                    .find(|link| link.id == existing_id)
+                    .expect("existing endpoint link");
+                let old_client = std::mem::replace(&mut link.client, remote_client);
+                link.events = events;
+                link.critical_event_overflow = critical_event_overflow;
+                link.expected_closes.clear();
+                drop(old_client);
+                return Ok((existing_id, format!("Remote {endpoint}")));
+            }
+        }
+        let id = EndpointId(self.next_endpoint);
+        self.next_endpoint += 1;
+        let label = format!("Remote {}", paired.address);
+        let (events, critical_event_overflow) = remote_client.subscribe_bounded_with_overflow(1024);
+        self.remotes.push(RemoteLink {
+            id,
+            endpoint,
+            client: remote_client,
+            events,
+            critical_event_overflow,
+            expected_closes: HashSet::new(),
+        });
+        Ok((id, label))
+    }
+
+    fn remote_client(&self, endpoint: EndpointId) -> Option<&RemoteClient> {
+        self.remotes
+            .iter()
+            .find(|link| link.id == endpoint)
+            .map(|link| &link.client)
+    }
+
+    /// Resolve one endpoint to its transport. `None` means this machine's
+    /// client; an unknown remote endpoint is an error everywhere, never a
+    /// silent fallback to the local core.
+    fn endpoint_client(&self, endpoint: EndpointId) -> Result<&dyn EndpointTransport, ClientError> {
+        if endpoint == LOCAL_ENDPOINT {
+            return Ok(&self.client);
+        }
+        self.remote_client(endpoint)
+            .map(|remote| remote as &dyn EndpointTransport)
+            .ok_or_else(|| {
+                ClientError::Disconnected("the remote host is no longer connected".into())
+            })
+    }
+
+    fn open_on(
+        &self,
+        endpoint: EndpointId,
+        path: &str,
+        baud: Option<u32>,
+    ) -> Result<serial_nexus_protocol::OpenResult, ClientError> {
+        self.endpoint_client(endpoint)?.open(path, baud, false)
+    }
+
+    /// Ask the core for the running session's state and take its answer as
+    /// authoritative. A checked device the core no longer lists (unplugged,
+    /// replaced at the same path, or revoked) loses its checkbox.
+    fn sync_share_status(&mut self) {
+        match self.client.sharing_status() {
+            Ok(snapshot) => {
+                let lost = self.state.apply_sharing_snapshot(snapshot);
+                if !lost.is_empty() {
+                    self.state.notice = Some(Notice::error(format!(
+                        "no longer shared: {} — check it again in Settings",
+                        lost.join(", ")
+                    )));
+                }
+            }
+            Err(error) => {
+                // A timeout says only that we do not know the state. Keep the
+                // owner view (and the credentials in memory) so another `s`
+                // still sends ShareStop; never claim the listener is gone.
+                let ended = matches!(
+                    error,
+                    ClientError::Disconnected(_) | ClientError::WriteUncertain(_)
+                ) || matches!(
+                    error.code(),
+                    Some(
+                        ErrorCode::NotFound | ErrorCode::PermissionDenied | ErrorCode::ShuttingDown
+                    )
+                );
+                if ended {
+                    self.state.sharing.clear_session();
+                    self.state.close_pairing_view();
+                    self.state.notice = Some(Notice::error(format!("sharing stopped: {error}")));
+                } else {
+                    self.state.notice = Some(Notice::error(format!(
+                        "sharing status is unknown: {error}; sharing may still be on — press s to stop it"
+                    )));
+                }
             }
         }
     }
@@ -468,14 +1397,18 @@ impl App {
             return;
         };
         let path = device.path.clone();
+        let endpoint = device.endpoint;
         if let Some(session) = self.state.highlighted_session() {
-            let device_id = session.device_id;
-            self.show_session(device_id);
+            let key = SessionKey {
+                endpoint: session.endpoint,
+                device_id: session.device_id,
+            };
+            self.focus_session(key);
             self.state.notice = Some(Notice::info("already attached"));
             return;
         }
         if device.open {
-            match self.open_path(&path, None) {
+            match self.open_endpoint(endpoint, &path, None) {
                 Ok(_) => {}
                 Err(error) => self.state.notice = Some(Notice::error(error.to_string())),
             }
@@ -484,26 +1417,46 @@ impl App {
         }
     }
 
-    /// Open or join `path` and show its live stream. Sessions start empty and
-    /// are fed by live events only, so output races never duplicate.
+    /// Open or join a device on this machine and show its live stream.
     pub fn open_path(&mut self, path: &str, baud: Option<u32>) -> Result<u64, ClientError> {
-        let opened = self.client.open(path, baud, false)?;
+        self.open_endpoint(LOCAL_ENDPOINT, path, baud)
+            .map(|key| key.device_id)
+    }
+
+    /// Open or join a device on one host and show its live stream. Sessions
+    /// start empty and are fed by live events only, so output races never
+    /// duplicate. The key includes the endpoint, so equal device ids and paths
+    /// on two hosts stay separate.
+    pub fn open_endpoint(
+        &mut self,
+        endpoint: EndpointId,
+        path: &str,
+        baud: Option<u32>,
+    ) -> Result<SessionKey, ClientError> {
+        let opened = self.open_on(endpoint, path, baud)?;
         // Rejoining a device (even the same id, while another client kept it
         // open) must not leave an old close suppression behind.
-        self.expected_closes.remove(&opened.device_id);
-        self.state.add_session(
+        if let Some(expected) = self.expected_closes_mut(endpoint) {
+            expected.remove(&opened.device_id);
+        }
+        let key = SessionKey {
+            endpoint,
+            device_id: opened.device_id,
+        };
+        self.state.add_endpoint_session(
+            endpoint,
             opened.device_id,
             opened.port.clone(),
             opened.baud,
             opened.control.holder.clone(),
         );
-        self.show_session(opened.device_id);
+        self.focus_session(key);
         self.state.notice = Some(Notice::info(format!(
             "opened {} at {} baud",
             opened.port, opened.baud
         )));
         self.refresh_devices();
-        Ok(opened.device_id)
+        Ok(key)
     }
 
     fn submit_baud_prompt(&mut self) {
@@ -517,7 +1470,7 @@ impl App {
             return;
         }
         match prompt.value() {
-            Ok(baud) => match self.open_path(&prompt.path, Some(baud)) {
+            Ok(baud) => match self.open_endpoint(prompt.endpoint, &prompt.path, Some(baud)) {
                 Ok(_) => {}
                 Err(error) => {
                     let mut prompt = prompt;
@@ -558,17 +1511,25 @@ impl App {
             self.state.notice = Some(Notice::error("highlight an attached device first"));
             return;
         };
-        let device_id = session.device_id;
+        let key = SessionKey {
+            endpoint: session.endpoint,
+            device_id: session.device_id,
+        };
         let path = session.path.clone();
-        self.expected_closes.insert(device_id);
-        match self.client.close(device_id) {
+        if let Some(expected) = self.expected_closes_mut(key.endpoint) {
+            expected.insert(key.device_id);
+        }
+        let closed = self
+            .endpoint_client(key.endpoint)
+            .and_then(|transport| transport.close(key.device_id));
+        match closed {
             Ok(()) => {
-                self.state.remove_session(device_id);
+                self.state.remove_session(key);
                 self.state.notice = Some(Notice::info(format!("disconnected {path}")));
             }
             Err(error) => {
                 if error.is_device_gone() {
-                    self.state.remove_session(device_id);
+                    self.state.remove_session(key);
                 }
                 self.state.notice =
                     Some(Notice::error(format!("disconnect {path} failed: {error}")));
@@ -579,7 +1540,8 @@ impl App {
 
     /// Write human input to the shown device without taking AI control. With
     /// `local_echo` on, the typed text is shown locally too; it is added only
-    /// after the write was accepted, so a refused write leaves no ghost.
+    /// after the write was accepted, so a refused or uncertain write leaves no
+    /// ghost and is never retried.
     ///
     /// The sidebar highlight plays no part here: typed device input goes only
     /// to the stream that has the focus and is on screen.
@@ -590,33 +1552,56 @@ impl App {
             ));
             return;
         };
-        let device_id = session.device_id;
+        let session_key = SessionKey {
+            endpoint: session.endpoint,
+            device_id: session.device_id,
+        };
         let path = session.path.clone();
-        if let Err(error) = self.client.write_bytes(device_id, bytes, None) {
+        let endpoint = session.endpoint;
+        let written = self
+            .endpoint_client(endpoint)
+            .and_then(|transport| transport.write_bytes(session_key.device_id, bytes, None));
+        if let Err(error) = written {
             if error.is_device_gone() {
-                self.state.remove_session(device_id);
+                self.state.remove_session(session_key);
             }
-            self.state.notice = Some(Notice::error(format!("write to {path}: {error}")));
+            let retried = if error.is_write_uncertain() {
+                " — the bytes may have reached it and were not retried"
+            } else {
+                ""
+            };
+            self.state.notice = Some(Notice::error(format!("write to {path}{retried}: {error}")));
             return;
         }
         let local_echo = self.state.settings.local_echo;
         if local_echo {
             if let (Some(echo), Some(session)) =
-                (echo_key(key), self.state.sessions.get_mut(&device_id))
+                (echo_key(key), self.state.sessions.get_mut(&session_key))
             {
                 session.screen.echo(&echo);
             }
         }
     }
 
-    /// Detach every device. Called on exit and after an event-loop error.
+    /// Detach every device and stop sharing. Called on exit and after an
+    /// event-loop error, so this terminal never leaves a listener or a remote
+    /// session behind.
     pub fn shutdown(&mut self) {
-        let device_ids = self.state.all_device_ids();
-        self.expected_closes.extend(device_ids.iter().copied());
-        for device_id in device_ids {
-            let _ = self.client.close(device_id);
-            self.state.remove_session(device_id);
+        if self.state.sharing.active {
+            let _ = self.client.stop_sharing();
+            self.state.sharing.clear_session();
         }
+        for key in self.state.all_sessions() {
+            if let Ok(transport) = self.endpoint_client(key.endpoint) {
+                let _ = transport.close(key.device_id);
+            }
+            self.state.remove_session(key);
+        }
+        for link in self.remotes.drain(..) {
+            self.state.remove_endpoint(link.id);
+            drop(link);
+        }
+        self.state.remote_labels.clear();
         self.pump();
     }
 
@@ -632,9 +1617,15 @@ impl App {
 }
 
 fn device_entry(device: DeviceSummary) -> DeviceEntry {
+    device_entry_on(LOCAL_ENDPOINT, device)
+}
+
+fn device_entry_on(endpoint: EndpointId, device: DeviceSummary) -> DeviceEntry {
     DeviceEntry {
+        endpoint,
         path: device.path,
         description: device.description,
+        identity: device.identity,
         open: device.open,
         device_id: device.device_id,
         baud: device.baud,
@@ -643,5 +1634,20 @@ fn device_entry(device: DeviceSummary) -> DeviceEntry {
             .control_holder
             .as_ref()
             .map(|holder| holder.client_id),
+    }
+}
+
+#[cfg(test)]
+mod event_overflow_tests {
+    use super::*;
+
+    #[test]
+    fn a_revoked_remote_device_is_treated_as_a_gone_session() {
+        assert!(remote_session_is_gone(&ClientError::Server(
+            serial_nexus_client::ErrorBody::new(ErrorCode::PermissionDenied, "no longer shared")
+        )));
+        assert!(!remote_session_is_gone(&ClientError::Timeout(
+            "slow host".into()
+        )));
     }
 }

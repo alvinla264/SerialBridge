@@ -10,6 +10,7 @@
 //! that many bytes), bounded by [`MAX_REMOTE_FRAME_BYTES`]. The Unix socket
 //! keeps its newline-delimited framing, so existing clients are unaffected.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, Read};
 use std::net::{IpAddr, SocketAddr};
@@ -45,16 +46,71 @@ pub const AUTH_TIMEOUT_SECS: u64 = 5;
 pub struct ShareBind {
     pub address: IpAddr,
     pub port: u16,
+    /// IPv6 scope/interface index for a link-local address; 0 when unused.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub scope_id: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+/// Parse an IPv4/IPv6 address with an optional numeric IPv6 interface scope.
+pub fn parse_scoped_ip(text: &str) -> Result<(IpAddr, u32), String> {
+    if let Ok(address) = text.parse::<IpAddr>() {
+        return Ok((address, 0));
+    }
+    let (address, interface) = text
+        .rsplit_once('%')
+        .ok_or_else(|| "the address is not an IPv4 or IPv6 address".to_string())?;
+    let address: std::net::Ipv6Addr = address
+        .parse()
+        .map_err(|_| "the address is not an IPv4 or IPv6 address".to_string())?;
+    let scope_id = interface
+        .parse::<u32>()
+        .map_err(|_| format!("the IPv6 scope {interface:?} is not an interface index"))?;
+    Ok((IpAddr::V6(address), scope_id))
+}
+
+/// Ensure an interface scope is only used with link-local IPv6.
+pub fn validate_scope(address: IpAddr, scope_id: u32) -> Result<(), String> {
+    if scope_id != 0 && !matches!(address, IpAddr::V6(ip) if ip.is_unicast_link_local()) {
+        return Err("an interface scope is valid only for link-local IPv6".to_string());
+    }
+    Ok(())
+}
+
+/// Build a socket address while retaining a link-local IPv6 interface scope.
+pub fn scoped_socket_addr(address: IpAddr, port: u16, scope_id: u32) -> SocketAddr {
+    match address {
+        IpAddr::V6(address) if scope_id != 0 => {
+            SocketAddr::V6(std::net::SocketAddrV6::new(address, port, 0, scope_id))
+        }
+        address => SocketAddr::new(address, port),
+    }
 }
 
 impl ShareBind {
     pub fn new(address: IpAddr, port: u16) -> Self {
-        Self { address, port }
+        Self {
+            address,
+            port,
+            scope_id: 0,
+        }
+    }
+
+    pub fn with_scope(address: IpAddr, port: u16, scope_id: u32) -> Self {
+        Self {
+            address,
+            port,
+            scope_id,
+        }
     }
 
     /// Refuse addresses that would listen on every interface or that are not
     /// usable unicast endpoints.
     pub fn validate(&self) -> Result<(), String> {
+        validate_scope(self.address, self.scope_id)?;
         // An IPv4-mapped IPv6 address is an IPv4 address in disguise; validate
         // the inner address so `::ffff:0.0.0.0` cannot become a wildcard bind.
         if let std::net::IpAddr::V6(v6) = self.address {
@@ -80,7 +136,7 @@ impl ShareBind {
     }
 
     pub fn socket_addr(&self) -> SocketAddr {
-        SocketAddr::new(self.address, self.port)
+        scoped_socket_addr(self.address, self.port, self.scope_id)
     }
 }
 
@@ -153,12 +209,32 @@ pub struct ShareStartParams {
     /// open locally.
     #[serde(default)]
     pub devices: Vec<String>,
+    /// The device identity the owner selected for each path, when it had one.
+    /// The core refuses a path whose current node no longer matches, so a
+    /// replacement cannot inherit a check made against its predecessor.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub expected: BTreeMap<String, String>,
 }
 
 /// Check or uncheck specific devices in the owner's running session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareDevicesParams {
     pub devices: Vec<String>,
+    /// Expected device identity per path, as captured when it was selected.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub expected: BTreeMap<String, String>,
+}
+
+/// A validated checklist that has not been applied yet.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharePrepared {
+    pub token: String,
+}
+
+/// Apply a previously prepared checklist.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareCommitParams {
+    pub token: String,
 }
 
 /// Which kind of pairing credential a secret is.
@@ -403,6 +479,19 @@ mod tests {
             ShareBind::new("::1".parse().unwrap(), 9000).to_string(),
             "[::1]:9000"
         );
+    }
+
+    #[test]
+    fn scoped_socket_helpers_preserve_only_link_local_scopes() {
+        let (address, scope) = parse_scoped_ip("fe80::1%3").expect("scoped IPv6");
+        assert_eq!(scope, 3);
+        assert_eq!(
+            scoped_socket_addr(address, 7331, scope).to_string(),
+            "[fe80::1%3]:7331"
+        );
+        assert!(validate_scope(address, scope).is_ok());
+        assert!(validate_scope("::1".parse().unwrap(), scope).is_err());
+        assert!(validate_scope("127.0.0.1".parse().unwrap(), scope).is_err());
     }
 
     #[test]

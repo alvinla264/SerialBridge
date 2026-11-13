@@ -57,8 +57,29 @@ pub enum Action {
     OpenSettings,
     SettingsMove(i32),
     SettingsToggle,
+    /// Start typing into the selected sharing address or port row.
+    SettingsBeginEdit,
+    SettingsEditChar(char),
+    SettingsEditBackspace,
+    /// Stop editing the text row, keeping what was typed in the draft.
+    SettingsEditDone,
     SettingsSave,
     SettingsCancel,
+    /// Start or stop the local sharing session.
+    ShareToggle,
+    /// Show the owner's pairing information for the running session.
+    OpenPairing,
+    /// Ask for a remote host's address, port and pairing information.
+    ConnectRemote,
+    ConnectChar(char),
+    ConnectBackspace,
+    ConnectNext(i32),
+    ConnectSubmit,
+    ConnectCancel,
+    /// Leave the pairing view for the stream.
+    LeavePairing,
+    /// Scroll the pairing information back (`> 0`) or forward by lines.
+    PairingScroll(i32),
     Ignore,
 }
 
@@ -68,8 +89,9 @@ pub enum Action {
 /// shown device, `Tab` and `Ctrl+Q` included. Only `Ctrl+]` leaves it, which is
 /// why the sidebar's `]` sends a literal `Ctrl+]`. The sidebar is the command
 /// surface: `Ctrl+Q` quits there, `b` shows the highlighted device's scrollback,
-/// and the settings button is a row of it. The scrollback view navigates with
-/// the arrow and page keys; they never reach the device from there.
+/// `s` starts or stops sharing, `p` shows the pairing information, `c` asks for
+/// a remote host, and the buttons are rows of it. The scrollback view navigates
+/// with the arrow and page keys; they never reach the device from there.
 ///
 /// The device keys always belong to the *shown* device, never to the sidebar's
 /// highlighted row.
@@ -90,17 +112,51 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
         };
     }
     if key == Key::Ctrl(']') {
-        // The focus moves even while Settings are open: the sidebar stays
-        // visible beside them, and the draft is kept until Save or Cancel.
+        // The focus moves even while Settings or the pairing view are open:
+        // the sidebar stays visible beside them, and the draft is kept.
         return Action::ToggleFocus;
     }
+    // A text field belongs to the right pane. Once focus moves to the sidebar
+    // (Ctrl+]), its keys act on the sidebar, not on the hidden field.
+    if state.settings_editing && state.view == View::Settings && state.focus == Focus::Right {
+        return match key {
+            Key::Ctrl('s') => Action::SettingsSave,
+            Key::Esc => Action::SettingsCancel,
+            Key::Enter => Action::SettingsEditDone,
+            Key::Backspace => Action::SettingsEditBackspace,
+            Key::Char(ch) if ch.is_ascii_graphic() => Action::SettingsEditChar(ch),
+            Key::Tab | Key::BackTab => Action::SettingsEditDone,
+            _ => Action::Ignore,
+        };
+    }
+    if state.view == View::Connect && state.focus == Focus::Right {
+        return match key {
+            Key::Esc => Action::ConnectCancel,
+            Key::Enter => Action::ConnectSubmit,
+            Key::Tab | Key::Down => Action::ConnectNext(1),
+            Key::BackTab | Key::Up => Action::ConnectNext(-1),
+            Key::Backspace => Action::ConnectBackspace,
+            Key::Char(ch) if ch.is_ascii_graphic() => Action::ConnectChar(ch),
+            _ => Action::Ignore,
+        };
+    }
     if state.view == View::Settings && state.focus == Focus::Right {
+        let kind = state.settings_kind(state.settings_row);
         return match key {
             Key::Ctrl('s') => Action::SettingsSave,
             Key::Esc => Action::SettingsCancel,
             Key::Tab | Key::Down | Key::Char('j') => Action::SettingsMove(1),
             Key::BackTab | Key::Up | Key::Char('k') => Action::SettingsMove(-1),
-            Key::Char(' ') | Key::Enter => Action::SettingsToggle,
+            Key::Char(' ') => match kind {
+                Some(row) if row.is_text_field() => Action::Ignore,
+                _ => Action::SettingsToggle,
+            },
+            Key::Enter => match kind {
+                Some(row) if row.is_text_field() => Action::SettingsBeginEdit,
+                _ => Action::SettingsToggle,
+            },
+            // Typing is not a command in the settings; only the two text rows
+            // take it, and only after Enter started editing them.
             _ => Action::Ignore,
         };
     }
@@ -109,8 +165,8 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
             Key::Ctrl('q') | Key::F(10) => Action::Quit,
             // The sidebar can still feed the shown device while the right
             // pane is its stream: `]` is the literal Ctrl+] the stream cannot
-            // send without leaving it. It writes nothing while the settings
-            // or scrollback own the pane.
+            // send without leaving it. It writes nothing while the settings,
+            // scrollback or pairing view own the pane.
             Key::Char(']') if state.view == View::Stream => Action::Write(vec![0x1d]),
             Key::Up | Key::Char('k') => Action::Select(-1),
             Key::Down | Key::Char('j') => Action::Select(1),
@@ -125,6 +181,9 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
             Key::Char('b') if state.highlighted_session().is_some() => Action::EnterScrollback,
             Key::Char('b') => Action::StartBaudPrompt,
             Key::Char('d') => Action::DisconnectSelected,
+            Key::Char('s') => Action::ShareToggle,
+            Key::Char('p') => Action::OpenPairing,
+            Key::Char('c') => Action::ConnectRemote,
             _ => Action::Ignore,
         },
         (Focus::Right, View::Stream) => match encode_key(key) {
@@ -140,9 +199,18 @@ pub fn map_key(state: &AppState, key: Key) -> Action {
             Key::Esc => Action::LeaveScrollback,
             _ => Action::Ignore,
         },
-        // The settings branch above owns a right-focused settings view; the
-        // left-focused one takes the sidebar's commands instead.
-        (Focus::Right, View::Settings) => Action::Ignore,
+        (Focus::Right, View::Pairing) => match key {
+            Key::Esc => Action::LeavePairing,
+            Key::Char('s') => Action::ShareToggle,
+            Key::Up => Action::PairingScroll(-1),
+            Key::Down => Action::PairingScroll(1),
+            Key::PageUp => Action::PairingScroll(-(state.rows().max(1) as i32)),
+            Key::PageDown => Action::PairingScroll(state.rows().max(1) as i32),
+            _ => Action::Ignore,
+        },
+        // The settings and connect branches above own their right-focused
+        // views; the left-focused ones take the sidebar's commands instead.
+        (Focus::Right, View::Settings | View::Connect) => Action::Ignore,
     }
 }
 
@@ -487,5 +555,83 @@ mod tests {
         assert_eq!(echo_key(Key::Backspace), Some(b"\x08 \x08".to_vec()));
         assert_eq!(echo_key(Key::Up), None);
         assert_eq!(echo_key(Key::Ctrl('c')), None);
+    }
+}
+
+#[cfg(test)]
+mod sharing_input_tests {
+    use super::*;
+    use crate::state::DeviceEntry;
+
+    fn state() -> AppState {
+        let mut state = AppState::new(20, 80);
+        state.set_devices(vec![DeviceEntry::new("/dev/ttyUSB0")]);
+        state
+    }
+
+    #[test]
+    fn the_sidebar_offers_sharing_pairing_and_remote_connect() {
+        let state = state();
+        assert_eq!(map_key(&state, Key::Char('s')), Action::ShareToggle);
+        assert_eq!(map_key(&state, Key::Char('p')), Action::OpenPairing);
+        assert_eq!(map_key(&state, Key::Char('c')), Action::ConnectRemote);
+    }
+
+    #[test]
+    fn the_pairing_view_scrolls_and_stops_sharing() {
+        let mut state = state();
+        state.view = View::Pairing;
+        state.focus = Focus::Right;
+        assert_eq!(map_key(&state, Key::Down), Action::PairingScroll(1));
+        assert_eq!(map_key(&state, Key::Up), Action::PairingScroll(-1));
+        assert_eq!(map_key(&state, Key::PageDown), Action::PairingScroll(20));
+        assert_eq!(map_key(&state, Key::Esc), Action::LeavePairing);
+        assert_eq!(map_key(&state, Key::Char('s')), Action::ShareToggle);
+        assert_eq!(
+            map_key(&state, Key::Char('x')),
+            Action::Ignore,
+            "nothing typed in the pairing view reaches a device"
+        );
+    }
+
+    #[test]
+    fn moving_focus_leaves_the_settings_text_field() {
+        let mut state = state();
+        state.begin_settings();
+        state.settings_row = 2; // the share address
+        assert!(state.begin_settings_edit());
+        state.focus = Focus::Sidebar;
+        assert_eq!(
+            map_key(&state, Key::Char('s')),
+            Action::ShareToggle,
+            "the sidebar owns keys once focus moved there"
+        );
+        assert_eq!(map_key(&state, Key::Char('x')), Action::Ignore);
+    }
+
+    #[test]
+    fn settings_rows_edit_text_toggle_checkboxes_and_leave_on_escape() {
+        let mut state = state();
+        state.begin_settings();
+        state.settings_row = 4; // the device checkbox
+        assert_eq!(map_key(&state, Key::Char(' ')), Action::SettingsToggle);
+        state.settings_row = 2; // the address
+        assert_eq!(
+            map_key(&state, Key::Char(' ')),
+            Action::Ignore,
+            "Space must not clear an address field"
+        );
+        assert_eq!(map_key(&state, Key::Enter), Action::SettingsBeginEdit);
+        state.settings_editing = true;
+        assert_eq!(
+            map_key(&state, Key::Char('a')),
+            Action::SettingsEditChar('a')
+        );
+        assert_eq!(
+            map_key(&state, Key::Backspace),
+            Action::SettingsEditBackspace
+        );
+        assert_eq!(map_key(&state, Key::Esc), Action::SettingsCancel);
+        assert_eq!(map_key(&state, Key::Ctrl('s')), Action::SettingsSave);
     }
 }

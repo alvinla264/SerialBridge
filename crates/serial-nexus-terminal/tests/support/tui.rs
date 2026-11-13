@@ -78,6 +78,10 @@ impl TuiSession {
         let mut command = Command::new(env!("CARGO_BIN_EXE_serial-nexus-terminal"));
         command
             .env("SERIAL_NEXUS_SOCKET", socket)
+            .env(
+                "SERIAL_NEXUS_GATEWAY_SOCKET",
+                socket.with_file_name("gateway.sock"),
+            )
             .env("XDG_CONFIG_HOME", xdg)
             .env("HOME", xdg)
             .env("TERM", "xterm-256color")
@@ -218,6 +222,15 @@ impl TuiSession {
         });
     }
 
+    /// Screen text safe to print: pairing credentials never reach test logs.
+    /// Wrapped credential fragments have no marker of their own, so a pairing
+    /// screen is redacted as a whole.
+    fn redacted(_text: &str) -> String {
+        // Pairing screens can wrap a credential so that no label survives.
+        // Omit screen text entirely rather than risk printing a secret.
+        "[screen omitted: it may contain pairing credentials]".to_string()
+    }
+
     /// Wait for a condition on the whole screen, then keep going.
     pub fn wait_until(&mut self, what: &str, mut ready: impl FnMut(&str) -> bool) {
         let deadline = Instant::now() + STEP;
@@ -228,7 +241,8 @@ impl TuiSession {
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for {what}\n--- screen ---\n{text}"
+                "timed out waiting for {what}\n--- screen ---\n{}",
+                Self::redacted(&text)
             );
             std::thread::sleep(Duration::from_millis(20));
         }

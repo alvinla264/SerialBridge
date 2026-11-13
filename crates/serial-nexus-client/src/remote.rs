@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
 use rustls::pki_types::{CertificateDer, ServerName};
 use serial_nexus_protocol::share::tlsio;
 use serial_nexus_protocol::{
@@ -36,15 +36,47 @@ use crate::ClientError;
 pub struct RemoteEndpoint {
     pub address: IpAddr,
     pub port: u16,
+    /// Interface index for scoped IPv6 link-local endpoints.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub scope_id: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 impl RemoteEndpoint {
+    /// Parse an IPv4/IPv6 address with an optional numeric IPv6 interface
+    /// scope, returning the IP and scope separately for socket construction.
+    pub fn parse_address(text: &str) -> Result<(IpAddr, u32), String> {
+        serial_nexus_protocol::parse_scoped_ip(text)
+    }
+
     pub fn new(address: IpAddr, port: u16) -> Self {
-        Self { address, port }
+        Self {
+            address,
+            port,
+            scope_id: 0,
+        }
+    }
+
+    pub fn with_scope(address: IpAddr, port: u16, scope_id: u32) -> Self {
+        Self {
+            address,
+            port,
+            scope_id,
+        }
     }
 
     pub fn from_socket_addr(address: SocketAddr) -> Self {
-        Self::new(address.ip(), address.port())
+        match address {
+            SocketAddr::V4(address) => Self::new(IpAddr::V4(*address.ip()), address.port()),
+            SocketAddr::V6(address) => Self::with_scope(
+                IpAddr::V6(*address.ip()),
+                address.port(),
+                address.scope_id(),
+            ),
+        }
     }
 
     /// IPv4-mapped IPv6 is the same endpoint as its IPv4 form, exactly as the
@@ -62,7 +94,14 @@ impl RemoteEndpoint {
     /// The same endpoint with IPv4-mapped IPv6 folded to IPv4, so equality and
     /// ordering treat both spellings as one endpoint.
     pub fn canonical(&self) -> Self {
-        Self::new(Self::canonical_ip(self.address), self.port)
+        Self::with_scope(Self::canonical_ip(self.address), self.port, self.scope_id)
+    }
+
+    /// Whether two endpoints name the same host address and port, ignoring
+    /// their client-local interface scopes.
+    pub fn same_host(&self, other: &Self) -> bool {
+        Self::canonical_ip(self.address) == Self::canonical_ip(other.address)
+            && self.port == other.port
     }
 
     /// Refuse addresses no client can mean: port 0, wildcards, multicast and
@@ -72,6 +111,7 @@ impl RemoteEndpoint {
             return Err("the port must be between 1 and 65535".to_string());
         }
         let address = Self::canonical_ip(self.address);
+        serial_nexus_protocol::validate_scope(address, self.scope_id)?;
         if address.is_unspecified() {
             return Err(format!(
                 "{address} is a wildcard address; give the host's concrete address"
@@ -89,7 +129,7 @@ impl RemoteEndpoint {
     }
 
     pub fn socket_addr(&self) -> SocketAddr {
-        SocketAddr::new(self.address, self.port)
+        serial_nexus_protocol::scoped_socket_addr(self.address, self.port, self.scope_id)
     }
 }
 
@@ -107,16 +147,23 @@ struct Pending {
 }
 
 type PendingMap = Arc<Mutex<HashMap<u64, Pending>>>;
+type EventSubscribers = Arc<Mutex<Vec<EventSubscriber>>>;
+
+struct EventSubscriber {
+    sender: Sender<Event>,
+    critical_overflow: Option<Arc<AtomicBool>>,
+}
 
 struct Inner {
     outgoing: Sender<Vec<u8>>,
     pending: PendingMap,
-    subscribers: Arc<Mutex<Vec<Sender<Event>>>>,
+    subscribers: EventSubscribers,
     connected: Arc<AtomicBool>,
     /// A handle for closing the socket when the last clone is dropped, so the
     /// reader thread ends promptly.
     tcp: TcpStream,
     auth: RemoteAuthResult,
+    pairing_fingerprint: [u8; 32],
     next_id: AtomicU64,
     request_timeout: Duration,
 }
@@ -157,7 +204,7 @@ impl RemoteClient {
     ) -> Result<Self, ClientError> {
         endpoint.validate().map_err(ClientError::EndpointMismatch)?;
         let paired_endpoint = RemoteEndpoint::from_socket_addr(paired.address);
-        if endpoint.canonical() != paired_endpoint.canonical() {
+        if !endpoint.same_host(&paired_endpoint) {
             return Err(ClientError::EndpointMismatch(format!(
                 "{endpoint} is not the paired endpoint {paired_endpoint}"
             )));
@@ -264,8 +311,9 @@ impl RemoteClient {
             )));
         }
 
+        let pairing_fingerprint = pairing_fingerprint(endpoint, paired, secret);
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
-        let subscribers: Arc<Mutex<Vec<Sender<Event>>>> = Arc::new(Mutex::new(Vec::new()));
+        let subscribers: EventSubscribers = Arc::new(Mutex::new(Vec::new()));
         let connected = Arc::new(AtomicBool::new(true));
         let (outgoing, outgoing_rx) = unbounded::<Vec<u8>>();
         let drop_handle = tcp.try_clone()?;
@@ -298,6 +346,7 @@ impl RemoteClient {
                 connected,
                 tcp: drop_handle,
                 auth,
+                pairing_fingerprint,
                 next_id: AtomicU64::new(1),
                 request_timeout: timeout,
             }),
@@ -319,6 +368,17 @@ impl RemoteClient {
 
     pub fn is_connected(&self) -> bool {
         self.inner.connected.load(Ordering::SeqCst)
+    }
+
+    /// Whether this live connection was established with this exact endpoint
+    /// and pairing. Only a one-way digest is retained, not the credential.
+    pub fn matches_pairing(
+        &self,
+        endpoint: RemoteEndpoint,
+        paired: &PairedHost,
+        secret: &PairingSecret,
+    ) -> bool {
+        self.inner.pairing_fingerprint == pairing_fingerprint(endpoint, paired, secret)
     }
 
     pub fn list_devices(&self) -> Result<DevicesResult, ClientError> {
@@ -424,8 +484,37 @@ impl RemoteClient {
             .subscribers
             .lock()
             .expect("subscribers lock")
-            .push(tx);
+            .push(EventSubscriber {
+                sender: tx,
+                critical_overflow: None,
+            });
         rx
+    }
+
+    /// Subscribe with a bounded queue. A peer that floods events fills the
+    /// queue; further events are dropped for this subscriber instead of growing
+    /// memory without limit or blocking the reader thread.
+    pub fn subscribe_bounded(&self, capacity: usize) -> Receiver<Event> {
+        self.subscribe_bounded_with_overflow(capacity).0
+    }
+
+    /// Like `subscribe_bounded`, and signals when a lifecycle event such as
+    /// `DeviceClosed` could not be queued and must be reconciled by the caller.
+    pub fn subscribe_bounded_with_overflow(
+        &self,
+        capacity: usize,
+    ) -> (Receiver<Event>, Arc<AtomicBool>) {
+        let (tx, rx) = bounded(capacity.max(1));
+        let critical_overflow = Arc::new(AtomicBool::new(false));
+        self.inner
+            .subscribers
+            .lock()
+            .expect("subscribers lock")
+            .push(EventSubscriber {
+                sender: tx,
+                critical_overflow: Some(Arc::clone(&critical_overflow)),
+            });
+        (rx, critical_overflow)
     }
 
     fn request(&self, request: Request, timeout: Duration) -> Result<ResponseData, ClientError> {
@@ -505,7 +594,7 @@ fn connection_loop(
     outgoing: Receiver<Vec<u8>>,
     mut decoder: FrameDecoder,
     pending: PendingMap,
-    subscribers: Arc<Mutex<Vec<Sender<Event>>>>,
+    subscribers: EventSubscribers,
     connected: Arc<AtomicBool>,
 ) {
     loop {
@@ -555,11 +644,7 @@ fn decode_server_message(body: &[u8]) -> Result<ServerMessage, ClientError> {
     serde_json::from_slice(body).map_err(|error| ClientError::Protocol(error.into()))
 }
 
-fn dispatch(
-    message: ServerMessage,
-    pending: &PendingMap,
-    subscribers: &Arc<Mutex<Vec<Sender<Event>>>>,
-) {
+fn dispatch(message: ServerMessage, pending: &PendingMap, subscribers: &EventSubscribers) {
     match message {
         ServerMessage::Response { id, result } => {
             if let Some(pending) = pending.lock().expect("pending lock").remove(&id) {
@@ -571,18 +656,13 @@ fn dispatch(
                 let _ = pending.tx.send(Err(ClientError::from(error)));
             }
         }
-        ServerMessage::Event { event } => {
-            subscribers
-                .lock()
-                .expect("subscribers lock")
-                .retain(|tx| tx.send(event.clone()).is_ok());
-        }
+        ServerMessage::Event { event } => send_event_to_subscribers(subscribers, event),
     }
 }
 
 fn fail(
     pending: &PendingMap,
-    subscribers: &Arc<Mutex<Vec<Sender<Event>>>>,
+    subscribers: &EventSubscribers,
     connected: &AtomicBool,
     reason: &str,
 ) {
@@ -600,10 +680,58 @@ fn fail(
     let event = Event::TransportClosed {
         reason: reason.to_string(),
     };
+    send_event_to_subscribers(subscribers, event);
+}
+
+fn send_event_to_subscribers(subscribers: &EventSubscribers, event: Event) {
     subscribers
         .lock()
         .expect("subscribers lock")
-        .retain(|tx| tx.send(event.clone()).is_ok());
+        .retain(
+            |subscriber| match subscriber.sender.try_send(event.clone()) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) => {
+                    if matches!(event, Event::DeviceClosed { .. }) {
+                        if let Some(overflow) = &subscriber.critical_overflow {
+                            overflow.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    true
+                }
+                Err(TrySendError::Disconnected(_)) => false,
+            },
+        );
+}
+
+fn pairing_fingerprint(
+    endpoint: RemoteEndpoint,
+    paired: &PairedHost,
+    secret: &PairingSecret,
+) -> [u8; 32] {
+    let endpoint = endpoint.to_string();
+    let paired_address = paired.address.to_string();
+    let role = match secret.role {
+        PairingRole::Human => b"human".as_slice(),
+        PairingRole::Ai => b"ai".as_slice(),
+    };
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    context.update(b"SerialNexus pairing fingerprint v1");
+    for part in [
+        endpoint.as_bytes(),
+        paired_address.as_bytes(),
+        paired.host_name.as_bytes(),
+        paired.ca_cert_der_b64.as_bytes(),
+        paired.host_cert_fingerprint_sha256.as_bytes(),
+        role,
+        secret.credential.as_bytes(),
+    ] {
+        context.update(&(part.len() as u64).to_be_bytes());
+        context.update(part);
+    }
+    let digest = context.finish();
+    let mut fingerprint = [0; 32];
+    fingerprint.copy_from_slice(digest.as_ref());
+    fingerprint
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -619,4 +747,129 @@ fn hex(bytes: &[u8]) -> String {
         text.push_str(&format!("{byte:02x}"));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pairing_fingerprint_distinguishes_credentials_and_endpoints() {
+        let paired = PairedHost {
+            address: "192.0.2.10:7000".parse().unwrap(),
+            host_name: "192.0.2.10".into(),
+            ca_cert_der_b64: "ca".into(),
+            host_cert_fingerprint_sha256: "fingerprint".into(),
+        };
+        let secret = PairingSecret {
+            role: PairingRole::Human,
+            credential: "first".into(),
+        };
+        let endpoint = RemoteEndpoint::from_socket_addr(paired.address);
+        let original = pairing_fingerprint(endpoint, &paired, &secret);
+        let changed_secret = PairingSecret {
+            credential: "second".into(),
+            ..secret.clone()
+        };
+        assert_ne!(
+            original,
+            pairing_fingerprint(endpoint, &paired, &changed_secret)
+        );
+        assert_ne!(
+            original,
+            pairing_fingerprint(
+                RemoteEndpoint::new("192.0.2.11".parse().unwrap(), 7000),
+                &paired,
+                &secret
+            )
+        );
+    }
+
+    #[test]
+    fn a_dropped_device_closed_event_sets_the_overflow_signal() {
+        let (tx, rx) = bounded(1);
+        let overflow = Arc::new(AtomicBool::new(false));
+        let subscribers = Arc::new(Mutex::new(vec![EventSubscriber {
+            sender: tx,
+            critical_overflow: Some(Arc::clone(&overflow)),
+        }]));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        dispatch(
+            ServerMessage::Event {
+                event: Event::TransportClosed {
+                    reason: "queued".into(),
+                },
+            },
+            &pending,
+            &subscribers,
+        );
+        dispatch(
+            ServerMessage::Event {
+                event: Event::DeviceClosed {
+                    device_id: 7,
+                    path: "/dev/ttyUSB0".into(),
+                    reason: "unplugged".into(),
+                },
+            },
+            &pending,
+            &subscribers,
+        );
+
+        assert!(overflow.load(Ordering::SeqCst));
+        assert_eq!(subscribers.lock().expect("subscribers lock").len(), 1);
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn scoped_ipv6_socket_addresses_keep_their_interface_index() {
+        let socket: SocketAddr = "[fe80::1%3]:7331".parse().expect("scoped socket address");
+        let endpoint = RemoteEndpoint::from_socket_addr(socket);
+        assert_eq!(endpoint.scope_id, 3);
+        assert_eq!(endpoint.socket_addr(), socket);
+        assert!(endpoint.validate().is_ok());
+    }
+
+    #[test]
+    fn a_full_bounded_subscriber_drops_events_without_blocking_or_unsubscribing() {
+        let (tx, rx) = bounded(1);
+        let subscribers = Arc::new(Mutex::new(vec![EventSubscriber {
+            sender: tx,
+            critical_overflow: None,
+        }]));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        for reason in ["first", "dropped"] {
+            dispatch(
+                ServerMessage::Event {
+                    event: Event::TransportClosed {
+                        reason: reason.into(),
+                    },
+                },
+                &pending,
+                &subscribers,
+            );
+        }
+        assert_eq!(
+            subscribers.lock().expect("subscribers lock").len(),
+            1,
+            "a full subscriber remains active after dropping an event"
+        );
+        match rx.try_recv().expect("the first event") {
+            Event::TransportClosed { reason } => assert_eq!(reason, "first"),
+            other => panic!("unexpected event {other:?}"),
+        }
+        dispatch(
+            ServerMessage::Event {
+                event: Event::TransportClosed {
+                    reason: "resumed".into(),
+                },
+            },
+            &pending,
+            &subscribers,
+        );
+        match rx.try_recv().expect("delivery resumes after draining") {
+            Event::TransportClosed { reason } => assert_eq!(reason, "resumed"),
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
 }

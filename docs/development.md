@@ -82,14 +82,17 @@ path as a real serial port and the test drives the master. Covered end to end:
   loopback IPv4 and IPv6 where available, host certificate pinning and wrong-CA
   refusal, wrong credentials, oversized frames, stalled TLS handshake deadline,
   unauthenticated handshake connection slots, waited-write admission limits,
+  an expected device identity enforced by the core at ShareStart/ShareCheck/
+  ShareReplace (atomic whole-list replacement),
   bind failure leaving sharing off, unchecking
   revoking access and failing pending work while local and other devices keep
   working, owner loss stopping the listener and revoking credentials, stopping
   during a waited write without replay, path replacement not inheriting
   authorization, secrets absent from responses/events/history, and existing
   Unix-socket clients still working while sharing is active;
-- core grace-period shutdown and client auto-start (including an explicit core
-  path, a missing binary, and the started core owning a separate session);
+- core grace-period shutdown and supported client auto-start (including an
+  explicit core path, a missing binary, and the started core owning a separate
+  session);
 - the terminal's side-by-side layout at a usable width and focused-pane layout
   when narrow, single-click highlight never changing the shown stream,
   Enter/double-click opening, focus switching with `Ctrl+]` without redirecting
@@ -133,11 +136,25 @@ The PTY fixtures pre-open their devices, so opening a closed device through the
 baud prompt, device discovery, and a hand-edited invalid settings file staying
 untouched are covered at the app and client/core seams, not through this PTY.
 
+Further terminal coverage uses real core/client seams and dedicated PTY flows:
+- `sharing_controls.rs`: checklist Save/Cancel, bind failures, session-only
+  device selection, identity replacement, pairing credentials, revocation and
+  cleanup on shutdown.
+- `remote_controls.rs`: authenticated Connect, certificate mismatch, several
+  endpoint groups, same-path isolation, unplug/disconnect notices, and remote
+  write failures.
+- `pty_sharing.rs` and `pty_remote.rs`: the actual rendered and keyboard-driven
+  Share/Pairing and Connect workflows, including device access on the host.
+
 `serial-nexus-mcp` additionally has end-to-end tests over real MCP stdio framing:
 handshake and tool listing, protocol errors, default and joined baud, rejected
 conflicts, two independent sessions with read-only takeover, exact writes,
 waited sends, partial lines, timeouts, disconnect releasing control, detached
-and missing devices, an unplugged device, and auto-start.
+and missing devices and an unplugged device. Separate tests require the local
+terminal gateway and prove MCP never auto-starts the core. Remote MCP tests cover
+private pairing-file permissions/redaction, per-endpoint sessions and device
+identity, explicit remote pairing and transport, and isolation between local
+and remote endpoints.
 
 Not proven here: real hardware and drivers, PTY behaviour that differs from
 USB serial adapters, platforms other than Linux, terminals other than what the

@@ -12,23 +12,19 @@
 //! through tool arguments and is never part of a result.
 
 use std::collections::BTreeMap;
-use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::{json, Value};
 use serial_nexus_client::{
-    Client, ClientConfig, ClientError, ClientInfo, ErrorCode, HistoryLine, Limits, OpenResult,
-    PairingRole, Peers, ReadResult, RemoteClient, RemoteEndpoint, Role, Source, WaitSpec,
-    WriteResult,
+    paths, Client, ClientError, ClientInfo, ErrorCode, HistoryLine, RemoteEndpoint, Role, Source,
+    WaitSpec,
 };
-use serial_nexus_protocol::DevicesResult;
+use serial_nexus_protocol::GatewayTarget;
 
 /// Client name this server introduces itself with.
 pub const CLIENT_NAME: &str = "serial-nexus-mcp";
-
-/// How long one remote connection attempt may take.
-const REMOTE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A failed tool call, split by whether the caller's arguments were wrong.
 #[derive(Debug)]
@@ -104,10 +100,7 @@ impl Target {
             Self::Local => value,
             Self::Remote(endpoint) => {
                 let mut object = value.as_object().cloned().unwrap_or_default();
-                object.insert(
-                    "remote_endpoint".into(),
-                    json!({ "address": endpoint.address.to_string(), "port": endpoint.port }),
-                );
+                object.insert("remote_endpoint".into(), json!(endpoint));
                 Value::Object(object)
             }
         }
@@ -121,73 +114,6 @@ impl Target {
     }
 }
 
-/// One connected core: local Unix socket or paired remote host.
-enum Link {
-    Local(Client),
-    Remote(RemoteClient),
-}
-
-impl Link {
-    fn list_devices(&self) -> Result<DevicesResult, ClientError> {
-        match self {
-            Self::Local(client) => client.list_devices(),
-            Self::Remote(client) => client.list_devices(),
-        }
-    }
-
-    fn open(
-        &self,
-        port: String,
-        baud: Option<u32>,
-        request_control: bool,
-    ) -> Result<OpenResult, ClientError> {
-        match self {
-            Self::Local(client) => client.open(port, baud, request_control),
-            Self::Remote(client) => client.open(port, baud, request_control),
-        }
-    }
-
-    fn close(&self, device_id: u64) -> Result<(), ClientError> {
-        match self {
-            Self::Local(client) => client.close(device_id),
-            Self::Remote(client) => client.close(device_id),
-        }
-    }
-
-    fn read(&self, device_id: u64, lines: Option<usize>) -> Result<ReadResult, ClientError> {
-        match self {
-            Self::Local(client) => client.read(device_id, lines),
-            Self::Remote(client) => client.read(device_id, lines),
-        }
-    }
-
-    fn write_bytes(
-        &self,
-        device_id: u64,
-        data: &[u8],
-        wait: Option<WaitSpec>,
-    ) -> Result<WriteResult, ClientError> {
-        match self {
-            Self::Local(client) => client.write_bytes(device_id, data, wait),
-            Self::Remote(client) => client.write_bytes(device_id, data, wait),
-        }
-    }
-
-    fn status(&self, device_id: u64) -> Result<serial_nexus_client::DeviceStatus, ClientError> {
-        match self {
-            Self::Local(client) => client.status(device_id),
-            Self::Remote(client) => client.status(device_id),
-        }
-    }
-
-    fn limits(&self) -> Limits {
-        match self {
-            Self::Local(client) => client.hello().limits,
-            Self::Remote(client) => client.limits().clone(),
-        }
-    }
-}
-
 struct Connection {
     port: String,
     baud: u32,
@@ -195,12 +121,12 @@ struct Connection {
 
 type ConnectionKey = (Target, u64);
 
-/// One MCP server run: lazily started core connections (one per endpoint) plus
-/// the devices this session has connected to, kept apart per endpoint so two
+/// One MCP server run: lazy terminal-gateway connections (one per endpoint)
+/// plus the devices this session has connected to, kept apart per endpoint so two
 /// hosts sharing the same device path never share ids, control or history.
 pub struct Session {
     local: Mutex<Option<Client>>,
-    remote: Mutex<BTreeMap<RemoteEndpoint, RemoteClient>>,
+    remote: Mutex<BTreeMap<RemoteEndpoint, Client>>,
     connections: Mutex<BTreeMap<ConnectionKey, Connection>>,
 }
 
@@ -219,8 +145,8 @@ impl Session {
         }
     }
 
-    /// The local core connection, starting the core on the first call and
-    /// replacing a connection that has since closed.
+    /// The local terminal-gateway connection. It never starts the core; local
+    /// MCP operations require the supported terminal to be running.
     fn local_client(&self) -> Result<Client, Failure> {
         let mut guard = self.local.lock().expect("client lock");
         if let Some(client) = guard.as_ref() {
@@ -228,8 +154,16 @@ impl Session {
                 return Ok(client.clone());
             }
         }
-        let client = Client::connect(ClientConfig::new(ClientInfo::ai(CLIENT_NAME)))
-            .map_err(|error| Target::Local.failure(&error, None))?;
+        let client = Client::connect_to_gateway(
+            paths::default_gateway_socket_path(),
+            GatewayTarget::Local,
+            ClientInfo::ai(CLIENT_NAME),
+        )
+        .map_err(|error| {
+            Failure::Tool(format!(
+                "could not establish local MCP access through the terminal gateway; confirm serial-nexus-terminal and its core connection are healthy, then retry: {error}"
+            ))
+        })?;
         *guard = Some(client.clone());
         Ok(client)
     }
@@ -237,7 +171,7 @@ impl Session {
     /// The remote connection for one endpoint, pairing again from the private
     /// file when the previous connection closed. A failure here never becomes a
     /// local call.
-    fn remote_client(&self, endpoint: RemoteEndpoint) -> Result<RemoteClient, Failure> {
+    fn remote_client(&self, endpoint: RemoteEndpoint) -> Result<Client, Failure> {
         let mut guard = self.remote.lock().expect("remote lock");
         if let Some(client) = guard.get(&endpoint) {
             if client.is_connected() {
@@ -245,32 +179,39 @@ impl Session {
             }
         }
         guard.remove(&endpoint);
-        let peers = Peers::load_default().map_err(|error| Failure::Tool(error.to_string()))?;
-        let peer = peers
-            .find(&endpoint)
-            .map_err(|error| Failure::Tool(error.to_string()))?;
-        if peer.secret.role != PairingRole::Ai {
-            return Err(Failure::Tool(format!(
-                "the credential for {endpoint} is a {:?} credential; the MCP host needs the AI credential (role \"ai\")",
-                peer.secret.role
-            )));
-        }
-        let client = RemoteClient::connect_to(
-            endpoint,
-            &peer.paired,
-            &peer.secret,
-            Some(CLIENT_NAME.to_string()),
-            REMOTE_TIMEOUT,
+        let pairing_file = serial_nexus_client::Peers::default_path().map_err(|error| {
+            Failure::Tool(format!(
+                "cannot locate the MCP pairing file for remote {endpoint}: {error}"
+            ))
+        })?;
+        let pairing_file = resolve_pairing_path(pairing_file).map_err(|error| {
+            Failure::Tool(format!(
+                "cannot resolve the MCP pairing file for remote {endpoint}: {error}"
+            ))
+        })?;
+        let client = Client::connect_to_gateway_with_pairing(
+            paths::default_gateway_socket_path(),
+            GatewayTarget::Remote {
+                address: endpoint.address,
+                port: endpoint.port,
+                scope_id: endpoint.scope_id,
+            },
+            Some(pairing_file),
+            ClientInfo::ai(CLIENT_NAME),
         )
-        .map_err(|error| Target::Remote(endpoint).failure(&error, None))?;
+        .map_err(|error| {
+            Failure::Tool(format!(
+                "could not establish remote MCP access to {endpoint} through the terminal gateway; confirm serial-nexus-terminal is running, the pairing is current, and the host is sharing: {error}"
+            ))
+        })?;
         guard.insert(endpoint, client.clone());
         Ok(client)
     }
 
-    fn link(&self, target: Target) -> Result<Link, Failure> {
+    fn link(&self, target: Target) -> Result<Client, Failure> {
         match target {
-            Target::Local => Ok(Link::Local(self.local_client()?)),
-            Target::Remote(endpoint) => Ok(Link::Remote(self.remote_client(endpoint)?)),
+            Target::Local => self.local_client(),
+            Target::Remote(endpoint) => self.remote_client(endpoint),
         }
     }
 
@@ -557,24 +498,33 @@ impl Session {
             target.failure(&error, Some(&device_label(&device, Some(port.clone()))))
         })?;
         self.forget(target, device_id);
-        let device_closed = status
-            .as_ref()
-            .is_none_or(|status| status.client_count <= 1);
-        let text = if device_closed {
-            format!(
-                "disconnected from {port} (device {device_id}){}; the device is now closed",
-                target.suffix()
-            )
-        } else {
-            let left = status
-                .as_ref()
-                .map(|status| status.client_count - 1)
-                .unwrap_or(0);
-            format!(
-                "disconnected from {port} (device {device_id}){}; left the device open for {}",
-                target.suffix(),
-                plural(left, "other client", "other clients")
-            )
+        let disconnect_state = client
+            .list_devices()
+            .ok()
+            .and_then(|result| disconnect_state(&result, &port));
+        let (device_closed, text) = match disconnect_state {
+            Some((false, _)) => (
+                Some(true),
+                format!(
+                    "disconnected from {port} (device {device_id}){}; the device is now closed",
+                    target.suffix()
+                ),
+            ),
+            Some((true, remaining)) => (
+                Some(false),
+                format!(
+                    "disconnected from {port} (device {device_id}){}; left the device open for {}",
+                    target.suffix(),
+                    plural(remaining, "other client", "other clients")
+                ),
+            ),
+            None => (
+                None,
+                format!(
+                    "disconnected from {port} (device {device_id}){}; could not confirm whether the device remains open",
+                    target.suffix()
+                ),
+            ),
         };
         Ok(ToolOutcome::ok(
             text,
@@ -659,7 +609,7 @@ impl Session {
         let device_id = self.resolve_device(target, &device)?;
         let requested_lines = optional_u64(arguments, "lines")?.unwrap_or(1);
         let client = self.link(target)?;
-        let limits = client.limits();
+        let limits = client.hello().limits;
         // The core caps its wait target silently; do it here so the reply can
         // say what it actually waited for.
         let lines = requested_lines.min(limits.read_max_lines as u64);
@@ -801,16 +751,14 @@ fn parse_endpoint(ip: &Value, port: &Value) -> Result<RemoteEndpoint, Failure> {
     let text = ip
         .as_str()
         .ok_or_else(|| Failure::Params("ip must be an IPv4 or IPv6 address string".into()))?;
-    let address = text.parse::<IpAddr>().map_err(|_| {
-        Failure::Params(format!(
-            "{text:?} is not an IPv4 or IPv6 address (for example 192.0.2.10 or ::1)"
-        ))
+    let (address, scope_id) = RemoteEndpoint::parse_address(text).map_err(|error| {
+        Failure::Params(format!("{text:?} is not an IPv4 or IPv6 address: {error}"))
     })?;
     let number = as_integral(port)
         .ok_or_else(|| Failure::Params("port must be a TCP port number".into()))?;
     let port = u16::try_from(number)
         .map_err(|_| Failure::Params(format!("port {number} is not between 1 and 65535")))?;
-    let endpoint = RemoteEndpoint::new(address, port).canonical();
+    let endpoint = RemoteEndpoint::with_scope(address, port, scope_id).canonical();
     endpoint.validate().map_err(Failure::Params)?;
     Ok(endpoint)
 }
@@ -857,7 +805,7 @@ pub fn definitions() -> Value {
                 "properties": {
                     "ip": {
                         "type": "string",
-                        "description": "IPv4 or IPv6 address of a host sharing devices. Give it together with port; omit both for the local core."
+                        "description": "IPv4 or IPv6 address of a host sharing devices (link-local IPv6 may include a numeric interface scope, e.g. fe80::20%3). Give it together with port; omit both for the local core."
                     },
                     "port": {
                         "type": "integer",
@@ -895,7 +843,7 @@ pub fn definitions() -> Value {
                     },
                     "ip": {
                         "type": "string",
-                        "description": "IPv4 or IPv6 address of a host sharing devices. Give it together with port and path; omit it for the local core."
+                        "description": "IPv4 or IPv6 address of a host sharing devices (link-local IPv6 may include a numeric interface scope, e.g. fe80::20%3). Give it together with port and path; omit it for the local core."
                     }
                 },
                 "additionalProperties": false
@@ -1081,6 +1029,32 @@ fn human_duration(millis: u64) -> String {
     }
 }
 
+fn disconnect_state(
+    devices: &serial_nexus_protocol::DevicesResult,
+    path: &str,
+) -> Option<(bool, usize)> {
+    devices
+        .devices
+        .iter()
+        .find(|device| device.path == path)
+        .map(|device| (device.open, device.client_count))
+}
+
+fn resolve_pairing_path(path: PathBuf) -> Result<PathBuf, std::io::Error> {
+    resolve_pairing_path_from(path, std::env::current_dir)
+}
+
+fn resolve_pairing_path_from(
+    path: PathBuf,
+    current_dir: impl FnOnce() -> Result<PathBuf, std::io::Error>,
+) -> Result<PathBuf, std::io::Error> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(current_dir()?.join(path))
+    }
+}
+
 /// Turn a core error into a message an AI host (and its human) can act on.
 fn describe_error(error: &ClientError, device: Option<&str>) -> String {
     if let ClientError::Server(body) = error {
@@ -1088,12 +1062,15 @@ fn describe_error(error: &ClientError, device: Option<&str>) -> String {
     }
     match error {
         ClientError::CoreNotFound => {
-            "serial-nexus-core was not found; install it next to serial-nexus-mcp or set SERIAL_NEXUS_CORE"
+            "serial-nexus-core was not found; check the installation and terminal configuration"
                 .to_string()
         }
-        ClientError::CoreStart(reason) => format!("serial-nexus-core did not start: {reason}"),
+        ClientError::CoreStart(reason) => format!("serial-nexus-core could not be started: {reason}"),
         ClientError::Disconnected(reason) => format!(
-            "lost the connection to serial-nexus-core ({reason}); the next call starts it again"
+            "the terminal gateway connection was lost ({reason}); confirm serial-nexus-terminal is running and retry"
+        ),
+        ClientError::WriteUncertain(reason) => format!(
+            "serial write outcome uncertain ({reason}); the bytes may have reached the device and were not sent again"
         ),
         ClientError::Timeout(reason) => format!("serial-nexus-core did not answer in time: {reason}"),
         ClientError::UnsupportedProtocol { core, client } => format!(
@@ -1407,6 +1384,65 @@ mod tests {
     }
 
     #[test]
+    fn disconnect_state_uses_the_device_list_after_close() {
+        let result = serial_nexus_protocol::DevicesResult {
+            devices: vec![serial_nexus_protocol::DeviceSummary {
+                path: "/dev/ttyUSB0".into(),
+                description: None,
+                identity: None,
+                open: true,
+                device_id: Some(7),
+                baud: Some(9_600),
+                client_count: 2,
+                control_holder: None,
+            }],
+        };
+        assert_eq!(disconnect_state(&result, "/dev/ttyUSB0"), Some((true, 2)));
+        assert_eq!(disconnect_state(&result, "/dev/other"), None);
+
+        let closed = serial_nexus_protocol::DevicesResult {
+            devices: vec![serial_nexus_protocol::DeviceSummary {
+                path: "/dev/ttyUSB0".into(),
+                description: None,
+                identity: None,
+                open: false,
+                device_id: None,
+                baud: None,
+                client_count: 0,
+                control_holder: None,
+            }],
+        };
+        assert_eq!(disconnect_state(&closed, "/dev/ttyUSB0"), Some((false, 0)));
+    }
+
+    #[test]
+    fn relative_pairing_paths_resolve_in_the_mcp_process_directory() {
+        let cwd = PathBuf::from("/var/tmp/mcp-host");
+        assert_eq!(
+            resolve_pairing_path_from(PathBuf::from("peers.json"), || Ok(cwd.clone())).unwrap(),
+            cwd.join("peers.json")
+        );
+        assert_eq!(
+            resolve_pairing_path_from(PathBuf::from("/etc/serial-nexus/peers.json"), || {
+                panic!("absolute paths do not need the current directory")
+            })
+            .unwrap(),
+            PathBuf::from("/etc/serial-nexus/peers.json")
+        );
+    }
+
+    #[test]
+    fn local_uncertain_write_error_says_not_to_replay() {
+        let message = describe_error(
+            &ClientError::WriteUncertain("gateway disconnected after submission".into()),
+            Some("/dev/ttyUSB0"),
+        );
+        assert!(message.contains("outcome uncertain"));
+        assert!(message.contains("may have reached the device"));
+        assert!(message.contains("were not sent again"));
+    }
+
+    #[test]
     fn durations_read_naturally() {
         assert_eq!(human_duration(950), "950 ms");
         assert_eq!(human_duration(3_200), "3.2 s");
@@ -1423,6 +1459,22 @@ mod tests {
         assert_eq!(local, "Permission denied (os error 13) (PermissionDenied)");
         let remote = describe_server_error(&body, None, true);
         assert!(remote.contains("the host owner has not shared this device"));
+    }
+
+    #[test]
+    fn structured_remote_endpoint_preserves_nonzero_scope() {
+        let endpoint = RemoteEndpoint::with_scope("fe80::20".parse().unwrap(), 7331, 3);
+        let value = Target::Remote(endpoint).attach(json!({"ok": true}));
+        assert_eq!(value["remote_endpoint"]["scope_id"], 3);
+        assert_eq!(value["remote_endpoint"]["address"], "fe80::20");
+        assert_eq!(value["remote_endpoint"]["port"], 7331);
+    }
+
+    #[test]
+    fn remote_endpoint_parser_preserves_link_local_scope() {
+        let endpoint = parse_endpoint(&json!("fe80::1%3"), &json!(7331)).unwrap();
+        assert_eq!(endpoint.scope_id, 3);
+        assert_eq!(endpoint.socket_addr().to_string(), "[fe80::1%3]:7331");
     }
 
     #[test]

@@ -79,26 +79,30 @@ current system only; `nix flake check --all-systems --no-build` evaluates every
 system without building it. Building for the other architecture needs a native
 builder or an emulator.
 
-The two client packages are built against the `serial-nexus-core` they ship
-with: the flake compiles that store path in as `SERIAL_NEXUS_CORE_DEFAULT` (see
-[Auto-start and packaging](clients.md#auto-start-and-packaging)), so a client started
-from anywhere always launches its own matching core. No separate core install
-is needed; set `SERIAL_NEXUS_CORE` to use a different one.
+The terminal package is built against the `serial-nexus-core` it ships with:
+the flake compiles that store path in as `SERIAL_NEXUS_CORE_DEFAULT` (see
+[Auto-start and packaging](clients.md#auto-start-and-packaging)), so the
+terminal can start its matching core. MCP does not start a core; all MCP calls
+require the foreground terminal gateway. No separate core install is needed;
+set `SERIAL_NEXUS_CORE` to make the terminal use a different one.
 
 ## Running
 
-- **The core has no service.** The first client to connect starts it detached
+- **The core has no service.** The foreground terminal starts it detached
   (own session, stdio discarded) on the standard per-user socket; the core exits
-  30 seconds after its last client disconnects. Both the TUI and the MCP server
-  do this, so either can be started first.
+  30 seconds after its last client disconnects. The terminal also hosts the
+  local MCP gateway. Local and remote MCP calls require the terminal to be
+  running; MCP never auto-starts the core or dials remote endpoints directly.
 - **One core per user.** Clients racing to start it still end up sharing one.
   `SERIAL_NEXUS_SOCKET` (or `--socket`) in a fresh parent directory isolates a
   second core for testing; the lock is `core.lock` in that directory, so two
   sockets in one directory still mean one core.
-- **Stopping.** Close the clients (the TUI on `Ctrl+Q`, the MCP host ends its
-  session) and the core goes away after its grace period. To stop it sooner,
-  terminate `serial-nexus-core`; devices close and attached clients see the
-  connection end.
+- **Stopping.** Close the terminal (`Ctrl+Q`) to stop its share, disconnect
+  local and outgoing remote MCP sessions, and release its core connection. MCP
+  can no longer make local or remote calls until the terminal is running again.
+  The core goes away after its grace period when no clients remain. To stop it
+  sooner, terminate `serial-nexus-core`; devices close and attached clients see
+  the connection end.
 - **Human access.** Run `serial-nexus-terminal` whenever you want: it lists the
   same devices as the AI, joins an open one at its active baud, follows the live
   stream from then on, and can always write. It does not replay earlier
@@ -108,8 +112,11 @@ is needed; set `SERIAL_NEXUS_CORE` to use a different one.
 
 ## Behaviour and defaults
 
-All defaults are bounded and reported to clients in the `hello` response
-(`Limits`), so client tools and docs never hard-code different numbers.
+All core defaults are bounded and reported to clients in the `hello` response
+(`Limits`), so client tools and docs never hard-code different numbers. Gateway
+IPC is separately versioned and bounded; all programs running as the laptop
+user are trusted, while different OS users remain excluded by the private
+sockets.
 
 | Setting | Default | Notes |
 | --- | --- | --- |
@@ -120,7 +127,8 @@ All defaults are bounded and reported to clients in the `hello` response
 | History | 2000 lines / 256 KiB per open device | In memory only; discarded when the device closes. Drops are counted and reported. |
 | Read lines | 50 default, 2000 max | The AI chooses per call. |
 | Write wait | 1000 ms default, 30 s max | The AI chooses per call. |
-| Default socket | `$SERIAL_NEXUS_SOCKET`, else `$XDG_RUNTIME_DIR/serial-nexus/core.sock`, else `$TMPDIR/serial-nexus-<uid>/core.sock` | Directory 0700, socket 0600, peer uid checked. |
+| Core socket | `$SERIAL_NEXUS_SOCKET`, else `$XDG_RUNTIME_DIR/serial-nexus/core.sock`, else `$TMPDIR/serial-nexus-<uid>/core.sock` | Directory 0700, socket 0600, peer uid checked. |
+| Terminal gateway socket | `$SERIAL_NEXUS_GATEWAY_SOCKET`, else `$XDG_RUNTIME_DIR/serial-nexus/gateway.sock`, else `$TMPDIR/serial-nexus-<uid>/gateway.sock` | Per-user IPC, socket 0600, same-UID peer checked; terminal lifetime. |
 
 Device rules:
 
@@ -131,10 +139,10 @@ Device rules:
   `/dev/serial/by-id/...` and `/dev/ttyUSB0` name the same open device, and
   discovery canonicalizes `by-id` aliases so each device is listed once.
 - **Closing.** The last client disconnecting closes the device and releases its
-  rate. Every write already accepted is drained to the device before the close
-  completes, and the core waits for the device's I/O threads to release the
-  serial file before it reports the close (or broadcasts `DeviceClosed`), so an
-  immediate reopen works from any client.
+  rate. For a local close, accepted writes drain and the serial file is released
+  before `DeviceClosed` is reported, so immediate reopen is a drain barrier.
+  Remote close returns before asynchronous drain and is not a release barrier;
+  see [the client and interface guide](clients.md#remote-lan-transport).
 - **Write control.** One AI client per device may write. It asks for control
   with `open(..., request_control = true)`. If another AI holds it, the open
   succeeds read-only and reports the holder; the holder is also told via a
@@ -166,3 +174,42 @@ Device rules:
   exceed the IPC frame limit or drop the connection. Incoming frames are read
   with a hard byte bound, so an unfinished line cannot grow memory without
   limit.
+
+## LAN sharing and remote terminals
+
+Sharing is off by default and needs no configuration until it is used. The
+human terminal is the owner: open Settings, set a concrete IPv4 or IPv6 address
+and port, tick the devices to share, Save, and start sharing from the sidebar's
+Share button (or `s`). See
+[Sharing devices on the LAN from the terminal](clients.md#sharing-devices-on-the-lan-from-the-terminal)
+for the controls.
+
+The pairing view shows two separate credentials:
+
+- the **human credential** goes into another terminal's Connect form, together
+  with the host address, port, CA certificate and certificate fingerprint;
+- the **MCP credential** is for `serial-nexus-mcp` running on the laptop whose
+  terminal owns the gateway. The MCP server uses that local gateway to connect
+  onward to the sharing host. Add the remote endpoint, CA certificate,
+  fingerprint and credential to the local MCP process's private `mcp-peers.json`
+  file with mode `0600`; follow the setup and tool-call examples in
+  [`serial-nexus-mcp/README.md`](../crates/serial-nexus-mcp/README.md#reach-a-device-shared-by-another-host).
+
+Do not paste either credential into shell history, a repository, an issue or a
+tool call. If you write the MCP credential down, use a file only your user can
+read (mode `0600`) outside the repository, for example
+`~/.config/serial-nexus/remote-mcp-credential`. Credentials are per sharing
+session: stopping or restarting sharing invalidates the old ones and new ones
+must be paired.
+
+**Exposure.** The listener exists only on the chosen address, and only while
+the terminal that started sharing is running. Firewall rules and router/NAT
+configuration decide who can actually reach it; forwarding a port can expose it
+outside the LAN. Prefer loopback (`127.0.0.1` or `::1`) for same-machine use and
+a trusted LAN address only when another device must connect.
+
+**Unplug and revocation.** Unchecking a device while sharing revokes remote
+access immediately; unplugging it, or replacing it at the same path, clears its
+checkbox and requires a recheck. A write already in progress may finish, and a
+write whose answer is lost is reported as uncertain: nothing is retried or
+rolled back.

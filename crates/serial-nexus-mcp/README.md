@@ -2,21 +2,38 @@
 
 The AI's SerialNexus client: an [MCP](https://modelcontextprotocol.io) server
 over stdio, launched by an AI host. It speaks newline-delimited JSON-RPC 2.0 on
-stdin/stdout and reaches the serial devices through the one local
-`serial-nexus-core` (using `serial-nexus-client`), starting the core when nothing
-answers.
+stdin/stdout and sends **every** tool call—local or to an explicit remote
+endpoint—through the one supported foreground `serial-nexus-terminal` running
+on this laptop. The terminal hosts a bounded, versioned, per-user Unix-socket
+gateway and owns one upstream core or authenticated remote connection per MCP
+session and endpoint.
 
 ```
-AI host  <-- MCP over stdio -->  serial-nexus-mcp  <-- Unix socket -->  serial-nexus-core
+AI host <-- MCP stdio --> serial-nexus-mcp <-- per-user IPC --> serial-nexus-terminal gateway
+                                                        <-- core socket or verified TLS --> core / paired remote host
 ```
 
-It can also reach devices another host shares on the local network, using a
-[private pairing file](#reach-a-device-shared-by-another-host) that the MCP host's
-human configures. Sharing is never enabled by this client.
+The terminal must be running for local **and remote** MCP calls. If it is not,
+MCP calls fail clearly: the MCP process does not start the core and does not
+make network connections itself. Local-only MCP calls work while LAN sharing is
+off; they do not require pairing. Closing the terminal disconnects its local
+and outgoing remote MCP sessions and stops any share it owns. A second
+supported terminal exits clearly. Sharing is never enabled by MCP.
 
-`serial-nexus-mcp` never opens a serial port itself and never takes ownership:
-the core still enforces one AI writer per device, baud conflicts, idle expiry,
-the human terminal's writes, and device close/open.
+**Same-user trust:** all programs running as this laptop user are trusted.
+Another same-UID program can impersonate the terminal/client role, access local
+serial through the core, or enable/change LAN sharing. Both sides verify the
+Unix peer UID before exchanging gateway messages, excluding other local OS
+users even if they pre-create the fallback socket path. The terminal gateway is
+the supported route and lifetime owner, not a security barrier against the
+same user. Remote clients still require valid pairing and are restricted to
+their role and the session allowlist.
+
+`serial-nexus-mcp` never opens a serial port itself and never owns a local core
+connection or remote network connection: the terminal gateway creates a
+separate upstream client per MCP session/endpoint. The core still enforces one
+AI writer per device, baud conflicts, idle expiry, history, and device
+open/close.
 
 ## Configure the host
 
@@ -43,15 +60,13 @@ A Nix host can run it straight from the flake instead:
 }
 ```
 
-The core is found like every other SerialNexus client:
-
-1. `SERIAL_NEXUS_SOCKET` (or the standard per-user socket path);
-2. `SERIAL_NEXUS_CORE` for an explicit `serial-nexus-core` binary, else the path
-   the build compiled in (`SERIAL_NEXUS_CORE_DEFAULT`, set by the Nix flake),
-   else a `serial-nexus-core` next to `serial-nexus-mcp`, else one on `PATH`.
-
-With no core running, the first tool call starts one detached; it exits again
-after its grace period once no clients remain.
+The terminal and MCP host must use the same gateway socket. Its default is
+`$XDG_RUNTIME_DIR/serial-nexus/gateway.sock` (or the per-user temporary runtime
+path when no runtime directory exists); set `SERIAL_NEXUS_GATEWAY_SOCKET` in
+both environments to override it. The terminal starts the core as needed and
+hosts the gateway for its foreground lifetime. `SERIAL_NEXUS_SOCKET` selects
+the core socket used by the terminal; it does not let MCP bypass the gateway.
+The MCP process has no core binary auto-start path.
 
 ## Tools
 
@@ -106,17 +121,22 @@ remote endpoint fails.
 ### Pairing file
 
 The credential is **not** a tool argument and never appears in MCP output,
-errors, history or serial writes. The MCP host's human writes one private JSON
-file, readable by its owner only:
+errors, logs, history or serial writes. The human writes one private JSON file,
+readable by the laptop user only. The MCP process sends only the configured
+file path through local gateway IPC; the terminal gateway opens and validates
+the file, then performs the paired TLS connection itself:
 
-1. get the pairing details from the host: its local human terminal issues them
-   once per sharing session with `ShareStart` (see
-   [`docs/sharing.md`](../../docs/sharing.md)); a terminal screen that shows
-   and copies them is part of the sharing controls work, so until it ships use
-   that contract;
+1. On the host, open terminal Settings and choose the detected devices to
+   share, save, and start sharing. Press `p` with the sidebar focused to open
+   the owner-only Pairing view; read the endpoint, CA certificate,
+   certificate fingerprint and **MCP credential** there. These details are
+   created for this session only. See
+   [`docs/sharing.md`](../../docs/sharing.md) for the core contract.
 2. create `~/.config/serial-nexus/mcp-peers.json` (`$XDG_CONFIG_HOME` is
-   honoured, and `SERIAL_NEXUS_MCP_PEERS` names another file; if none of these
-   is set the server says so instead of reading a relative file) with mode `600`:
+   honoured, and `SERIAL_NEXUS_MCP_PEERS` names another file; if that override
+   is relative, it is resolved against the MCP process's working directory; if
+   no path can be configured, the server says so instead of reading a relative
+   default file) with mode `600`:
 
 ```sh
 install -d -m 700 ~/.config/serial-nexus
@@ -145,9 +165,14 @@ $EDITOR ~/.config/serial-nexus/mcp-peers.json
 }
 ```
 
-- One entry per endpoint; two entries for the same address and port are
-  refused as ambiguous, and a file larger than 64 KiB is refused. IPv4 and IPv6 are both accepted
-  (`"address": "::1"`, `"address": "fd00::20"`).
+- One entry per endpoint; two entries for the same address, scope and port are
+  refused as ambiguous, and a file larger than 64 KiB is refused. IPv4 and IPv6
+  are accepted (`"address": "::1"`, `"address": "fd00::20"`). For a scoped
+  link-local IPv6 host, set `endpoint.scope_id` to the MCP machine's numeric
+  interface index and pass the same client-local scope in the tool's `ip`
+  argument (for example `"fe80::20%3"`). Keep the host's pairing address and
+  `host_name` as shown; their host-local scope is not used to choose the
+  connecting interface.
 - Use the **AI** credential (`"role": "ai"`) for this server. A human
   credential is refused: the role is enforced by the host, not chosen here.
 - The file must be a regular file owned by you with no group or world
@@ -169,7 +194,7 @@ Every tool takes the same optional pair:
 
 | Argument | Meaning |
 | --- | --- |
-| `ip` | The sharing host's IPv4 or IPv6 address. |
+| `ip` | The sharing host's IPv4 or IPv6 address; link-local IPv6 may include a numeric interface scope such as `fe80::20%3`. |
 | `port` | The sharing listener's TCP port. |
 
 Give both to use that host, or neither for the local core. Giving only one is a
@@ -186,7 +211,8 @@ the same name could point at a different device. A path this client cannot
 match to a remote connection is an error, not a guess.
 
 Results from a remote endpoint say so (`on remote 192.0.2.10:7000`) and carry
-`structuredContent.remote_endpoint`; local results are unchanged. Device ids,
+`structuredContent.remote_endpoint` with the address, port and (for scoped IPv6)
+`scope_id`; local results are unchanged. Device ids,
 control and history are kept separately per endpoint, so two hosts that both
 share `/dev/ttyUSB0` never collide. Only devices the host checked are visible,
 and an uncheck or owner termination revokes access immediately.
@@ -233,8 +259,8 @@ A failed or uncertain write is reported as such and is never sent again.
   1 MiB (only incoming messages are).
 - **Linux only**, like the core: Unix socket, `SO_PEERCRED`, PTY tests.
 - **A tool call is bounded by the core's per-request handling**, so if the core
-  is slow every call is slow; the MCP server itself keeps no state beyond the
-  client connection and the device ids it has seen.
+  is slow every call is slow. MCP keeps per-session device ids and endpoint
+  routing; the terminal gateway owns the corresponding upstream clients.
 
 ## Building and testing
 
@@ -256,10 +282,11 @@ sessions where the second is read-only, exact writes without an appended
 newline, waited sends returning device lines, partial lines (new and
 pre-existing), timeouts, capped line counts, disconnect releasing control,
 detached-session errors, path aliases, a missing device, an unplugged device,
-and auto-start with an explicit core path.
+and failure without the terminal gateway without auto-starting the core.
 
 `tests/remote_mcp.rs` covers the remote path: local calls unchanged with no
-pairing file, a real loopback sharing session reached with `ip` + `port`,
+pairing file, a real loopback sharing session reached through the terminal
+gateway with `ip` + `port`,
 endpoint and address validation, an unknown endpoint, a human credential
 refused for the AI role, a host that cannot prove the pinned certificate, an
 unreadable pairing file, two hosts with equal device ids kept apart, one AI

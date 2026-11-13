@@ -7,16 +7,55 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::pty::openpty;
 use serial_nexus_client::{Client, ClientInfo};
+use serial_nexus_core::enumerate::{install_port_lister, PortInfo};
 use serial_nexus_protocol::Event;
 use tempfile::TempDir;
 
 pub mod tui;
+
+/// Install a process-wide discovery lister for the lifetime of a test fixture.
+pub struct PortListerGuard;
+
+impl PortListerGuard {
+    pub fn from_paths(paths: Arc<Mutex<Vec<PathBuf>>>) -> Self {
+        install_port_lister(Some(Arc::new(move || {
+            paths
+                .lock()
+                .expect("test port paths lock")
+                .iter()
+                .map(|path| PortInfo {
+                    path: path.to_string_lossy().into_owned(),
+                    description: Some("simulated".into()),
+                })
+                .collect()
+        })));
+        Self
+    }
+
+    pub fn from_path(path: impl Into<String>) -> Self {
+        let path = path.into();
+        install_port_lister(Some(Arc::new(move || {
+            vec![PortInfo {
+                path: path.clone(),
+                description: Some("simulated".into()),
+            }]
+        })));
+        Self
+    }
+}
+
+impl Drop for PortListerGuard {
+    fn drop(&mut self) {
+        install_port_lister(None);
+    }
+}
 
 /// A PTY pair: the core opens the slave path as a serial port, the test drives
 /// the master side.
