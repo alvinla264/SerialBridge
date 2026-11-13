@@ -543,7 +543,10 @@ fn disconnect_reports_release_and_later_calls_fail_clearly() {
     let closed = controller.call_tool("disconnect", json!({"device": device_id}));
     assert!(!closed.is_error, "{}", closed.text);
     assert_eq!(closed.device_id(), device_id);
-    assert_eq!(closed.json()["device_closed"], false);
+    assert!(closed.json()["device_closed"].is_null());
+    assert!(closed
+        .text
+        .contains("1 other client was attached before disconnect"));
     assert!(closed.text.contains("disconnected"), "{}", closed.text);
 
     // Disconnecting released control, so the other AI session can claim it.
@@ -570,10 +573,11 @@ fn disconnect_reports_release_and_later_calls_fail_clearly() {
         stale.text
     );
 
-    // Last client disconnecting closes the device.
+    // The last client disconnects; the tool does not claim a post-close state
+    // that it did not query.
     let closed = reader.call_tool("disconnect", json!({"device": claimed.device_id()}));
     assert!(!closed.is_error, "{}", closed.text);
-    assert_eq!(closed.json()["device_closed"], true);
+    assert!(closed.json()["device_closed"].is_null());
 }
 
 #[test]
@@ -787,7 +791,7 @@ fn a_device_stays_addressable_by_the_path_used_to_connect() {
     let closed = mcp.call_tool("disconnect", json!({"device": alias}));
     assert!(!closed.is_error, "alias disconnect failed: {}", closed.text);
     assert_eq!(closed.device_id(), device_id);
-    assert_eq!(closed.json()["device_closed"], true);
+    assert!(closed.json()["device_closed"].is_null());
 }
 
 #[test]

@@ -503,31 +503,25 @@ impl Session {
             target.failure(&error, Some(&device_label(&device, Some(port.clone()))))
         })?;
         self.forget(target, device_id);
-        let device_closed = status
-            .as_ref()
-            .is_none_or(|status| status.client_count <= 1);
-        let text = if device_closed {
-            format!(
-                "disconnected from {port} (device {device_id}){}; the device is now closed",
-                target.suffix()
-            )
-        } else {
-            let left = status
-                .as_ref()
-                .map(|status| status.client_count - 1)
-                .unwrap_or(0);
-            format!(
-                "disconnected from {port} (device {device_id}){}; left the device open for {}",
+        let other_clients = status.as_ref().and_then(other_clients_before_disconnect);
+        let text = match other_clients {
+            Some(count) => format!(
+                "disconnected from {port} (device {device_id}){}; {} {} attached before disconnect, and the current device state was not confirmed",
                 target.suffix(),
-                plural(left, "other client", "other clients")
-            )
+                plural(count, "other client", "other clients"),
+                if count == 1 { "was" } else { "were" }
+            ),
+            None => format!(
+                "disconnected from {port} (device {device_id}){}; could not confirm whether the device remains open",
+                target.suffix()
+            ),
         };
         Ok(ToolOutcome::ok(
             text,
             target.attach(json!({
                 "device_id": device_id,
                 "port": port,
-                "device_closed": device_closed,
+                "device_closed": null,
             })),
         ))
     }
@@ -1026,6 +1020,10 @@ fn human_duration(millis: u64) -> String {
 }
 
 /// Turn a core error into a message an AI host (and its human) can act on.
+fn other_clients_before_disconnect(status: &serial_nexus_client::DeviceStatus) -> Option<usize> {
+    Some(status.client_count.saturating_sub(1))
+}
+
 fn resolve_pairing_path(path: PathBuf, cwd: &Path) -> PathBuf {
     if path.is_absolute() {
         path
@@ -1358,6 +1356,28 @@ mod tests {
         assert_eq!(
             session.connection(Target::Local, 1).as_deref(),
             Some("/dev/ttyUSB0")
+        );
+    }
+
+    #[test]
+    fn disconnect_does_not_make_an_unconfirmed_closed_state_claim() {
+        let unknown: Option<&serial_nexus_client::DeviceStatus> = None;
+        assert_eq!(unknown.and_then(other_clients_before_disconnect), None);
+        let status = serial_nexus_client::DeviceStatus {
+            device_id: 1,
+            path: "/dev/ttyUSB0".into(),
+            baud: 9_600,
+            client_count: 2,
+            control: serial_nexus_client::ControlState {
+                holder: None,
+                expires_in_ms: None,
+            },
+            history_lines: 0,
+            dropped_lines: 0,
+        };
+        assert_eq!(
+            Some(&status).and_then(other_clients_before_disconnect),
+            Some(1)
         );
     }
 

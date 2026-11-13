@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use serial_nexus_client::{Client, ClientInfo, ShareBind};
+use serial_nexus_client::{Client, ClientInfo, RemoteClient, ShareBind};
 
 use serial_nexus_protocol::ShareSessionInfo;
 use serial_nexus_terminal::app::App;
@@ -140,6 +140,42 @@ fn reopening_connect_keeps_the_in_progress_pairing_form() {
         form.error.is_none(),
         "reopened form must not show a stale error"
     );
+}
+
+#[test]
+fn reconnecting_with_the_same_pairing_reuses_a_link_at_the_host_connection_limit() {
+    let _guard = serial_test();
+    let device = SimulatedDevice::new();
+    let host = start_host(
+        &[&device.path],
+        Arc::new(Mutex::new(vec![PathBuf::from(&device.path)])),
+    );
+    let (_local, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let mut terminal = Terminal::new(&socket);
+    terminal.connect(&host.info);
+    let additional_clients: Vec<_> = (0..7)
+        .map(|_| {
+            RemoteClient::connect(
+                &host.info.host,
+                &host.info.human,
+                Some("connection-limit-test".into()),
+                Duration::from_secs(5),
+            )
+            .expect("fill remaining host connection slots")
+        })
+        .collect();
+
+    terminal.connect(&host.info);
+
+    assert!(terminal.app.state.connect.is_none());
+    assert_eq!(terminal.app.state.remote_labels.len(), 1);
+    assert!(terminal
+        .app
+        .state
+        .notice
+        .as_ref()
+        .is_some_and(|notice| notice.text.contains("connected to")));
+    drop(additional_clients);
 }
 
 #[test]

@@ -179,8 +179,8 @@ impl Checklist {
             .collect()
     }
 
-    /// Reconcile with current discovery: fill a missing identity, drop a path
-    /// that vanished, and drop one whose recorded identity changed.
+    /// Reconcile with current discovery without adopting new identities: drop
+    /// a vanished path or one whose captured identity changed.
     fn sync(&mut self, detected: &BTreeMap<String, Option<String>>) {
         self.entries.retain(|path, recorded| {
             let Some(current) = detected.get(path) else {

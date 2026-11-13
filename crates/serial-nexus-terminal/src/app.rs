@@ -2,6 +2,8 @@
 //! not depend on a real terminal.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
@@ -117,6 +119,7 @@ struct RemoteLink {
     endpoint: RemoteEndpoint,
     client: RemoteClient,
     events: Receiver<Event>,
+    critical_event_overflow: Arc<AtomicBool>,
     expected_closes: HashSet<u64>,
 }
 
@@ -277,6 +280,12 @@ impl App {
             .filter(|link| !link.client.is_connected())
             .map(|link| link.id)
             .collect();
+        let overflowed: Vec<EndpointId> = self
+            .remotes
+            .iter()
+            .filter(|link| link.critical_event_overflow.swap(false, Ordering::SeqCst))
+            .map(|link| link.id)
+            .collect();
         let pending: Vec<(EndpointId, Vec<Event>)> = self
             .remotes
             .iter()
@@ -307,6 +316,73 @@ impl App {
                 self.drop_remote(id, "remote host disconnected: its event stream closed");
             }
         }
+        for id in overflowed {
+            if self.remotes.iter().any(|link| link.id == id) {
+                self.reconcile_remote_after_event_overflow(id);
+            }
+        }
+    }
+
+    fn reconcile_remote_after_event_overflow(&mut self, id: EndpointId) {
+        let Some(client) = self
+            .remotes
+            .iter()
+            .find(|link| link.id == id)
+            .map(|link| link.client.clone())
+        else {
+            return;
+        };
+        if !client.is_connected() {
+            self.drop_remote(id, "remote host disconnected: its event stream closed");
+            return;
+        }
+        let sessions: Vec<SessionKey> = self
+            .state
+            .sessions
+            .keys()
+            .filter(|key| key.endpoint == id)
+            .copied()
+            .collect();
+        let mut closed = Vec::new();
+        let mut failed = Vec::new();
+        for key in sessions {
+            let path = self
+                .state
+                .sessions
+                .get(&key)
+                .map(|session| session.path.clone())
+                .unwrap_or_default();
+            match client.status(key.device_id) {
+                Ok(status) => {
+                    if let Some(session) = self.state.sessions.get_mut(&key) {
+                        session.control = status.control.holder.as_ref().map(short_holder);
+                        session.control_id = status
+                            .control
+                            .holder
+                            .as_ref()
+                            .map(|holder| holder.client_id);
+                    }
+                }
+                Err(error) if error.is_device_gone() => {
+                    self.state.remove_session(key);
+                    closed.push(path);
+                }
+                Err(error) => failed.push(format!("{path}: {error}")),
+            }
+        }
+        self.state.notice = Some(if !closed.is_empty() {
+            Notice::error(format!(
+                "remote session closed while its event queue was full: {}",
+                closed.join(", ")
+            ))
+        } else if !failed.is_empty() {
+            Notice::error(format!(
+                "remote event queue overflowed; session status could not be fully refreshed: {}",
+                failed.join("; ")
+            ))
+        } else {
+            Notice::info("remote event queue overflowed; active session status was refreshed")
+        });
     }
 
     fn handle_event(&mut self, endpoint: EndpointId, event: Event) {
@@ -1207,6 +1283,16 @@ impl App {
             .iter()
             .find(|link| link.endpoint == endpoint && link.client.is_connected())
             .map(|link| link.id);
+        if let Some(existing_id) = existing_id.filter(|existing_id| {
+            self.remotes.iter().any(|link| {
+                link.id == *existing_id
+                    && link.endpoint == endpoint
+                    && link.client.is_connected()
+                    && link.client.matches_pairing(endpoint, &paired, &secret)
+            })
+        }) {
+            return Ok((existing_id, format!("Remote {endpoint}")));
+        }
         let remote_client = serial_nexus_client::RemoteClient::connect_to(
             endpoint,
             &paired,
@@ -1226,12 +1312,13 @@ impl App {
         let id = EndpointId(self.next_endpoint);
         self.next_endpoint += 1;
         let label = format!("Remote {}", paired.address);
-        let events = remote_client.subscribe_bounded(1024);
+        let (events, critical_event_overflow) = remote_client.subscribe_bounded_with_overflow(1024);
         self.remotes.push(RemoteLink {
             id,
             endpoint,
             client: remote_client,
             events,
+            critical_event_overflow,
             expected_closes: HashSet::new(),
         });
         Ok((id, label))

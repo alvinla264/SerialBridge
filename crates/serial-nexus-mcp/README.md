@@ -133,8 +133,10 @@ the file, then performs the paired TLS connection itself:
    created for this session only. See
    [`docs/sharing.md`](../../docs/sharing.md) for the core contract.
 2. create `~/.config/serial-nexus/mcp-peers.json` (`$XDG_CONFIG_HOME` is
-   honoured, and `SERIAL_NEXUS_MCP_PEERS` names another file; if none of these
-   is set the server says so instead of reading a relative file) with mode `600`:
+   honoured, and `SERIAL_NEXUS_MCP_PEERS` names another file; if that override
+   is relative, it is resolved against the MCP process's working directory; if
+   no path can be configured, the server says so instead of reading a relative
+   default file) with mode `600`:
 
 ```sh
 install -d -m 700 ~/.config/serial-nexus

@@ -17,6 +17,7 @@ use serial_nexus_protocol::{
 };
 
 use crate::autostart::{find_core_binary, spawn_core};
+use crate::gateway::GATEWAY_HANDSHAKE_TIMEOUT;
 use crate::ClientError;
 
 const DEFAULT_LIMITS: Limits = Limits {
@@ -160,6 +161,7 @@ impl Client {
             ));
         }
         stream.write_all(&line)?;
+        stream.set_read_timeout(Some(GATEWAY_HANDSHAKE_TIMEOUT))?;
         let mut handshake_reader = BufReader::new(stream.try_clone()?);
         let handshake_line =
             serial_nexus_protocol::read_line(&mut handshake_reader, MAX_GATEWAY_MESSAGE_BYTES)?
@@ -181,6 +183,7 @@ impl Client {
         if let Some(error) = handshake.error {
             return Err(ClientError::GatewayHandshake(error));
         }
+        stream.set_read_timeout(None)?;
         let mut config = ClientConfig::new(client);
         config.socket = socket;
         config.auto_start = false;

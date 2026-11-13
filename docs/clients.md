@@ -150,7 +150,9 @@ local terminal gateway; the gateway opens and validates it before connecting.
 
 - path: `SERIAL_NEXUS_MCP_PEERS`, else `$XDG_CONFIG_HOME/serial-nexus/mcp-peers.json`,
   else `~/.config/serial-nexus/mcp-peers.json`; with none of those set the
-  loader fails instead of reading a relative file from the current directory;
+  loader fails instead of reading a relative default file. If the explicit
+  `SERIAL_NEXUS_MCP_PEERS` value is relative, it is resolved against the MCP
+  process's working directory before its path is sent to the gateway;
 - shape: `{ "version": 1, "peers": [ { "endpoint": {"address", "port"}, "paired": {...}, "secret": {"role", "credential"} } ] }`;
 - it must be a regular file owned by the current user with no group or world
   permission bits; a symlink, another owner or mode `644` is refused

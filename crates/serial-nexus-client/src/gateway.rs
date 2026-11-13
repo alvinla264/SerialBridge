@@ -27,7 +27,7 @@ use crate::{Client, ClientError, Peers, RemoteClient, RemoteEndpoint};
 const MAX_GATEWAY_CLIENTS: usize = 64;
 const EVENT_QUEUE_CAPACITY: usize = 1024;
 const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const GATEWAY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const GATEWAY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const ACCEPT_POLL: Duration = Duration::from_millis(20);
 
 /// Paths used by a terminal-owned gateway. The gateway never starts the core.
@@ -157,12 +157,19 @@ impl GatewayServer {
                             let sessions = Arc::clone(&thread_sessions);
                             let core_socket = core_socket.clone();
                             let worker_control = control.clone();
-                            let _ = thread::Builder::new()
+                            if thread::Builder::new()
                                 .name("serial-nexus-gateway-client".into())
                                 .spawn(move || {
                                     serve_connection(stream, &core_socket, worker_control);
                                     sessions.lock().expect("gateway sessions lock").remove(&id);
-                                });
+                                })
+                                .is_err()
+                            {
+                                thread_sessions
+                                    .lock()
+                                    .expect("gateway sessions lock")
+                                    .remove(&id);
+                            }
                         }
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                             thread::sleep(ACCEPT_POLL);

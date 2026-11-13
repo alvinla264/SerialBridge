@@ -15,6 +15,35 @@ use serial_nexus_protocol::{
 use tempfile::tempdir;
 
 #[test]
+fn client_times_out_when_a_gateway_does_not_acknowledge_its_connect_frame() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("stalled-gateway.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        read_line(&mut reader, MAX_GATEWAY_MESSAGE_BYTES)
+            .unwrap()
+            .expect("connect frame");
+        thread::sleep(Duration::from_millis(2500));
+    });
+
+    let started = Instant::now();
+    let result = Client::connect_to_gateway(
+        path,
+        GatewayTarget::Local,
+        ClientInfo::human("stalled-gateway-test"),
+    );
+
+    assert!(result.is_err(), "a silent gateway must not hang the client");
+    assert!(
+        started.elapsed() < Duration::from_millis(2400),
+        "the client should honor its bounded gateway handshake read"
+    );
+    server.join().expect("stalled server exits");
+}
+
+#[test]
 fn gateway_server_rejects_an_unsupported_protocol_version() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("gateway.sock");
