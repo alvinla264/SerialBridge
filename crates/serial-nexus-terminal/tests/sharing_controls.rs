@@ -606,6 +606,16 @@ fn a_failed_save_keeps_a_checked_draft_when_discovery_identity_is_lost() {
         app.state.draft_checked.contains(&path),
         "a failed save retains the human's checklist draft"
     );
+    let detected = app.state.detected_local_identities();
+    app.state.reconcile_share_checks(&detected);
+    assert!(
+        app.state.sharing.pending_checked.contains(&path),
+        "a later refresh must preserve an existing path while its identity is temporarily unavailable"
+    );
+    assert!(
+        app.state.draft_checked.contains(&path),
+        "a later refresh must not discard the attempted checklist draft"
+    );
     assert_eq!(
         app.state.notice.as_ref().map(|notice| notice.severity),
         Some(Severity::Error)
@@ -648,8 +658,9 @@ fn sharing_does_not_start_when_a_checked_device_has_no_current_identity() {
         .position(|device| device.path == path)
         .expect("detected device");
     app.state.devices[index].identity = None;
+    assert!(!app.state.sharing.active, "test starts with sharing off");
 
-    start(&mut app);
+    app.start_sharing();
 
     assert!(!app.state.sharing.active);
     assert!(!app.state.sharing.pending_checked.contains(&path));

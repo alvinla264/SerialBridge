@@ -1028,6 +1028,9 @@ fn describe_error(error: &ClientError, device: Option<&str>) -> String {
         ClientError::Disconnected(reason) => format!(
             "the terminal gateway connection was lost ({reason}); confirm serial-nexus-terminal is running and retry"
         ),
+        ClientError::WriteUncertain(reason) => format!(
+            "serial write outcome uncertain ({reason}); the bytes may have reached the device and were not sent again"
+        ),
         ClientError::Timeout(reason) => format!("serial-nexus-core did not answer in time: {reason}"),
         ClientError::UnsupportedProtocol { core, client } => format!(
             "serial-nexus-core speaks protocol {core}, this serial-nexus-mcp speaks {client}; upgrade one of them"
@@ -1337,6 +1340,17 @@ mod tests {
             session.connection(Target::Local, 1).as_deref(),
             Some("/dev/ttyUSB0")
         );
+    }
+
+    #[test]
+    fn local_uncertain_write_error_says_not_to_replay() {
+        let message = describe_error(
+            &ClientError::WriteUncertain("gateway disconnected after submission".into()),
+            Some("/dev/ttyUSB0"),
+        );
+        assert!(message.contains("outcome uncertain"));
+        assert!(message.contains("may have reached the device"));
+        assert!(message.contains("were not sent again"));
     }
 
     #[test]

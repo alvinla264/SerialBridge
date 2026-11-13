@@ -668,3 +668,21 @@ fn write_server_message_locked(stream: &mut UnixStream, message: &ServerMessage)
     stream.write_all(&line)?;
     stream.flush()
 }
+
+#[cfg(test)]
+mod uncertainty_tests {
+    use super::{request_error, ClientError};
+    use serial_nexus_protocol::ErrorCode;
+
+    #[test]
+    fn a_gateway_error_preserves_the_may_have_reached_device_marker() {
+        let body = request_error(
+            ClientError::WriteUncertain("accepted write lost its answer".into()),
+            true,
+        );
+        assert_eq!(body.code, ErrorCode::Internal);
+        let error = ClientError::from(body);
+        assert!(error.is_write_uncertain(), "{error:?}");
+        assert!(matches!(error, ClientError::WriteUncertain(_)));
+    }
+}

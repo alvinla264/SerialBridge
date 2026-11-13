@@ -126,6 +126,7 @@ fn reopening_connect_keeps_the_in_progress_pairing_form() {
     form.ca = "pinned-ca".into();
     form.fingerprint = "pinned-fingerprint".into();
     form.credential = "in-progress-secret".into();
+    form.error = Some("old connection error".into());
 
     terminal.app.start_connect();
 
@@ -135,6 +136,39 @@ fn reopening_connect_keeps_the_in_progress_pairing_form() {
     assert_eq!(form.ca, "pinned-ca");
     assert_eq!(form.fingerprint, "pinned-fingerprint");
     assert_eq!(form.credential, "in-progress-secret");
+    assert!(
+        form.error.is_none(),
+        "reopened form must not show a stale error"
+    );
+}
+
+#[test]
+fn reconnecting_to_an_already_connected_endpoint_does_not_duplicate_the_group() {
+    let _guard = serial_test();
+    let device = SimulatedDevice::new();
+    let host = start_host(
+        &[&device.path],
+        Arc::new(Mutex::new(vec![PathBuf::from(&device.path)])),
+    );
+    let (_local, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let mut terminal = Terminal::new(&socket);
+
+    terminal.connect(&host.info);
+    let first_ids: Vec<_> = terminal.app.state.remote_labels.keys().copied().collect();
+    assert_eq!(first_ids.len(), 1);
+    terminal.connect(&host.info);
+
+    assert_eq!(
+        terminal
+            .app
+            .state
+            .remote_labels
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        first_ids,
+        "the same live endpoint should reuse its existing group"
+    );
 }
 
 #[test]

@@ -114,6 +114,7 @@ struct LastClick {
 /// sessions and failures apart from every other host.
 struct RemoteLink {
     id: EndpointId,
+    endpoint: RemoteEndpoint,
     client: RemoteClient,
     events: Receiver<Event>,
     expected_closes: HashSet<u64>,
@@ -1056,7 +1057,9 @@ impl App {
             return;
         }
         self.state.prompt = None;
-        if self.state.connect.is_none() {
+        if let Some(form) = &mut self.state.connect {
+            form.error = None;
+        } else {
             self.state.connect = Some(ConnectForm::new());
         }
         self.state.view = View::Connect;
@@ -1164,7 +1167,16 @@ impl App {
             role: PairingRole::Human,
             credential: form.credential.trim().to_string(),
         };
-        let remote_client = serial_nexus_client::RemoteClient::connect(
+        let endpoint = RemoteEndpoint::from_socket_addr(paired.address).canonical();
+        if let Some(existing) = self
+            .remotes
+            .iter()
+            .find(|link| link.endpoint == endpoint && link.client.is_connected())
+        {
+            return Ok((existing.id, format!("Remote {endpoint}")));
+        }
+        let remote_client = serial_nexus_client::RemoteClient::connect_to(
+            endpoint,
             &paired,
             &secret,
             Some("serial-nexus-terminal".to_string()),
@@ -1177,6 +1189,7 @@ impl App {
         let events = remote_client.subscribe_bounded(1024);
         self.remotes.push(RemoteLink {
             id,
+            endpoint,
             client: remote_client,
             events,
             expected_closes: HashSet::new(),

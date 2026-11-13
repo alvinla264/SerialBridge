@@ -159,17 +159,29 @@ impl Checklist {
 
     /// Reconcile with current discovery: fill a missing identity, drop a path
     /// that vanished, and drop one whose recorded identity changed.
-    fn sync(&mut self, detected: &BTreeMap<String, String>) {
+    fn sync(&mut self, detected: &BTreeMap<String, Option<String>>) {
         self.entries.retain(|path, recorded| {
-            detected
-                .get(path)
-                .is_some_and(|current| recorded.as_ref().is_none_or(|recorded| recorded == current))
+            let Some(current) = detected.get(path) else {
+                return false;
+            };
+            current
+                .as_ref()
+                .is_none_or(|current| recorded.as_ref().is_none_or(|recorded| recorded == current))
         });
         for (path, identity) in detected {
-            if let Some(recorded) = self.entries.get_mut(path) {
+            if let (Some(recorded), Some(identity)) = (self.entries.get_mut(path), identity) {
                 *recorded = Some(identity.clone());
             }
         }
+    }
+
+    fn retain_current_identities(&mut self, detected: &BTreeMap<String, Option<String>>) {
+        self.entries.retain(|path, identity| {
+            identity
+                .as_ref()
+                .zip(detected.get(path).and_then(Option::as_ref))
+                .is_some_and(|(recorded, current)| recorded == current)
+        });
     }
 
     fn paths(&self) -> BTreeSet<String> {
@@ -1345,7 +1357,7 @@ impl AppState {
             let detected = self.detected_local_identities();
             self.sharing.pending_checked = Checklist::new();
             for device in &snapshot.checked {
-                if let Some(identity) = detected.get(&device.path) {
+                if let Some(Some(identity)) = detected.get(&device.path) {
                     self.sharing
                         .pending_checked
                         .insert_with_identity(device.path.clone(), identity.clone());
@@ -1379,7 +1391,7 @@ impl AppState {
     /// Reconcile both checklists against current identities in one operation.
     /// A vanished device or replacement loses its selection; current identity
     /// tokens are captured for surviving paths.
-    pub fn reconcile_share_checks(&mut self, detected: &BTreeMap<String, String>) {
+    pub fn reconcile_share_checks(&mut self, detected: &BTreeMap<String, Option<String>>) {
         self.sharing.pending_checked.sync(detected);
         self.draft_checked.sync(detected);
     }
@@ -1390,19 +1402,18 @@ impl AppState {
     pub fn drop_replaced_checks(&mut self) {
         let detected = self.detected_local_identities();
         self.reconcile_share_checks(&detected);
+        self.sharing
+            .pending_checked
+            .retain_current_identities(&detected);
+        self.draft_checked.retain_current_identities(&detected);
     }
 
     /// The local devices the core currently detects, mapped to their identity.
-    pub fn detected_local_identities(&self) -> BTreeMap<String, String> {
+    pub fn detected_local_identities(&self) -> BTreeMap<String, Option<String>> {
         self.devices
             .iter()
             .filter(|device| device.endpoint == LOCAL_ENDPOINT)
-            .filter_map(|device| {
-                device
-                    .identity
-                    .as_ref()
-                    .map(|identity| (device.path.clone(), identity.clone()))
-            })
+            .map(|device| (device.path.clone(), device.identity.clone()))
             .collect()
     }
 
@@ -1951,7 +1962,10 @@ mod sharing_tests {
     #[test]
     fn failed_save_stop_restores_effective_checks_but_keeps_attempted_checklist_draft() {
         let mut state = state_with_devices();
+        state.devices[0].identity = Some("node-0".into());
         let original: Checklist = ["/dev/ttyUSB0".to_string()].into_iter().collect();
+        let mut original = original;
+        original.insert_with_identity("/dev/ttyUSB0".into(), "node-0".into());
         let attempted: Checklist = ["/dev/ttyUSB1".to_string()].into_iter().collect();
         state.sharing.active = true;
         state.sharing.pending_checked = original.clone();
@@ -1959,10 +1973,13 @@ mod sharing_tests {
         state.view = View::Settings;
 
         state.stop_after_failed_settings_compensation(original.clone(), attempted.clone());
+        state.devices[0].identity = None;
+        let detected = state.detected_local_identities();
+        state.reconcile_share_checks(&detected);
 
         assert!(!state.sharing.active);
         assert!(state.sharing.pending_checked.contains("/dev/ttyUSB0"));
-        assert_eq!(state.draft_checked, attempted);
+        assert!(state.draft_checked.contains("/dev/ttyUSB1"));
         assert!(state.has_unsaved_settings());
     }
 
@@ -1995,7 +2012,7 @@ mod sharing_tests {
 
         checklist.sync(&BTreeMap::from([(
             "/dev/ttyUSB0".to_string(),
-            "stable-node".to_string(),
+            Some("stable-node".to_string()),
         )]));
         assert_eq!(
             checklist
@@ -2127,9 +2144,9 @@ mod sharing_tests {
         assert_eq!(state.toggle_draft(), Some(true));
         assert!(state.draft_checked.contains("/dev/ttyUSB0"));
 
-        let detected: BTreeMap<String, String> = [
-            ("/dev/ttyUSB0".to_string(), "new-node".to_string()),
-            ("/dev/ttyUSB1".to_string(), "other-node".to_string()),
+        let detected: BTreeMap<String, Option<String>> = [
+            ("/dev/ttyUSB0".to_string(), Some("new-node".to_string())),
+            ("/dev/ttyUSB1".to_string(), Some("other-node".to_string())),
         ]
         .into_iter()
         .collect();
@@ -2159,9 +2176,10 @@ mod sharing_tests {
         state
             .draft_checked
             .insert_with_identity("/dev/ttyUSB1".into(), "id1".into());
-        let detected: BTreeMap<String, String> = [("/dev/ttyUSB1".to_string(), "id1".to_string())]
-            .into_iter()
-            .collect();
+        let detected: BTreeMap<String, Option<String>> =
+            [("/dev/ttyUSB1".to_string(), Some("id1".to_string()))]
+                .into_iter()
+                .collect();
         state.reconcile_share_checks(&detected);
         assert!(!state.sharing.pending_checked.contains("/dev/ttyUSB0"));
         assert!(state.draft_checked.contains("/dev/ttyUSB1"));

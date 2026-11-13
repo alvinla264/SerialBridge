@@ -470,8 +470,8 @@ impl RemoteClient {
 
     /// Subscribe with a bounded queue. A peer that floods events fills the
     /// queue; further events are dropped for this subscriber instead of growing
-    /// memory without limit or blocking the reader thread. The connection
-    /// itself is unaffected.
+    /// memory without limit or blocking the reader thread. Draining the queue
+    /// resumes delivery.
     pub fn subscribe_bounded(&self, capacity: usize) -> Receiver<Event> {
         let (tx, rx) = bounded(capacity.max(1));
         self.inner
@@ -657,8 +657,8 @@ fn send_event_to_subscribers(subscribers: &Arc<Mutex<Vec<Sender<Event>>>>, event
         .lock()
         .expect("subscribers lock")
         .retain(|tx| match tx.try_send(event.clone()) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
+            Ok(()) | Err(TrySendError::Full(_)) => true,
+            Err(TrySendError::Disconnected(_)) => false,
         });
 }
 
@@ -691,11 +691,11 @@ mod tests {
     }
 
     #[test]
-    fn a_full_bounded_subscriber_is_dropped_without_blocking() {
+    fn a_full_bounded_subscriber_drops_events_without_blocking_or_unsubscribing() {
         let (tx, rx) = bounded(1);
         let subscribers = Arc::new(Mutex::new(vec![tx]));
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
-        for reason in ["first", "second"] {
+        for reason in ["first", "dropped"] {
             dispatch(
                 ServerMessage::Event {
                     event: Event::TransportClosed {
@@ -708,19 +708,25 @@ mod tests {
         }
         assert_eq!(
             subscribers.lock().expect("subscribers lock").len(),
-            0,
-            "a full subscriber is dropped so its client sees the overflow"
+            1,
+            "a full subscriber remains active after dropping an event"
         );
         match rx.try_recv().expect("the first event") {
             Event::TransportClosed { reason } => assert_eq!(reason, "first"),
             other => panic!("unexpected event {other:?}"),
         }
-        assert!(
-            matches!(
-                rx.try_recv(),
-                Err(crossbeam_channel::TryRecvError::Disconnected)
-            ),
-            "the receiver reports the dropped subscription"
+        dispatch(
+            ServerMessage::Event {
+                event: Event::TransportClosed {
+                    reason: "resumed".into(),
+                },
+            },
+            &pending,
+            &subscribers,
         );
+        match rx.try_recv().expect("delivery resumes after draining") {
+            Event::TransportClosed { reason } => assert_eq!(reason, "resumed"),
+            other => panic!("unexpected event {other:?}"),
+        }
     }
 }
