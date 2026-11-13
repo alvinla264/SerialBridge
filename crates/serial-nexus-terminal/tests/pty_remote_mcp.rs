@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -53,6 +54,8 @@ struct Mcp {
     stdout: Arc<Mutex<String>>,
     stderr: Arc<Mutex<String>>,
     secrets: Arc<Mutex<Vec<String>>>,
+    stdout_reader: Option<JoinHandle<()>>,
+    stderr_reader: Option<JoinHandle<()>>,
     next_id: u64,
 }
 
@@ -77,7 +80,7 @@ impl Mcp {
 
         let (tx, rx) = channel();
         let seen_stdout = Arc::new(Mutex::new(String::new()));
-        {
+        let stdout_reader = {
             let seen = Arc::clone(&seen_stdout);
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(stdout_pipe);
@@ -101,10 +104,10 @@ impl Mcp {
                         }
                     }
                 }
-            });
-        }
+            })
+        };
         let seen_stderr = Arc::new(Mutex::new(String::new()));
-        {
+        let stderr_reader = {
             let seen = Arc::clone(&seen_stderr);
             std::thread::spawn(move || {
                 let mut reader = stderr_pipe;
@@ -119,8 +122,8 @@ impl Mcp {
                         }
                     }
                 }
-            });
-        }
+            })
+        };
 
         let mut mcp = Self {
             child,
@@ -131,6 +134,8 @@ impl Mcp {
             secrets: Arc::new(Mutex::new(
                 secrets.iter().map(|secret| (*secret).to_string()).collect(),
             )),
+            stdout_reader: Some(stdout_reader),
+            stderr_reader: Some(stderr_reader),
             next_id: 1,
         };
         mcp.initialize();
@@ -215,6 +220,32 @@ impl Mcp {
         }
     }
 
+    /// Close stdin, wait for the server to exit and join both collectors, so
+    /// the final transcript includes its shutdown output.
+    fn finish(&mut self) {
+        self.stdin.take();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    break;
+                }
+            }
+        }
+        if let Some(reader) = self.stdout_reader.take() {
+            let _ = reader.join();
+        }
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = reader.join();
+        }
+    }
+
     fn stdout_text(&self) -> String {
         self.stdout
             .lock()
@@ -232,21 +263,7 @@ impl Mcp {
 
 impl Drop for Mcp {
     fn drop(&mut self) {
-        self.stdin.take();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                _ => {
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
-                    return;
-                }
-            }
-        }
+        self.finish();
     }
 }
 
@@ -561,7 +578,18 @@ fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway()
         writeln!(stdin, "{line}").expect("write pending send");
         stdin.flush().expect("flush pending send");
     }
-    let before_stop = drain_serial(&mut device, Duration::from_millis(200));
+    let mut before_stop = Vec::new();
+    let arrival = Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&before_stop).contains("uncertain-request")
+        && Instant::now() < arrival
+    {
+        before_stop.extend(device.try_read());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        String::from_utf8_lossy(&before_stop).contains("uncertain-request"),
+        "the pending write never reached the device"
+    );
     owner.stop_sharing().expect("sharing stops mid-write");
     let answer = answer_for(&mut mcp, 98);
     let result = &answer["result"];
@@ -573,6 +601,7 @@ fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway()
         .as_str()
         .unwrap_or_default()
         .to_lowercase();
+    let uncertainty = mcp.redacted(&uncertainty);
     assert!(
         uncertainty.contains("may have reached") || uncertainty.contains("uncertain"),
         "the error must say the write may have reached the device: {uncertainty}"
@@ -587,7 +616,8 @@ fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway()
     );
     assert!(
         after_stop.is_empty(),
-        "an uncertain write is never retried: {after_stop:?}"
+        "an uncertain write is never retried: {:?}",
+        mcp.redacted(&after_stop)
     );
     for value in [&before_stop, &after_stop] {
         assert!(!value.contains(&info.ai.credential));
@@ -651,8 +681,9 @@ fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway()
         "MCP must fail without the terminal gateway instead of starting a core: {text}"
     );
 
-    // No pairing value appeared anywhere in the server's output or
-    // diagnostics, across success, revocation, rotation and gateway loss.
+    // No pairing value appeared anywhere in the complete process transcript:
+    // close stdin and join both collectors so shutdown output is included.
+    mcp.finish();
     let output = mcp.stdout_text();
     let diagnostics = mcp.stderr_text();
     for secret in [
