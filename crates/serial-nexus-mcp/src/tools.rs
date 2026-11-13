@@ -12,6 +12,7 @@
 //! through tool arguments and is never part of a result.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -183,6 +184,16 @@ impl Session {
                 "cannot locate the MCP pairing file for remote {endpoint}: {error}"
             ))
         })?;
+        let pairing_file = if pairing_file.is_absolute() {
+            pairing_file
+        } else {
+            let cwd = std::env::current_dir().map_err(|error| {
+                Failure::Tool(format!(
+                    "cannot resolve the relative MCP pairing file for remote {endpoint}: {error}"
+                ))
+            })?;
+            resolve_pairing_path(pairing_file, &cwd)
+        };
         let client = Client::connect_to_gateway_with_pairing(
             paths::default_gateway_socket_path(),
             GatewayTarget::Remote {
@@ -1015,6 +1026,14 @@ fn human_duration(millis: u64) -> String {
 }
 
 /// Turn a core error into a message an AI host (and its human) can act on.
+fn resolve_pairing_path(path: PathBuf, cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
 fn describe_error(error: &ClientError, device: Option<&str>) -> String {
     if let ClientError::Server(body) = error {
         return describe_server_error(body, device, false);
@@ -1339,6 +1358,19 @@ mod tests {
         assert_eq!(
             session.connection(Target::Local, 1).as_deref(),
             Some("/dev/ttyUSB0")
+        );
+    }
+
+    #[test]
+    fn relative_pairing_paths_resolve_in_the_mcp_process_directory() {
+        let cwd = Path::new("/var/tmp/mcp-host");
+        assert_eq!(
+            resolve_pairing_path(PathBuf::from("peers.json"), cwd),
+            cwd.join("peers.json")
+        );
+        assert_eq!(
+            resolve_pairing_path(PathBuf::from("/etc/serial-nexus/peers.json"), cwd),
+            PathBuf::from("/etc/serial-nexus/peers.json")
         );
     }
 

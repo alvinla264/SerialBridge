@@ -134,6 +134,18 @@ impl Checklist {
         }
     }
 
+    fn preserve_selected_path(&mut self, path: &str, previous: &Checklist) {
+        match previous.entries.get(path) {
+            Some(Some(identity)) => {
+                self.insert_with_identity(path.to_string(), identity.clone());
+            }
+            Some(None) => {
+                self.insert(path.to_string());
+            }
+            None => {}
+        }
+    }
+
     pub fn insert_with_identity(&mut self, path: String, identity: String) -> bool {
         use std::collections::btree_map::Entry;
         if let Entry::Vacant(entry) = self.entries.entry(path) {
@@ -178,11 +190,6 @@ impl Checklist {
                 .as_ref()
                 .is_none_or(|current| recorded.as_ref().is_none_or(|recorded| recorded == current))
         });
-        for (path, identity) in detected {
-            if let (Some(recorded), Some(identity)) = (self.entries.get_mut(path), identity) {
-                *recorded = Some(identity.clone());
-            }
-        }
     }
 
     fn retain_current_identities(&mut self, detected: &BTreeMap<String, Option<String>>) {
@@ -1366,58 +1373,21 @@ impl AppState {
             }
             let detected = self.detected_local_identities();
             let pending_before_sync = self.sharing.pending_checked.clone();
-            let pending_identities = pending_before_sync.identities();
             self.sharing.pending_checked = Checklist::new();
             for device in &snapshot.checked {
-                match detected.get(&device.path) {
-                    Some(Some(identity)) => {
-                        let previous_identity = pending_identities.get(&device.path);
-                        if previous_identity.is_none_or(|previous| previous == identity) {
-                            self.sharing
-                                .pending_checked
-                                .insert_with_identity(device.path.clone(), identity.clone());
-                        }
-                    }
-                    Some(None) | None => {
-                        if let Some(previous_identity) = pending_identities.get(&device.path) {
-                            self.sharing.pending_checked.insert_with_identity(
-                                device.path.clone(),
-                                previous_identity.clone(),
-                            );
-                        } else {
-                            self.sharing.pending_checked.insert(device.path.clone());
-                        }
-                    }
+                if pending_before_sync.contains(&device.path) {
+                    self.sharing
+                        .pending_checked
+                        .preserve_selected_path(&device.path, &pending_before_sync);
+                } else {
+                    self.sharing.pending_checked.insert(device.path.clone());
                 }
             }
             let draft_before_sync = self.draft_checked.clone();
-            let draft_identities = draft_before_sync.identities();
             self.draft_checked.sync(&detected);
             for device in &snapshot.checked {
-                if !draft_before_sync.contains(&device.path) {
-                    continue;
-                }
-                match detected.get(&device.path) {
-                    Some(Some(identity)) => {
-                        if draft_identities
-                            .get(&device.path)
-                            .is_none_or(|previous| previous == identity)
-                        {
-                            self.draft_checked
-                                .insert_with_identity(device.path.clone(), identity.clone());
-                        }
-                    }
-                    Some(None) | None => {
-                        if let Some(previous_identity) = draft_identities.get(&device.path) {
-                            self.draft_checked.insert_with_identity(
-                                device.path.clone(),
-                                previous_identity.clone(),
-                            );
-                        } else {
-                            self.draft_checked.insert(device.path.clone());
-                        }
-                    }
-                }
+                self.draft_checked
+                    .preserve_selected_path(&device.path, &draft_before_sync);
             }
         }
         // An inactive snapshot says only that sharing is off; the session-only
@@ -1444,11 +1414,28 @@ impl AppState {
     /// Drop checked devices that are no longer detected. The core revokes
     /// their authorization; the checkbox must not survive a replacement.
     /// Reconcile both checklists against current identities in one operation.
-    /// A vanished device or replacement loses its selection; current identity
-    /// tokens are captured for surviving paths.
+    /// A vanished path or a known replacement loses its selection. A check
+    /// without a captured identity stays unverified until explicitly selected again.
     pub fn reconcile_share_checks(&mut self, detected: &BTreeMap<String, Option<String>>) {
+        let pending_before_sync = self.sharing.pending_checked.clone();
+        let draft_before_sync = self.draft_checked.clone();
         self.sharing.pending_checked.sync(detected);
         self.draft_checked.sync(detected);
+        if self.sharing.active {
+            if let Some(snapshot) = &self.sharing.snapshot {
+                for device in &snapshot.checked {
+                    if pending_before_sync.contains(&device.path) {
+                        self.sharing
+                            .pending_checked
+                            .preserve_selected_path(&device.path, &pending_before_sync);
+                    } else {
+                        self.sharing.pending_checked.insert(device.path.clone());
+                    }
+                    self.draft_checked
+                        .preserve_selected_path(&device.path, &draft_before_sync);
+                }
+            }
+        }
     }
 
     /// Drop a check whose recorded identity no longer matches the device at
@@ -2086,7 +2073,23 @@ mod sharing_tests {
     }
 
     #[test]
-    fn checklist_represents_missing_identity_explicitly_and_fills_it_on_sync() {
+    fn a_missing_check_identity_needs_explicit_reselection_after_discovery_recovers() {
+        let mut checklist: Checklist = ["/dev/ttyUSB0".to_string()].into_iter().collect();
+        let detected = BTreeMap::from([(
+            "/dev/ttyUSB0".to_string(),
+            Some("new-generation".to_string()),
+        )]);
+
+        checklist.sync(&detected);
+        assert!(checklist.contains("/dev/ttyUSB0"));
+        assert!(checklist.identities().is_empty());
+        checklist.retain_current_identities(&detected);
+
+        assert!(!checklist.contains("/dev/ttyUSB0"));
+    }
+
+    #[test]
+    fn checklist_represents_missing_identity_explicitly_without_adopting_it_on_sync() {
         let mut checklist: Checklist = ["/dev/ttyUSB0".to_string()].into_iter().collect();
         assert!(checklist.contains("/dev/ttyUSB0"));
         assert!(checklist.identities().is_empty());
@@ -2095,13 +2098,7 @@ mod sharing_tests {
             "/dev/ttyUSB0".to_string(),
             Some("stable-node".to_string()),
         )]));
-        assert_eq!(
-            checklist
-                .identities()
-                .get("/dev/ttyUSB0")
-                .map(String::as_str),
-            Some("stable-node")
-        );
+        assert!(checklist.identities().is_empty());
     }
 
     #[test]

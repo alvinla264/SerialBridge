@@ -271,7 +271,12 @@ impl App {
         while let Ok(event) = self.events.try_recv() {
             self.handle_event(LOCAL_ENDPOINT, event);
         }
-        let mut overflowed = Vec::new();
+        let mut disconnected: Vec<EndpointId> = self
+            .remotes
+            .iter()
+            .filter(|link| !link.client.is_connected())
+            .map(|link| link.id)
+            .collect();
         let pending: Vec<(EndpointId, Vec<Event>)> = self
             .remotes
             .iter()
@@ -282,7 +287,7 @@ impl App {
                         Ok(event) => events.push(event),
                         Err(crossbeam_channel::TryRecvError::Empty) => break,
                         Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                            overflowed.push(link.id);
+                            disconnected.push(link.id);
                             break;
                         }
                     }
@@ -295,9 +300,11 @@ impl App {
                 self.handle_event(id, event);
             }
         }
-        for id in overflowed {
+        disconnected.sort_unstable();
+        disconnected.dedup();
+        for id in disconnected {
             if self.remotes.iter().any(|link| link.id == id) {
-                self.drop_remote(id, "remote host disconnected: its event queue overflowed");
+                self.drop_remote(id, "remote host disconnected: its event stream closed");
             }
         }
     }
@@ -761,9 +768,13 @@ impl App {
             .filter(|_| self.state.sharing.active)
         {
             let detected = self.state.detected_local_identities();
+            let expected = self.state.draft_checked.identities();
             let unverified_checked = snapshot.checked.iter().any(|device| {
                 self.state.draft_checked.contains(&device.path)
-                    && !matches!(detected.get(&device.path), Some(Some(_)))
+                    && !matches!(
+                        (detected.get(&device.path), expected.get(&device.path)),
+                        (Some(Some(current)), Some(recorded)) if current == recorded
+                    )
             });
             if unverified_checked {
                 self.state.notice = Some(Notice::error(

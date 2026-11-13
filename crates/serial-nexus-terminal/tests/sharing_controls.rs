@@ -14,7 +14,7 @@ use serial_nexus_client::{ClientInfo, RemoteClient};
 use serial_nexus_protocol::{PairedHost, PairingRole, PairingSecret, SharingSnapshot};
 use serial_nexus_terminal::app::App;
 use serial_nexus_terminal::settings::SettingsStore;
-use serial_nexus_terminal::state::{Notice, Severity, SETTINGS_FIXED_ROWS};
+use serial_nexus_terminal::state::{Checklist, Notice, Severity, SETTINGS_FIXED_ROWS};
 use support::{connect, start_core, PortListerGuard, SimulatedDevice};
 use tempfile::TempDir;
 
@@ -668,10 +668,12 @@ fn saving_preferences_does_not_revoke_a_shared_device_during_temporary_identity_
         .snapshot
         .clone()
         .expect("active sharing snapshot");
+    app.state.apply_sharing_snapshot(snapshot.clone());
+    app.state.devices[index].identity = Some("snx-refreshed-after-gap".into());
     app.state.apply_sharing_snapshot(snapshot);
     assert!(
         app.state.sharing.pending_checked.contains(&path),
-        "the core-authoritative selection survives a transient missing identity"
+        "the core-authoritative selection survives a refreshed discovery token"
     );
 
     app.state.begin_settings();
@@ -688,6 +690,80 @@ fn saving_preferences_does_not_revoke_a_shared_device_during_temporary_identity_
         }),
         "save must refuse rather than silently revoke the checked device"
     );
+    app.shutdown();
+}
+
+#[test]
+fn a_reappeared_path_with_a_new_identity_is_not_shared_without_rechecking() {
+    let (fixture, devices) = Fixture::new();
+    let mut app = fixture.app();
+    let path = devices[0].path.clone();
+    check_device(&mut app, &path);
+    set_bind(&mut app, "127.0.0.1", 0);
+    save(&mut app);
+    app.start_sharing();
+    assert!(app.state.sharing.active);
+    let index = app
+        .state
+        .devices
+        .iter()
+        .position(|device| device.path == path)
+        .expect("detected device");
+    app.state.devices[index].identity = None;
+    let snapshot = app
+        .state
+        .sharing
+        .snapshot
+        .clone()
+        .expect("active sharing snapshot");
+    app.state.apply_sharing_snapshot(snapshot);
+
+    app.stop_sharing();
+    app.state.devices[index].identity = Some("replacement-generation".into());
+    app.start_sharing();
+
+    assert!(!app.state.sharing.active);
+    assert!(!app.state.sharing.pending_checked.contains(&path));
+    assert!(app.state.notice.as_ref().is_some_and(|notice| {
+        notice.severity == Severity::Error && notice.text.contains("check at least one device")
+    }));
+    app.shutdown();
+}
+
+#[test]
+fn an_active_selection_without_identity_cannot_adopt_a_replacement_after_stop() {
+    let (fixture, devices) = Fixture::new();
+    let mut app = fixture.app();
+    let path = devices[0].path.clone();
+    check_device(&mut app, &path);
+    set_bind(&mut app, "127.0.0.1", 0);
+    save(&mut app);
+    app.start_sharing();
+    assert!(app.state.sharing.active);
+
+    app.state.sharing.pending_checked = [path.clone()].into_iter().collect::<Checklist>();
+    app.state.draft_checked = app.state.sharing.pending_checked.clone();
+    let index = app
+        .state
+        .devices
+        .iter()
+        .position(|device| device.path == path)
+        .expect("detected device");
+    app.state.devices[index].identity = None;
+    let snapshot = app
+        .state
+        .sharing
+        .snapshot
+        .clone()
+        .expect("active sharing snapshot");
+    app.state.apply_sharing_snapshot(snapshot);
+
+    app.stop_sharing();
+    app.state.devices[index].identity = Some("replacement-generation".into());
+    app.start_sharing();
+
+    assert!(!app.state.sharing.active);
+    assert!(!app.state.sharing.pending_checked.contains(&path));
     app.shutdown();
 }
 
