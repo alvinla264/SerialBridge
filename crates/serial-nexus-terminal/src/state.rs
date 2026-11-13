@@ -146,6 +146,25 @@ impl Checklist {
         }
     }
 
+    /// Preserve the terminal's detected identity from the effective selection
+    /// or draft. The core snapshot's identity token is a different namespace.
+    fn preserve_snapshot_selection(
+        &mut self,
+        path: &str,
+        effective: &Checklist,
+        draft: &Checklist,
+    ) {
+        let previous = if effective.contains(path) {
+            effective
+        } else {
+            draft
+        };
+        self.preserve_selected_path(path, previous);
+        if !self.contains(path) {
+            self.insert(path.to_string());
+        }
+    }
+
     pub fn insert_with_identity(&mut self, path: String, identity: String) -> bool {
         use std::collections::btree_map::Entry;
         if let Entry::Vacant(entry) = self.entries.entry(path) {
@@ -1373,17 +1392,15 @@ impl AppState {
             }
             let detected = self.detected_local_identities();
             let pending_before_sync = self.sharing.pending_checked.clone();
+            let draft_before_sync = self.draft_checked.clone();
             self.sharing.pending_checked = Checklist::new();
             for device in &snapshot.checked {
-                if pending_before_sync.contains(&device.path) {
-                    self.sharing
-                        .pending_checked
-                        .preserve_selected_path(&device.path, &pending_before_sync);
-                } else {
-                    self.sharing.pending_checked.insert(device.path.clone());
-                }
+                self.sharing.pending_checked.preserve_snapshot_selection(
+                    &device.path,
+                    &pending_before_sync,
+                    &draft_before_sync,
+                );
             }
-            let draft_before_sync = self.draft_checked.clone();
             self.draft_checked.sync(&detected);
             for device in &snapshot.checked {
                 self.draft_checked
@@ -1424,13 +1441,11 @@ impl AppState {
         if self.sharing.active {
             if let Some(snapshot) = &self.sharing.snapshot {
                 for device in &snapshot.checked {
-                    if pending_before_sync.contains(&device.path) {
-                        self.sharing
-                            .pending_checked
-                            .preserve_selected_path(&device.path, &pending_before_sync);
-                    } else {
-                        self.sharing.pending_checked.insert(device.path.clone());
-                    }
+                    self.sharing.pending_checked.preserve_snapshot_selection(
+                        &device.path,
+                        &pending_before_sync,
+                        &draft_before_sync,
+                    );
                     self.draft_checked
                         .preserve_selected_path(&device.path, &draft_before_sync);
                 }
@@ -2044,6 +2059,66 @@ mod sharing_tests {
         assert!(lost.is_empty());
         assert!(state.sharing.pending_checked.contains("/dev/ttyUSB0"));
         assert!(!state.sharing.active);
+    }
+
+    #[test]
+    fn an_active_snapshot_keeps_the_discovery_identity_of_a_newly_checked_device() {
+        let mut state = state_with_devices();
+        for device in &mut state.devices {
+            device.identity = Some("dev=1:2 ino=3".into());
+        }
+        state.sharing.active = true;
+        state.sharing.snapshot = Some(snapshot(&["/dev/ttyUSB0"]));
+        state
+            .sharing
+            .pending_checked
+            .insert_with_identity("/dev/ttyUSB0".into(), "dev=1:2 ino=3".into());
+        state
+            .draft_checked
+            .insert_with_identity("/dev/ttyUSB0".into(), "dev=1:2 ino=3".into());
+        state
+            .draft_checked
+            .insert_with_identity("/dev/ttyUSB1".into(), "dev=1:2 ino=3".into());
+
+        state.apply_sharing_snapshot(snapshot(&["/dev/ttyUSB0", "/dev/ttyUSB1"]));
+
+        assert_eq!(
+            state
+                .sharing
+                .pending_checked
+                .identities()
+                .get("/dev/ttyUSB1"),
+            Some(&"dev=1:2 ino=3".to_string())
+        );
+    }
+
+    #[test]
+    fn an_active_snapshot_restores_pending_checks_from_the_selected_draft() {
+        let mut state = state_with_devices();
+        for device in &mut state.devices {
+            device.identity = Some("dev=1:2 ino=3".into());
+        }
+        state.sharing.active = true;
+        state.sharing.snapshot = Some(snapshot(&["/dev/ttyUSB0", "/dev/ttyUSB1"]));
+        state
+            .sharing
+            .pending_checked
+            .insert_with_identity("/dev/ttyUSB0".into(), "dev=1:2 ino=3".into());
+        state
+            .draft_checked
+            .insert_with_identity("/dev/ttyUSB1".into(), "dev=1:2 ino=3".into());
+
+        let detected = state.detected_local_identities();
+        state.reconcile_share_checks(&detected);
+
+        assert_eq!(
+            state
+                .sharing
+                .pending_checked
+                .identities()
+                .get("/dev/ttyUSB1"),
+            Some(&"dev=1:2 ino=3".to_string())
+        );
     }
 
     #[test]

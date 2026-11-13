@@ -644,6 +644,49 @@ fn leaving_the_terminal_stops_sharing_and_revokes_the_credentials() {
 }
 
 #[test]
+fn saving_preferences_still_works_after_adding_a_device_to_active_sharing() {
+    let (fixture, devices) = Fixture::new();
+    let mut app = fixture.app();
+    let first = devices[0].path.clone();
+    let added = devices[1].path.clone();
+
+    check_device(&mut app, &first);
+    set_bind(&mut app, "127.0.0.1", 0);
+    save(&mut app);
+    app.start_sharing();
+    assert!(app.state.sharing.active);
+
+    check_device(&mut app, &added);
+    save(&mut app);
+    assert_eq!(
+        app.state.sharing.pending_checked.identities().get(&added),
+        app.state
+            .devices
+            .iter()
+            .find(|device| device.path == added)
+            .and_then(|device| device.identity.as_ref()),
+        "notice={:?}; pending={:?}; snapshot={:?}",
+        app.state.notice,
+        app.state.sharing.pending_checked,
+        app.state.sharing.snapshot
+    );
+
+    app.refresh_devices();
+    app.state.begin_settings();
+    app.state.draft.local_echo = false;
+    save(&mut app);
+
+    assert!(!app.state.settings.local_echo);
+    assert!(app.state.sharing.checked().contains(&first));
+    assert!(app.state.sharing.checked().contains(&added));
+    assert_eq!(
+        app.state.notice.as_ref().map(|notice| notice.severity),
+        Some(Severity::Info)
+    );
+    app.shutdown();
+}
+
+#[test]
 fn saving_preferences_does_not_revoke_a_shared_device_during_temporary_identity_loss() {
     let (fixture, devices) = Fixture::new();
     let mut app = fixture.app();
