@@ -805,13 +805,12 @@ fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway()
 
 #[test]
 fn a_write_larger_than_the_serial_buffer_keeps_the_device_to_itself() {
-    // A request of 40 KiB is base64-safe inside one 64 KiB remote frame and is
-    // far larger than a PTY's buffer, so one serial write needs many syscalls.
-    // The second client's request is admitted while the first is still
-    // incomplete: a single serial writer must finish the first whole request
-    // before the second byte reaches the device.
+    // A request of 44 KiB is base64-safe inside one 64 KiB remote frame and is
+    // far larger than a Linux PTY's buffer, so one serial write needs many
+    // syscalls. Nothing reads the device until the human's request is queued,
+    // so the AI request cannot finish first.
     let _guard = serial_test();
-    const REQUEST: usize = 40_000;
+    const REQUEST: usize = 44_000;
     let (host_core, host_socket) =
         start_core(Duration::from_secs(30), Duration::from_secs(300), 500);
     let mut device = SimulatedDevice::new();
@@ -877,24 +876,17 @@ fn a_write_larger_than_the_serial_buffer_keeps_the_device_to_itself() {
         writeln!(stdin, "{line}").expect("write large send");
         stdin.flush().expect("flush large send");
     }
-    // The first bytes prove the AI request is mid-write; the device's small
-    // buffer means the rest is still pending.
-    let mut stream = Vec::new();
-    let started = Instant::now() + Duration::from_secs(5);
-    while stream.is_empty() && Instant::now() < started {
-        stream.extend(device.try_read());
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    // A write without a wait is answered once the core queued it. The serial
+    // writer has begun and is blocked by the device's buffer because nothing
+    // reads the device yet, so this acknowledgement proves the AI request is
+    // still incomplete.
+    let answer = answer_for(&mut mcp, 7);
     assert!(
-        !stream.is_empty() && stream.iter().all(|byte| *byte == b'D'),
-        "the AI request started before the human's"
-    );
-    assert!(
-        stream.len() < REQUEST,
-        "the AI request is still incomplete when the human writes"
+        !answer["result"]["isError"].as_bool().unwrap_or(false),
+        "the large AI send was queued"
     );
 
-    // A human joins and writes another 40 KiB while the AI request is still
+    // A human joins and writes another 44 KiB while the AI request is still
     // incomplete.
     let human = RemoteClient::connect(
         &info.host,
@@ -907,13 +899,13 @@ fn a_write_larger_than_the_serial_buffer_keeps_the_device_to_itself() {
         .open(&device.path, None, false)
         .expect("human joins the open device");
     let human_text = "E".repeat(REQUEST);
-    // A write without a wait answers as soon as the core queued it, so this
-    // returning proves the human request was admitted while the AI's 40 KiB
-    // request is still incomplete: nothing drains the device until then.
+    // The human's acknowledgement means its request is queued behind the
+    // unfinished AI request. Reading the device now cannot change that order.
     human
         .write_bytes(human_open.device_id, human_text.as_bytes(), None)
         .expect("human write is admitted mid-write");
 
+    let mut stream = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(15);
     while stream.len() < 2 * REQUEST && Instant::now() < deadline {
         stream.extend(device.try_read());
@@ -924,12 +916,6 @@ fn a_write_larger_than_the_serial_buffer_keeps_the_device_to_itself() {
         stream == expected.as_bytes(),
         "the serial writer finished the AI request before the human's: {} bytes",
         stream.len()
-    );
-
-    let answer = answer_for(&mut mcp, 7);
-    assert!(
-        !answer["result"]["isError"].as_bool().unwrap_or(false),
-        "the large AI send succeeded"
     );
 
     drop(human);

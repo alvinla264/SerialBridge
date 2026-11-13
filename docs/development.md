@@ -148,8 +148,8 @@ Further terminal coverage uses real core/client seams and dedicated PTY flows:
 - `pty_remote_mcp.rs`: the real MCP binary reaching a remote host through the
   real terminal's gateway, beside two more human clients on the same device:
   discovery and first-open baud on a checked but unopened port, whole
-  non-interleaved writes (including a 40 KiB request that needs many serial
-  writes while a second client's request is admitted mid-write), an interrupted
+  non-interleaved writes (including a 44 KiB request that needs many serial
+  writes while a second client's request is queued mid-write), an interrupted
   write reported uncertain with no second copy on the device, during the stop or
   after re-sharing, uncheck revocation, rotated credentials, no fallback when
   the gateway exits, and a pairing-value search over the complete MCP
