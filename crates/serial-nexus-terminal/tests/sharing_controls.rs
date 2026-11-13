@@ -319,6 +319,53 @@ fn unchecking_while_sharing_revokes_the_remote_client_and_leaves_other_devices_a
 }
 
 #[test]
+fn a_failed_settings_publish_does_not_detach_remote_sessions() {
+    let (fixture, devices) = Fixture::new();
+    let mut app = fixture.app();
+    let path = devices[0].path.clone();
+
+    check_device(&mut app, &path);
+    set_bind(&mut app, "127.0.0.1", 0);
+    save(&mut app);
+    app.start_sharing();
+    let (host, human, _) = pairing(&app);
+    let remote = RemoteClient::connect(&host, &human, None, Duration::from_secs(5))
+        .expect("remote connects");
+    let opened = remote.open(&path, Some(9_600), false).expect("open device");
+
+    app.state.begin_settings();
+    let row = app
+        .state
+        .devices
+        .iter()
+        .position(|device| device.path == path)
+        .expect("detected device");
+    app.state.settings_row = SETTINGS_FIXED_ROWS + row;
+    assert_eq!(app.state.toggle_draft(), Some(false));
+    app.state.draft.local_echo = false;
+
+    std::fs::remove_file(&fixture.settings_path).expect("remove settings file");
+    std::fs::create_dir(&fixture.settings_path).expect("force publication failure");
+    save(&mut app);
+
+    assert!(
+        app.state.settings.local_echo,
+        "failed Save does not apply preferences"
+    );
+    assert!(app.state.sharing.checked().contains(&path));
+    assert!(
+        remote.status(opened.device_id).is_ok(),
+        "failed Save does not detach an existing remote session"
+    );
+    assert!(app
+        .state
+        .notice
+        .as_ref()
+        .is_some_and(|notice| notice.text.contains("not saved")));
+    app.shutdown();
+}
+
+#[test]
 fn a_bind_failure_is_shown_and_sharing_stays_off() {
     let (fixture, devices) = Fixture::new();
     let mut app = fixture.app();

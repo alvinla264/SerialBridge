@@ -889,8 +889,6 @@ impl App {
         // paths only.
         let expected = self.state.draft_checked.identities();
 
-        // Keep preferences staged until the core accepts the checklist. A
-        // failed commit therefore cannot require a best-effort file restore.
         let mut staged = Some(match store.stage(&draft) {
             Ok(staged) => staged,
             Err(error) => {
@@ -924,9 +922,22 @@ impl App {
             }
         }
 
-        let previous_checked: Vec<String> =
-            self.state.sharing.pending_checked.iter().cloned().collect();
-        let previous_expected = self.state.sharing.pending_checked.identities();
+        // Publish the preferences before committing the checklist, but keep an
+        // exact rollback copy until the core confirms. A filesystem failure
+        // must never detach sessions for a checklist whose Save failed.
+        let mut published = match store.publish_reversibly(staged.take().expect("staged settings"))
+        {
+            Ok(published) => Some(published),
+            Err(error) => {
+                self.restore_settings_checklists(
+                    original_draft_checked.clone(),
+                    original_pending_checked.clone(),
+                );
+                self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
+                return;
+            }
+        };
+
         let mut committed_checklist = false;
         if let Some(token) = prepared {
             match self.client.commit_shared_devices(token) {
@@ -945,73 +956,34 @@ impl App {
                             && draft_checked == self.state.sharing.checked();
                     }
                     if !committed_checklist {
-                        if let Some(staged) = staged.take() {
-                            store.discard(staged);
-                        }
+                        let rollback = published
+                            .take()
+                            .expect("published settings before core commit")
+                            .rollback();
                         self.state.draft_checked = original_draft_checked.clone();
                         if !uncertain {
                             self.state.sharing.pending_checked = original_pending_checked.clone();
                         }
-                        self.state.notice = Some(Notice::error(if uncertain {
-                            format!(
+                        let message = match rollback {
+                            Ok(()) if uncertain => format!(
                                 "settings save is unknown: {error}; the core may have applied the checklist — check it and save again"
-                            )
-                        } else {
-                            format!("settings not saved: {error}")
-                        }));
+                            ),
+                            Ok(()) => format!("settings not saved: {error}"),
+                            Err(rollback_error) => format!(
+                                "settings save is unknown: {error}; previous preferences could not be restored: {rollback_error}"
+                            ),
+                        };
+                        self.state.notice = Some(Notice::error(message));
                         return;
                     }
                 }
             }
         }
 
-        if let Err(error) = store.publish(staged.take().expect("staged settings")) {
-            if committed_checklist {
-                let reverted = self
-                    .client
-                    .prepare_shared_devices_expected(previous_checked, previous_expected)
-                    .and_then(|token| self.client.commit_shared_devices(token));
-                match reverted {
-                    Ok(snapshot) => {
-                        let _ = self.state.apply_sharing_snapshot(snapshot);
-                        self.state.draft_checked = original_draft_checked.clone();
-                        self.state.notice = Some(Notice::error(format!(
-                            "settings not saved: {error}; the checked devices were restored"
-                        )));
-                    }
-                    Err(rollback_error) => {
-                        self.state.draft_checked = original_draft_checked.clone();
-                        // A failed compensation must not leave the attempted
-                        // checklist available to remote clients. Fail closed
-                        // by stopping sharing instead of retaining a partially
-                        // applied authorization set.
-                        match self.client.stop_sharing() {
-                            Ok(()) => {
-                                self.state.stop_after_failed_settings_compensation(
-                                    original_pending_checked.clone(),
-                                    original_draft_checked.clone(),
-                                );
-                                self.state.notice = Some(Notice::error(format!(
-                                    "settings not saved: {error}; checklist rollback failed and sharing was stopped: {rollback_error}"
-                                )));
-                            }
-                            Err(stop_error) => {
-                                self.sync_share_status();
-                                self.state.notice = Some(Notice::error(format!(
-                                    "settings save is unknown: {error}; checklist rollback failed: {rollback_error}; stop sharing failed: {stop_error}"
-                                )));
-                            }
-                        }
-                    }
-                }
-            } else {
-                self.state.draft_checked = original_draft_checked;
-                self.state.sharing.pending_checked = original_pending_checked;
-                self.state.notice = Some(Notice::error(format!("settings not saved: {error}")));
-            }
-            return;
-        }
-
+        published
+            .take()
+            .expect("settings publication remains live")
+            .confirm();
         if committed_checklist {
             // The accepted snapshot is authoritative; only now replace the
             // user's attempted draft with the core's committed checklist.
