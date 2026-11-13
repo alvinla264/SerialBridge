@@ -543,10 +543,10 @@ fn disconnect_reports_release_and_later_calls_fail_clearly() {
     let closed = controller.call_tool("disconnect", json!({"device": device_id}));
     assert!(!closed.is_error, "{}", closed.text);
     assert_eq!(closed.device_id(), device_id);
-    assert!(closed.json()["device_closed"].is_null());
+    assert_eq!(closed.json()["device_closed"], false);
     assert!(closed
         .text
-        .contains("1 other client was attached before disconnect"));
+        .contains("left the device open for 1 other client"));
     assert!(closed.text.contains("disconnected"), "{}", closed.text);
 
     // Disconnecting released control, so the other AI session can claim it.
@@ -573,8 +573,8 @@ fn disconnect_reports_release_and_later_calls_fail_clearly() {
         stale.text
     );
 
-    // The last client disconnects; the tool does not claim a post-close state
-    // that it did not query.
+    // This PTY is not enumerated once its final session closes, so the tool
+    // leaves the post-close state unknown rather than guessing.
     let closed = reader.call_tool("disconnect", json!({"device": claimed.device_id()}));
     assert!(!closed.is_error, "{}", closed.text);
     assert!(closed.json()["device_closed"].is_null());

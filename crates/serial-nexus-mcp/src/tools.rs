@@ -12,7 +12,7 @@
 //! through tool arguments and is never part of a result.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -184,16 +184,11 @@ impl Session {
                 "cannot locate the MCP pairing file for remote {endpoint}: {error}"
             ))
         })?;
-        let pairing_file = if pairing_file.is_absolute() {
-            pairing_file
-        } else {
-            let cwd = std::env::current_dir().map_err(|error| {
-                Failure::Tool(format!(
-                    "cannot resolve the relative MCP pairing file for remote {endpoint}: {error}"
-                ))
-            })?;
-            resolve_pairing_path(pairing_file, &cwd)
-        };
+        let pairing_file = resolve_pairing_path(pairing_file).map_err(|error| {
+            Failure::Tool(format!(
+                "cannot resolve the MCP pairing file for remote {endpoint}: {error}"
+            ))
+        })?;
         let client = Client::connect_to_gateway_with_pairing(
             paths::default_gateway_socket_path(),
             GatewayTarget::Remote {
@@ -503,17 +498,32 @@ impl Session {
             target.failure(&error, Some(&device_label(&device, Some(port.clone()))))
         })?;
         self.forget(target, device_id);
-        let other_clients = status.as_ref().and_then(other_clients_before_disconnect);
-        let text = match other_clients {
-            Some(count) => format!(
-                "disconnected from {port} (device {device_id}){}; {} {} attached before disconnect, and the current device state was not confirmed",
-                target.suffix(),
-                plural(count, "other client", "other clients"),
-                if count == 1 { "was" } else { "were" }
+        let disconnect_state = client
+            .list_devices()
+            .ok()
+            .and_then(|result| disconnect_state(&result, &port));
+        let (device_closed, text) = match disconnect_state {
+            Some((false, _)) => (
+                Some(true),
+                format!(
+                    "disconnected from {port} (device {device_id}){}; the device is now closed",
+                    target.suffix()
+                ),
             ),
-            None => format!(
-                "disconnected from {port} (device {device_id}){}; could not confirm whether the device remains open",
-                target.suffix()
+            Some((true, remaining)) => (
+                Some(false),
+                format!(
+                    "disconnected from {port} (device {device_id}){}; left the device open for {}",
+                    target.suffix(),
+                    plural(remaining, "other client", "other clients")
+                ),
+            ),
+            None => (
+                None,
+                format!(
+                    "disconnected from {port} (device {device_id}){}; could not confirm whether the device remains open",
+                    target.suffix()
+                ),
             ),
         };
         Ok(ToolOutcome::ok(
@@ -521,7 +531,7 @@ impl Session {
             target.attach(json!({
                 "device_id": device_id,
                 "port": port,
-                "device_closed": null,
+                "device_closed": device_closed,
             })),
         ))
     }
@@ -1019,19 +1029,33 @@ fn human_duration(millis: u64) -> String {
     }
 }
 
-/// Turn a core error into a message an AI host (and its human) can act on.
-fn other_clients_before_disconnect(status: &serial_nexus_client::DeviceStatus) -> Option<usize> {
-    Some(status.client_count.saturating_sub(1))
+fn disconnect_state(
+    devices: &serial_nexus_protocol::DevicesResult,
+    path: &str,
+) -> Option<(bool, usize)> {
+    devices
+        .devices
+        .iter()
+        .find(|device| device.path == path)
+        .map(|device| (device.open, device.client_count))
 }
 
-fn resolve_pairing_path(path: PathBuf, cwd: &Path) -> PathBuf {
+fn resolve_pairing_path(path: PathBuf) -> Result<PathBuf, std::io::Error> {
+    resolve_pairing_path_from(path, std::env::current_dir)
+}
+
+fn resolve_pairing_path_from(
+    path: PathBuf,
+    current_dir: impl FnOnce() -> Result<PathBuf, std::io::Error>,
+) -> Result<PathBuf, std::io::Error> {
     if path.is_absolute() {
-        path
+        Ok(path)
     } else {
-        cwd.join(path)
+        Ok(current_dir()?.join(path))
     }
 }
 
+/// Turn a core error into a message an AI host (and its human) can act on.
 fn describe_error(error: &ClientError, device: Option<&str>) -> String {
     if let ClientError::Server(body) = error {
         return describe_server_error(body, device, false);
@@ -1360,36 +1384,49 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_does_not_make_an_unconfirmed_closed_state_claim() {
-        let unknown: Option<&serial_nexus_client::DeviceStatus> = None;
-        assert_eq!(unknown.and_then(other_clients_before_disconnect), None);
-        let status = serial_nexus_client::DeviceStatus {
-            device_id: 1,
-            path: "/dev/ttyUSB0".into(),
-            baud: 9_600,
-            client_count: 2,
-            control: serial_nexus_client::ControlState {
-                holder: None,
-                expires_in_ms: None,
-            },
-            history_lines: 0,
-            dropped_lines: 0,
+    fn disconnect_state_uses_the_device_list_after_close() {
+        let result = serial_nexus_protocol::DevicesResult {
+            devices: vec![serial_nexus_protocol::DeviceSummary {
+                path: "/dev/ttyUSB0".into(),
+                description: None,
+                identity: None,
+                open: true,
+                device_id: Some(7),
+                baud: Some(9_600),
+                client_count: 2,
+                control_holder: None,
+            }],
         };
-        assert_eq!(
-            Some(&status).and_then(other_clients_before_disconnect),
-            Some(1)
-        );
+        assert_eq!(disconnect_state(&result, "/dev/ttyUSB0"), Some((true, 2)));
+        assert_eq!(disconnect_state(&result, "/dev/other"), None);
+
+        let closed = serial_nexus_protocol::DevicesResult {
+            devices: vec![serial_nexus_protocol::DeviceSummary {
+                path: "/dev/ttyUSB0".into(),
+                description: None,
+                identity: None,
+                open: false,
+                device_id: None,
+                baud: None,
+                client_count: 0,
+                control_holder: None,
+            }],
+        };
+        assert_eq!(disconnect_state(&closed, "/dev/ttyUSB0"), Some((false, 0)));
     }
 
     #[test]
     fn relative_pairing_paths_resolve_in_the_mcp_process_directory() {
-        let cwd = Path::new("/var/tmp/mcp-host");
+        let cwd = PathBuf::from("/var/tmp/mcp-host");
         assert_eq!(
-            resolve_pairing_path(PathBuf::from("peers.json"), cwd),
+            resolve_pairing_path_from(PathBuf::from("peers.json"), || Ok(cwd.clone())).unwrap(),
             cwd.join("peers.json")
         );
         assert_eq!(
-            resolve_pairing_path(PathBuf::from("/etc/serial-nexus/peers.json"), cwd),
+            resolve_pairing_path_from(PathBuf::from("/etc/serial-nexus/peers.json"), || {
+                panic!("absolute paths do not need the current directory")
+            })
+            .unwrap(),
             PathBuf::from("/etc/serial-nexus/peers.json")
         );
     }

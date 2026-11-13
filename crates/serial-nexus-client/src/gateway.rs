@@ -144,7 +144,10 @@ impl GatewayServer {
                             let id = thread_next_session.fetch_add(1, Ordering::Relaxed);
                             let tracked = match stream.try_clone() {
                                 Ok(tracked) => tracked,
-                                Err(_) => continue,
+                                Err(_) => {
+                                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                                    continue;
+                                }
                             };
                             let control = GatewaySessionControl {
                                 socket: Arc::new(tracked),
@@ -165,6 +168,7 @@ impl GatewayServer {
                                 })
                                 .is_err()
                             {
+                                control.shutdown();
                                 thread_sessions
                                     .lock()
                                     .expect("gateway sessions lock")

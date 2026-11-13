@@ -15,7 +15,7 @@ use serial_nexus_terminal::app::App;
 use serial_nexus_terminal::input::Key;
 use serial_nexus_terminal::settings::SettingsStore;
 use serial_nexus_terminal::state::{EndpointId, View};
-use support::{connect, start_core, PortListerGuard, SimulatedDevice};
+use support::{connect, start_core, wait_until, PortListerGuard, SimulatedDevice};
 use tempfile::TempDir;
 
 static REMOTE_TESTS: Mutex<()> = Mutex::new(());
@@ -176,6 +176,40 @@ fn reconnecting_with_the_same_pairing_reuses_a_link_at_the_host_connection_limit
         .as_ref()
         .is_some_and(|notice| notice.text.contains("connected to")));
     drop(additional_clients);
+}
+
+#[test]
+fn a_rotated_pairing_replaces_the_existing_endpoint_connection() {
+    let _guard = serial_test();
+    let device = SimulatedDevice::new();
+    let host = start_host(
+        &[&device.path],
+        Arc::new(Mutex::new(vec![PathBuf::from(&device.path)])),
+    );
+    let (_local, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let mut terminal = Terminal::new(&socket);
+    terminal.connect(&host.info);
+    assert_eq!(terminal.app.state.remote_labels.len(), 1);
+
+    let bind = ShareBind::new(host.info.host.address.ip(), host.info.host.address.port());
+    host.owner.stop_sharing().expect("stop old session");
+    let new_info = host
+        .owner
+        .start_sharing(bind, vec![device.path.clone()])
+        .expect("start rotated session");
+    terminal.connect(&new_info);
+
+    assert!(terminal.app.state.connect.is_none());
+    assert_eq!(terminal.app.state.remote_labels.len(), 1);
+    assert!(terminal.app.state.notice.as_ref().is_some_and(|notice| {
+        notice.severity == serial_nexus_terminal::state::Severity::Info
+            && notice.text.contains("connected to")
+    }));
+    terminal.app.refresh_devices();
+    assert!(terminal.app.state.devices.iter().any(|entry| entry.endpoint
+        != serial_nexus_terminal::state::LOCAL_ENDPOINT
+        && entry.path == device.path));
+    terminal.app.shutdown();
 }
 
 #[test]
@@ -543,6 +577,32 @@ fn unchecking_one_remote_device_keeps_the_other_and_the_local_core() {
     second.read_until(b"still", Duration::from_secs(5));
 
     terminal.app.shutdown();
+}
+
+#[test]
+fn terminal_shutdown_disconnects_its_outgoing_remote_connection() {
+    let _guard = serial_test();
+    let device = SimulatedDevice::new();
+    let host = start_host(
+        &[&device.path],
+        Arc::new(Mutex::new(vec![PathBuf::from(&device.path)])),
+    );
+    let (_local, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let mut terminal = Terminal::new(&socket);
+    terminal.connect(&host.info);
+    wait_until(Duration::from_secs(2), || {
+        host.owner
+            .sharing_status()
+            .is_ok_and(|snapshot| snapshot.remote_clients == 1)
+    });
+
+    terminal.app.shutdown();
+
+    wait_until(Duration::from_secs(2), || {
+        host.owner
+            .sharing_status()
+            .is_ok_and(|snapshot| snapshot.remote_clients == 0)
+    });
 }
 
 #[test]

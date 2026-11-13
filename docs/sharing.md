@@ -229,34 +229,24 @@ core and terminal. The real-hardware acceptance procedure is documented in
   frame-safe budget and stays a successful `WriteResult` (never downgraded to
   an error), preserving write-outcome semantics. Test:
   `an_oversized_waited_write_answer_stays_a_successful_write`.
-- Minor fixes from that round: glossary wording now matches the close
-  contract; the incremental frame decoder buffers two complete frames so two
-  valid pipelined frames are not mistaken for an oversized one (protocol unit
-  test `two_pipelined_frames_are_not_mistaken_for_one_oversized_frame`).
-
-Findings fixed after the additional focused review:
-
+- The incremental frame decoder handles two valid pipelined frames without
+  mistaking them for one oversized frame (`two_pipelined_frames_are_not_mistaken_for_one_oversized_frame`).
 - **Stop/enqueue race.** `share_gate` (an `RwLock`) serializes stop/revocation
   with remote write admission; a write admitted concurrently either queued
   before the epoch bump (and is dropped) or waits and then sees the stopped
   session. Test: `a_remote_write_cannot_be_admitted_after_stop_begins`.
-- **Unchecked-device discovery.** Open-device discovery now requires the
-  instance's share marker *and* current-session allowlist membership; uncheck
-  and every new/stopped session clear the markers. Tests:
+- **Unchecked-device discovery.** Open-device discovery requires the instance's
+  share marker *and* current-session allowlist membership; uncheck and every
+  new/stopped session clear the markers. Test:
   `unchecked_and_new_session_devices_are_not_discoverable`.
-- **Metadata-only oversized write answers.** Waited-write trimming now budgets
-  the serialized response (binary-searching kept newest lines), so many empty
-  or short lines cannot turn a successful write into an error. Test:
-  `many_empty_waited_lines_keep_a_successful_write`.
-- **TLS send boundary.** The transport now writes plaintext in bounded chunks
-  and flushes whenever rustls's buffer is full, so a valid near-limit frame
-  cannot close the connection after the device write executed. Tests:
-  `near_limit_waited_write_answers_survive_the_tls_send`. Zero-write
-  recovery accounts for the retry's accepted count exactly once (protocol
-  test `zero_write_recovery_never_duplicates_plaintext`).
-- **Seam replay observability.** The fake serial port now records every write
-  attempt, including failed ones, and the test asserts the exact
-  `write_all` remainder sequence with no later attempt.
+- **Waited-write size and TLS framing.** Responses are trimmed to the serialized
+  frame budget, and the TLS transport flushes bounded chunks before a valid
+  near-limit write answer can be lost. Tests:
+  `many_empty_waited_lines_keep_a_successful_write`,
+  `near_limit_waited_write_answers_survive_the_tls_send`, and
+  `zero_write_recovery_never_duplicates_plaintext`.
+- **Write-attempt observability.** The serial test seam records failed attempts
+  and verifies that recovery writes only the unaccepted remainder.
 
 ## Client adapter
 

@@ -23,6 +23,12 @@ use crate::state::{
     SidebarButton, View, LOCAL_ENDPOINT,
 };
 
+/// A disconnected or revoked remote session no longer belongs in the sidebar.
+fn remote_session_is_gone(error: &ClientError) -> bool {
+    error.is_device_gone()
+        || matches!(error, ClientError::Server(body) if body.code == ErrorCode::PermissionDenied)
+}
+
 /// Two clicks on the same cell within this long count as a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
@@ -363,7 +369,7 @@ impl App {
                             .map(|holder| holder.client_id);
                     }
                 }
-                Err(error) if error.is_device_gone() => {
+                Err(error) if remote_session_is_gone(&error) => {
                     self.state.remove_session(key);
                     closed.push(path);
                 }
@@ -1281,7 +1287,7 @@ impl App {
         let existing_id = self
             .remotes
             .iter()
-            .find(|link| link.endpoint == endpoint && link.client.is_connected())
+            .find(|link| link.endpoint == endpoint)
             .map(|link| link.id);
         if let Some(existing_id) = existing_id.filter(|existing_id| {
             self.remotes.iter().any(|link| {
@@ -1301,13 +1307,23 @@ impl App {
             Duration::from_secs(5),
         )
         .map_err(|error| format!("not connected: {error}"))?;
-        if let Some(existing_id) = existing_id.filter(|existing_id| {
-            self.remotes.iter().any(|link| {
-                link.id == *existing_id && link.endpoint == endpoint && link.client.is_connected()
-            })
-        }) {
-            drop(remote_client);
-            return Ok((existing_id, format!("Remote {endpoint}")));
+        if let Some(existing_id) = existing_id {
+            if self.remotes.iter().any(|link| link.id == existing_id) {
+                self.state.remove_endpoint(existing_id);
+                let (events, critical_event_overflow) =
+                    remote_client.subscribe_bounded_with_overflow(1024);
+                let link = self
+                    .remotes
+                    .iter_mut()
+                    .find(|link| link.id == existing_id)
+                    .expect("existing endpoint link");
+                let old_client = std::mem::replace(&mut link.client, remote_client);
+                link.events = events;
+                link.critical_event_overflow = critical_event_overflow;
+                link.expected_closes.clear();
+                drop(old_client);
+                return Ok((existing_id, format!("Remote {endpoint}")));
+            }
         }
         let id = EndpointId(self.next_endpoint);
         self.next_endpoint += 1;
@@ -1609,6 +1625,11 @@ impl App {
             }
             self.state.remove_session(key);
         }
+        for link in self.remotes.drain(..) {
+            self.state.remove_endpoint(link.id);
+            drop(link);
+        }
+        self.state.remote_labels.clear();
         self.pump();
     }
 
@@ -1641,5 +1662,20 @@ fn device_entry_on(endpoint: EndpointId, device: DeviceSummary) -> DeviceEntry {
             .control_holder
             .as_ref()
             .map(|holder| holder.client_id),
+    }
+}
+
+#[cfg(test)]
+mod event_overflow_tests {
+    use super::*;
+
+    #[test]
+    fn a_revoked_remote_device_is_treated_as_a_gone_session() {
+        assert!(remote_session_is_gone(&ClientError::Server(
+            serial_nexus_client::ErrorBody::new(ErrorCode::PermissionDenied, "no longer shared")
+        )));
+        assert!(!remote_session_is_gone(&ClientError::Timeout(
+            "slow host".into()
+        )));
     }
 }
