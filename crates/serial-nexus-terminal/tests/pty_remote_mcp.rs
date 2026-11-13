@@ -805,7 +805,7 @@ fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway()
 
 #[test]
 fn a_write_larger_than_the_serial_buffer_keeps_the_device_to_itself() {
-    // A request of 44 KiB is base64-safe inside one 64 KiB remote frame and is
+    // A request of 44,000 bytes is base64-safe inside one 64 KiB remote frame and is
     // far larger than a Linux PTY's buffer, so one serial write needs many
     // syscalls. Nothing reads the device until the human's request is queued,
     // so the AI request cannot finish first.
@@ -886,8 +886,8 @@ fn a_write_larger_than_the_serial_buffer_keeps_the_device_to_itself() {
         "the large AI send was queued"
     );
 
-    // A human joins and writes another 44 KiB while the AI request is still
-    // incomplete.
+    // A human joins and writes another 44,000 bytes while the AI request is
+    // still incomplete.
     let human = RemoteClient::connect(
         &info.host,
         &info.human,
