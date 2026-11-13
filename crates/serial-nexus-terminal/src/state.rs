@@ -2064,21 +2064,20 @@ mod sharing_tests {
     #[test]
     fn an_active_snapshot_keeps_the_discovery_identity_of_a_newly_checked_device() {
         let mut state = state_with_devices();
-        for device in &mut state.devices {
-            device.identity = Some("dev=1:2 ino=3".into());
-        }
+        state.devices[0].identity = Some("snx-1".into());
+        state.devices[1].identity = Some("snx-2".into());
         state.sharing.active = true;
         state.sharing.snapshot = Some(snapshot(&["/dev/ttyUSB0"]));
         state
             .sharing
             .pending_checked
-            .insert_with_identity("/dev/ttyUSB0".into(), "dev=1:2 ino=3".into());
+            .insert_with_identity("/dev/ttyUSB0".into(), "snx-1".into());
         state
             .draft_checked
-            .insert_with_identity("/dev/ttyUSB0".into(), "dev=1:2 ino=3".into());
+            .insert_with_identity("/dev/ttyUSB0".into(), "snx-1".into());
         state
             .draft_checked
-            .insert_with_identity("/dev/ttyUSB1".into(), "dev=1:2 ino=3".into());
+            .insert_with_identity("/dev/ttyUSB1".into(), "snx-2".into());
 
         state.apply_sharing_snapshot(snapshot(&["/dev/ttyUSB0", "/dev/ttyUSB1"]));
 
@@ -2088,25 +2087,24 @@ mod sharing_tests {
                 .pending_checked
                 .identities()
                 .get("/dev/ttyUSB1"),
-            Some(&"dev=1:2 ino=3".to_string())
+            Some(&"snx-2".to_string())
         );
     }
 
     #[test]
     fn an_active_snapshot_restores_pending_checks_from_the_selected_draft() {
         let mut state = state_with_devices();
-        for device in &mut state.devices {
-            device.identity = Some("dev=1:2 ino=3".into());
-        }
+        state.devices[0].identity = Some("snx-1".into());
+        state.devices[1].identity = Some("snx-2".into());
         state.sharing.active = true;
         state.sharing.snapshot = Some(snapshot(&["/dev/ttyUSB0", "/dev/ttyUSB1"]));
         state
             .sharing
             .pending_checked
-            .insert_with_identity("/dev/ttyUSB0".into(), "dev=1:2 ino=3".into());
+            .insert_with_identity("/dev/ttyUSB0".into(), "snx-1".into());
         state
             .draft_checked
-            .insert_with_identity("/dev/ttyUSB1".into(), "dev=1:2 ino=3".into());
+            .insert_with_identity("/dev/ttyUSB1".into(), "snx-2".into());
 
         let detected = state.detected_local_identities();
         state.reconcile_share_checks(&detected);
@@ -2117,7 +2115,7 @@ mod sharing_tests {
                 .pending_checked
                 .identities()
                 .get("/dev/ttyUSB1"),
-            Some(&"dev=1:2 ino=3".to_string())
+            Some(&"snx-2".to_string())
         );
     }
 
