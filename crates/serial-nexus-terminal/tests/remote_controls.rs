@@ -14,7 +14,7 @@ use serial_nexus_protocol::ShareSessionInfo;
 use serial_nexus_terminal::app::App;
 use serial_nexus_terminal::input::Key;
 use serial_nexus_terminal::settings::SettingsStore;
-use serial_nexus_terminal::state::{EndpointId, View};
+use serial_nexus_terminal::state::{EndpointId, Focus, View};
 use support::{connect, start_core, wait_until, PortListerGuard, SimulatedDevice};
 use tempfile::TempDir;
 
@@ -730,5 +730,91 @@ fn two_connected_hosts_with_the_same_path_stay_separate_in_the_sidebar() {
     if let Some(endpoint) = shown {
         assert!(!terminal.app.state.endpoint_tag(endpoint).is_empty());
     }
+    terminal.app.shutdown();
+}
+
+fn remote_stream_text(app: &App) -> String {
+    app.state
+        .shown_session()
+        .map(|session| session.screen.lines().join("\n"))
+        .unwrap_or_default()
+}
+
+fn remote_view_text(app: &App) -> String {
+    let Some(session) = app.state.shown_session() else {
+        return String::new();
+    };
+    let screen = &session.screen;
+    (0..screen.rows())
+        .map(|row| {
+            (0..screen.cols())
+                .map(|col| screen.view_cell(row, col).ch)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn a_remote_stream_keeps_scrollback_and_scroll_keys_stay_out_of_the_device() {
+    let _guard = serial_test();
+    let mut device = SimulatedDevice::new();
+    let path = device.path.clone();
+    let host = start_host(&[&path], Arc::new(Mutex::new(vec![PathBuf::from(&path)])));
+    let (_local, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let mut terminal = Terminal::new(&socket);
+    terminal.connect(&host.info);
+    let endpoint = terminal.endpoint_of(&path);
+    let key = terminal
+        .app
+        .open_endpoint(endpoint, &path, Some(9_600))
+        .expect("open the remote device");
+    terminal.app.resize_stream(6, 40);
+
+    let lines: String = (0..12).map(|index| format!("remote{index}\r\n")).collect();
+    device.write(lines.as_bytes());
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline
+        && !remote_stream_text(&terminal.app).contains("remote11")
+    {
+        terminal.app.pump();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        remote_stream_text(&terminal.app).contains("remote11"),
+        "the remote stream never showed its newest line: {}",
+        remote_stream_text(&terminal.app)
+    );
+
+    // The narrow resize keeps the remote session and its kept rows.
+    terminal.app.resize_stream(5, 30);
+    assert_eq!(terminal.app.state.shown_key(), Some(key));
+    terminal.app.resize_stream(6, 40);
+
+    // `b` from the sidebar views the remote session's kept rows; scrolling is
+    // navigation, not device input.
+    terminal.app.state.focus = Focus::Sidebar;
+    terminal.app.handle_key(Key::Char('b'));
+    assert_eq!(terminal.app.state.view, View::Scrollback);
+    for _ in 0..12 {
+        terminal.app.handle_key(Key::Up);
+    }
+    let scrolled = remote_view_text(&terminal.app);
+    assert!(
+        scrolled.contains("remote0"),
+        "the scrollback view reaches the remote session's oldest kept line: {scrolled}"
+    );
+    assert!(
+        device.try_read().is_empty(),
+        "scroll keys never reach the remote device"
+    );
+    terminal.app.handle_key(Key::Esc);
+    assert_eq!(terminal.app.state.view, View::Stream);
+
+    // Typing in the stream still reaches only the remote device.
+    terminal.app.handle_key(Key::Char('Q'));
+    device.read_until(b"Q", Duration::from_secs(5));
     terminal.app.shutdown();
 }

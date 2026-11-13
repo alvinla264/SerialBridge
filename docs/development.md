@@ -141,10 +141,14 @@ Further terminal coverage uses real core/client seams and dedicated PTY flows:
   device selection, identity replacement, pairing credentials, revocation and
   cleanup on shutdown.
 - `remote_controls.rs`: authenticated Connect, certificate mismatch, several
-  endpoint groups, same-path isolation, unplug/disconnect notices, and remote
-  write failures.
+  endpoint groups, same-path isolation, a remote session's focus, scrollback
+  and resize, unplug/disconnect notices, and remote write failures.
 - `pty_sharing.rs` and `pty_remote.rs`: the actual rendered and keyboard-driven
   Share/Pairing and Connect workflows, including device access on the host.
+- `pty_remote_mcp.rs`: the real MCP binary reaching a remote host through the
+  real terminal's gateway, beside a second and third human client on the same
+  device, with whole non-retried writes, secret-free output, uncheck revocation,
+  credential rotation and no fallback when the gateway exits.
 
 `serial-nexus-mcp` additionally has end-to-end tests over real MCP stdio framing:
 handshake and tool listing, protocol errors, default and joined baud, rejected
