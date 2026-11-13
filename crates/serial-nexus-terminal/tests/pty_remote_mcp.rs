@@ -24,9 +24,20 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use serial_nexus_client::{Client, ClientInfo, RemoteClient, ShareBind};
 use serial_nexus_protocol::ShareSessionInfo;
+use std::sync::MutexGuard;
 use support::tui::TuiSession;
 use support::{start_core, wait_until, PortListerGuard, SimulatedDevice};
 use tempfile::TempDir;
+
+static SERIAL_TESTS: Mutex<()> = Mutex::new(());
+
+/// The injected discovery lister is process-wide, so the tests here take
+/// turns rather than publish two different device lists.
+fn serial_test() -> MutexGuard<'static, ()> {
+    SERIAL_TESTS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
 
 /// The workspace builds every binary before its integration tests run, so the
 /// terminal tests can drive the MCP binary at the same target directory. This
@@ -316,6 +327,63 @@ fn drain_serial(device: &mut SimulatedDevice, quiet: Duration) -> Vec<u8> {
     }
 }
 
+/// Remove ANSI control sequences from a terminal transcript: CSI, OSC, and
+/// the short two-byte escapes. Text between them is kept in order.
+fn strip_terminal_sequences(bytes: &[u8]) -> String {
+    let mut text = String::new();
+    let mut chars = bytes.iter().copied().peekable();
+    while let Some(byte) = chars.next() {
+        if byte != 0x1b {
+            text.push(byte as char);
+            continue;
+        }
+        match chars.next() {
+            Some(b'[') => {
+                // CSI: parameters then a final byte in 0x40..=0x7e.
+                for next in chars.by_ref() {
+                    if (0x40..=0x7e).contains(&next) {
+                        break;
+                    }
+                }
+            }
+            Some(b']') => {
+                // OSC: ends with BEL or ESC \.
+                let mut previous = 0;
+                for next in chars.by_ref() {
+                    if next == 0x07 || (previous == 0x1b && next == b'\\') {
+                        break;
+                    }
+                    previous = next;
+                }
+            }
+            Some(_) => {}
+            None => {}
+        }
+    }
+    text
+}
+
+/// True when a pairing value appears in a PTY transcript, either literally,
+/// with control sequences removed, or with every non-base64 character
+/// removed (so wrapping, spacing and cursor moves between its characters
+/// cannot hide it).
+fn transcript_leaks(transcript: &[u8], secret: &str) -> bool {
+    let raw = String::from_utf8_lossy(transcript);
+    if raw.contains(secret) {
+        return true;
+    }
+    let stripped = strip_terminal_sequences(transcript);
+    if stripped.contains(secret) {
+        return true;
+    }
+    let squash = |text: &str| -> String {
+        text.chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '='))
+            .collect()
+    };
+    squash(&stripped).contains(&squash(secret))
+}
+
 /// Read one specific MCP answer, ignoring unrelated traffic.
 fn answer_for(mcp: &mut Mcp, id: u64) -> Value {
     loop {
@@ -331,6 +399,7 @@ fn answer_for(mcp: &mut Mcp, id: u64) -> Value {
 
 #[test]
 fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway() {
+    let _guard = serial_test();
     // The host's core, its detected (never opened) device and the owner.
     let (host_core, host_socket) =
         start_core(Duration::from_secs(30), Duration::from_secs(300), 500);
@@ -665,33 +734,24 @@ fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway()
         "a stale pairing must not echo its credential: {text}"
     );
 
-    // With the rotated details the same MCP process reaches the new session.
+    // With the rotated details the same MCP process reaches the new session,
+    // and the interrupted request is still not sent a second time.
     write_peers(peers_directory.path(), &rotated);
     let (is_error, text, _) = mcp.call_tool("list_devices", remote_args(&rotated, json!({})));
     assert!(!is_error, "the rotated pairing is accepted: {text}");
     assert!(text.contains(&device.path), "{text}");
+    let after_restart = drain_serial(&mut device, Duration::from_millis(300));
+    assert!(
+        after_restart.is_empty(),
+        "an uncertain write is not replayed on a later session: {:?}",
+        mcp.redacted(&String::from_utf8_lossy(&after_restart))
+    );
 
     // When the foreground terminal leaves while that remote session is
     // healthy, its gateway goes with it. MCP neither dials the host directly
-    // nor starts a local core.
-    // No pairing value appeared on the terminal's own screen (the gateway's
-    // stderr is the terminal's PTY) or in the MCP process transcript.
-    let screen = terminal.text();
-    for secret in [
-        &info.ai.credential,
-        &info.human.credential,
-        &info.host.ca_cert_der_b64,
-        &rotated.ai.credential,
-        &rotated.human.credential,
-        &rotated.host.ca_cert_der_b64,
-    ] {
-        assert!(
-            !screen.contains(secret),
-            "the terminal screen leaked a pairing value"
-        );
-    }
-
-    terminal.quit();
+    // nor starts a local core. The transcript is joined after the child exits,
+    // so shutdown output is part of the secrecy check below.
+    let transcript = terminal.quit_capturing();
     let (is_error, text, _) = mcp.call_tool("list_devices", remote_args(&rotated, json!({})));
     assert!(
         is_error,
@@ -703,8 +763,10 @@ fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway()
         "MCP must fail without the terminal gateway instead of starting a core: {text}"
     );
 
-    // No pairing value appeared anywhere in the complete process transcript:
-    // close stdin and join both collectors so shutdown output is included.
+    // No pairing value appeared in the complete terminal PTY transcript
+    // (including shutdown, unwrapped from control sequences) or in the
+    // MCP process transcript: close stdin and join both collectors so its
+    // shutdown output is included too.
     mcp.finish();
     let output = mcp.stdout_text();
     let diagnostics = mcp.stderr_text();
@@ -724,7 +786,144 @@ fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway()
             !diagnostics.contains(secret),
             "MCP stderr leaked a pairing value"
         );
+        assert!(
+            !transcript_leaks(&transcript, secret),
+            "the terminal PTY transcript leaked a pairing value"
+        );
     }
 
+    drop(host_core);
+}
+
+#[test]
+fn a_write_larger_than_the_serial_buffer_keeps_the_device_to_itself() {
+    // A request of 40 KiB is base64-safe inside one 64 KiB remote frame and is
+    // far larger than a PTY's buffer, so one serial write needs many syscalls.
+    // The second client's request is admitted while the first is still
+    // incomplete: a single serial writer must finish the first whole request
+    // before the second byte reaches the device.
+    let _guard = serial_test();
+    const REQUEST: usize = 40_000;
+    let (host_core, host_socket) =
+        start_core(Duration::from_secs(30), Duration::from_secs(300), 500);
+    let mut device = SimulatedDevice::new();
+    let _lister = PortListerGuard::from_path(device.path.clone());
+    let owner = Client::connect_to_socket(&host_socket, ClientInfo::human("host-terminal"))
+        .expect("owner connects");
+    let info = owner
+        .start_sharing(
+            ShareBind::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            vec![device.path.clone()],
+        )
+        .expect("sharing starts");
+
+    let (_local_core, local_socket) =
+        start_core(Duration::from_secs(30), Duration::from_secs(300), 500);
+    let xdg = TempDir::new().expect("xdg");
+    let mut terminal = TuiSession::spawn(&local_socket, xdg.path(), 30, 110);
+    terminal.wait_for_text("focus: sidebar");
+    let gateway = local_socket.with_file_name("gateway.sock");
+    wait_until(Duration::from_secs(5), || gateway.exists());
+
+    let peers_directory = TempDir::new().expect("peers directory");
+    let peers = write_peers(peers_directory.path(), &info);
+    let peers = peers.to_string_lossy().into_owned();
+    let gateway_text = gateway.to_string_lossy().into_owned();
+    let mut mcp = Mcp::spawn(
+        &[
+            ("SERIAL_NEXUS_GATEWAY_SOCKET", &gateway_text),
+            ("SERIAL_NEXUS_MCP_PEERS", &peers),
+            ("HOME", &xdg.path().to_string_lossy()),
+            ("XDG_CONFIG_HOME", &xdg.path().to_string_lossy()),
+        ],
+        &[
+            &info.ai.credential,
+            &info.human.credential,
+            &info.host.ca_cert_der_b64,
+        ],
+    );
+    let (is_error, text, structured) = mcp.call_tool(
+        "connect",
+        remote_args(
+            &info,
+            json!({ "path": device.path, "baud": 57_600, "request_control": true }),
+        ),
+    );
+    assert!(!is_error, "{text}");
+    let device_id = structured.expect("structured connect")["device_id"]
+        .as_u64()
+        .expect("device id");
+
+    let ai_text = "D".repeat(REQUEST);
+    {
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "send",
+                "arguments": remote_args(&info, json!({ "device": device_id, "text": ai_text, "lines": 0 })),
+            },
+        });
+        let stdin = mcp.stdin.as_mut().expect("stdin open");
+        writeln!(stdin, "{line}").expect("write large send");
+        stdin.flush().expect("flush large send");
+    }
+    // The first bytes prove the AI request is mid-write; the device's small
+    // buffer means the rest is still pending.
+    let mut stream = Vec::new();
+    let started = Instant::now() + Duration::from_secs(5);
+    while stream.is_empty() && Instant::now() < started {
+        stream.extend(device.try_read());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !stream.is_empty() && stream.iter().all(|byte| *byte == b'D'),
+        "the AI request started before the human's"
+    );
+
+    // A human joins and writes another 40 KiB while the AI request is still
+    // incomplete.
+    let human = RemoteClient::connect(
+        &info.host,
+        &info.human,
+        Some("large-human".into()),
+        Duration::from_secs(5),
+    )
+    .expect("human pairs");
+    let human_open = human
+        .open(&device.path, None, false)
+        .expect("human joins the open device");
+    let human_text = "E".repeat(REQUEST);
+    let human_write = {
+        let human = human.clone();
+        let text = human_text.clone();
+        std::thread::spawn(move || human.write_bytes(human_open.device_id, text.as_bytes(), None))
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while stream.len() < 2 * REQUEST && Instant::now() < deadline {
+        stream.extend(device.try_read());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let expected = format!("{ai_text}{human_text}");
+    assert!(
+        stream == expected.as_bytes(),
+        "the serial writer finished the AI request before the human's: {} bytes",
+        stream.len()
+    );
+
+    human_write
+        .join()
+        .expect("human write thread")
+        .expect("human write");
+    let answer = answer_for(&mut mcp, 7);
+    assert!(
+        !answer["result"]["isError"].as_bool().unwrap_or(false),
+        "the large AI send succeeded"
+    );
+
+    drop(human);
+    terminal.quit();
     drop(host_core);
 }
