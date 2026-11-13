@@ -41,6 +41,10 @@ pub struct TuiSession {
     master: File,
     child: Child,
     parser: Arc<Mutex<Parser>>,
+    /// Every byte the child wrote to its terminal, before the emulator turns
+    /// it into a screen. Kept for whole-transcript checks (including output
+    /// after the alternate screen is left).
+    raw: Arc<Mutex<Vec<u8>>>,
     reader: Option<std::thread::JoinHandle<()>>,
     rows: u16,
     cols: u16,
@@ -105,14 +109,22 @@ impl TuiSession {
         drop(slave);
 
         let parser = Arc::new(Mutex::new(Parser::new(rows, cols, 0)));
+        let raw = Arc::new(Mutex::new(Vec::new()));
         let mut reads = master.try_clone().expect("clone master");
         let screen = Arc::clone(&parser);
+        let transcript = Arc::clone(&raw);
         let reader = std::thread::spawn(move || {
             let mut buffer = [0u8; 4096];
             loop {
                 match reads.read(&mut buffer) {
                     Ok(0) => break,
-                    Ok(read) => screen.lock().expect("screen lock").process(&buffer[..read]),
+                    Ok(read) => {
+                        transcript
+                            .lock()
+                            .expect("transcript lock")
+                            .extend_from_slice(&buffer[..read]);
+                        screen.lock().expect("screen lock").process(&buffer[..read]);
+                    }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
@@ -123,6 +135,7 @@ impl TuiSession {
             master,
             child,
             parser,
+            raw,
             reader: Some(reader),
             rows,
             cols,
@@ -269,11 +282,30 @@ impl TuiSession {
             .unwrap_or(false)
     }
 
+    /// Everything the child has written to its terminal so far, including
+    /// control sequences and output after leaving the alternate screen.
+    pub fn raw_transcript(&self) -> Vec<u8> {
+        self.raw
+            .lock()
+            .map(|bytes| bytes.clone())
+            .unwrap_or_default()
+    }
+
     /// Quit the terminal the way a human would: make sure the sidebar has the
     /// keys, then `Ctrl+Q`. A zero exit status, the alternate screen left and
     /// the PTY's termios restored are all part of the check, so a killed or
     /// crashed process cannot pass.
-    pub fn quit(mut self) {
+    pub fn quit(self) {
+        let _ = self.shutdown();
+    }
+
+    /// Quit, then return the complete PTY transcript, joined after the reader
+    /// has seen EOF so shutdown output is included.
+    pub fn quit_capturing(self) -> Vec<u8> {
+        self.shutdown()
+    }
+
+    fn shutdown(mut self) -> Vec<u8> {
         // Ctrl+] twice returns the focus to the sidebar whatever pane has it.
         self.send(KEY_CTRL_BRACKET);
         self.send(KEY_CTRL_BRACKET);
@@ -305,6 +337,10 @@ impl TuiSession {
             self.terminal_restored(),
             "the terminal's raw mode was not restored"
         );
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        self.raw_transcript()
     }
 }
 

@@ -32,6 +32,34 @@ use serial_nexus_protocol::{ClientKind, ResponseData};
 use crate::device::DeviceIdentity;
 use crate::engine::{Engine, PendingWrite, WriteStart};
 
+/// Bind a sharing listener with `SO_REUSEADDR`, so stopping and restarting a
+/// session on the same port works even while an old accepted socket is still
+/// finishing its close (or in `TIME_WAIT`). Without it the kernel answers
+/// `EADDRINUSE` for a rapid restart on the same port.
+fn bind_reusing_address(address: SocketAddr) -> std::io::Result<TcpListener> {
+    use nix::sys::socket::{
+        bind, listen, setsockopt, socket, sockopt::ReuseAddr, AddressFamily, Backlog, SockFlag,
+        SockType, SockaddrIn, SockaddrIn6,
+    };
+    use std::os::fd::AsRawFd;
+
+    let family = if address.is_ipv4() {
+        AddressFamily::Inet
+    } else {
+        AddressFamily::Inet6
+    };
+    let fd = socket(family, SockType::Stream, SockFlag::SOCK_CLOEXEC, None)
+        .map_err(std::io::Error::from)?;
+    setsockopt(&fd, ReuseAddr, &true).map_err(std::io::Error::from)?;
+    match address {
+        SocketAddr::V4(address) => bind(fd.as_raw_fd(), &SockaddrIn::from(address)),
+        SocketAddr::V6(address) => bind(fd.as_raw_fd(), &SockaddrIn6::from(address)),
+    }
+    .map_err(std::io::Error::from)?;
+    listen(&fd, Backlog::new(128).map_err(std::io::Error::from)?).map_err(std::io::Error::from)?;
+    Ok(TcpListener::from(fd))
+}
+
 /// Bounded sharing defaults, taken from [`crate::CoreConfig`].
 #[derive(Clone, Debug)]
 pub struct ShareLimits {
@@ -160,7 +188,7 @@ pub fn prepare(
             "at most {MAX_SHARED_DEVICES} devices may be shared in one session"
         ));
     }
-    let listener = TcpListener::bind(params.bind.socket_addr())
+    let listener = bind_reusing_address(params.bind.socket_addr())
         .map_err(|error| format!("could not bind {}: {error}", params.bind))?;
     listener
         .set_nonblocking(true)
@@ -1040,5 +1068,44 @@ pub fn inactive_snapshot() -> SharingSnapshot {
         checked: Vec::new(),
         remote_clients: 0,
         pending_connections: 0,
+    }
+}
+
+#[cfg(test)]
+mod rebind_tests {
+    use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+    use std::time::Duration;
+
+    use super::bind_reusing_address;
+
+    /// A session's listener sets `SO_REUSEADDR`, and the kernel gives it to
+    /// the connections it accepts. After such a connection is closed, the
+    /// port can be bound again at once; a listener created without it cannot
+    /// be reused (the old behaviour, which made a rapid restart fail).
+    #[test]
+    fn a_reused_listener_binds_a_port_after_a_closed_connection() {
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let first = bind_reusing_address(address).expect("first listener");
+        let bound = first.local_addr().expect("bound address");
+
+        // Let the server close first, so it ends up in TIME_WAIT; the client
+        // then closes too, as it would after an owner stop.
+        let client = TcpStream::connect(bound).expect("client connects");
+        let (accepted, _) = first.accept().expect("accepted");
+        drop(first);
+        accepted.shutdown(Shutdown::Both).expect("server closes");
+        drop(accepted);
+        let mut buf = [0u8; 1];
+        use std::io::Read;
+        let _ = (&client).read(&mut buf);
+        drop(client);
+        std::thread::sleep(Duration::from_millis(30));
+
+        // The provider of the reuse is the *first* session's listener; a
+        // listener created without it would leave an unreusable port behind.
+        let reused = TcpListener::bind(bound).expect("the closed port is reusable");
+        drop(reused);
+        let second = bind_reusing_address(bound).expect("reused listener");
+        assert_eq!(second.local_addr().expect("address"), bound);
     }
 }

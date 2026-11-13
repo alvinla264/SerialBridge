@@ -17,6 +17,9 @@ and there is no network listener unless a local owner starts one.
    `ShareStop`, a core shutdown or a crash closes the listener, disconnects
    every remote connection and revokes both credentials. Sharing is off until
    started again, with a fresh session id, CA, leaf certificate and credentials.
+   The listener is bound with `SO_REUSEADDR`, so stopping and starting again
+   with the same address and port is not blocked by a previous session's
+   closing sockets.
 4. Only the owner connection may check, uncheck, inspect or stop its active
    session. This is connection ownership, not terminal-process authentication:
    every program running as the laptop user is trusted and can impersonate a
