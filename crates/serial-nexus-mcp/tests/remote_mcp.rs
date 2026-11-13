@@ -83,7 +83,7 @@ fn restart_on_the_same_port(host: &SharedHost, devices: &[String]) -> ShareSessi
     );
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        match host.owner.start_sharing(bind.clone(), devices.to_vec()) {
+        match host.owner.start_sharing(bind, devices.to_vec()) {
             Ok(info) => return info,
             Err(ClientError::Server(error))
                 if error.code == ErrorCode::DeviceFailed

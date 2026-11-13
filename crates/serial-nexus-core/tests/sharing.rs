@@ -2278,7 +2278,7 @@ fn sharing_restarts_on_the_same_port_right_after_a_connection_closes() {
 
     for round in 0..3 {
         let info = owner
-            .start_sharing(bind.clone(), vec![device.path.clone()])
+            .start_sharing(bind, vec![device.path.clone()])
             .unwrap_or_else(|error| panic!("round {round} could not start: {error}"));
         if round == 0 {
             bind = ShareBind::new(info.bind.ip(), info.bind.port());
@@ -2304,7 +2304,7 @@ fn sharing_restarts_on_the_same_port_while_an_old_connection_is_half_closed() {
     // still around; without SO_REUSEADDR the kernel reports EADDRINUSE.
     let core = shared_core();
     let owner = local_owner(&core);
-    let mut device = SimulatedDevice::new();
+    let device = SimulatedDevice::new();
     owner
         .open(&device.path, Some(115_200), false)
         .expect("open");
@@ -2319,7 +2319,7 @@ fn sharing_restarts_on_the_same_port_while_an_old_connection_is_half_closed() {
     owner.stop_sharing().expect("stop");
 
     let restarted = owner
-        .start_sharing(bind.clone(), vec![device.path.clone()])
+        .start_sharing(bind, vec![device.path.clone()])
         .expect("restart on the same port");
     assert_eq!(restarted.bind, info.bind);
     drop(raw);
