@@ -262,6 +262,36 @@ fn dropping_gateway_makes_an_inflight_write_uncertain_without_replay() {
 }
 
 #[test]
+fn gateway_server_closes_a_client_that_stalls_before_handshake() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("gateway.sock");
+    let _server = GatewayServer::start(GatewayConfig {
+        socket: path.clone(),
+        core_socket: dir.path().join("missing-core.sock"),
+    })
+    .unwrap();
+    let stream = UnixStream::connect(&path).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .unwrap();
+    let mut reader = BufReader::new(stream);
+    let started = Instant::now();
+    let line = read_line(&mut reader, MAX_GATEWAY_MESSAGE_BYTES)
+        .unwrap()
+        .expect("gateway should reject the stalled handshake with an error");
+    let acknowledgement: GatewayHandshake = decode_line(&line).unwrap();
+    assert!(acknowledgement
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("invalid gateway handshake"));
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "stalled handshake exceeded the client timeout"
+    );
+}
+
+#[test]
 fn gateway_server_refuses_oversized_prefaces() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("gateway.sock");

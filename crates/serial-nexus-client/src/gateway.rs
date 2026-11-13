@@ -27,6 +27,7 @@ use crate::{Client, ClientError, Peers, RemoteClient, RemoteEndpoint};
 const MAX_GATEWAY_CLIENTS: usize = 64;
 const EVENT_QUEUE_CAPACITY: usize = 1024;
 const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const GATEWAY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const ACCEPT_POLL: Duration = Duration::from_millis(20);
 
 /// Paths used by a terminal-owned gateway. The gateway never starts the core.
@@ -348,6 +349,12 @@ fn serve_connection(
     core_socket: &std::path::Path,
     control: GatewaySessionControl,
 ) {
+    if stream
+        .set_read_timeout(Some(GATEWAY_HANDSHAKE_TIMEOUT))
+        .is_err()
+    {
+        return;
+    }
     let reader_stream = match stream.try_clone() {
         Ok(stream) => stream,
         Err(_) => return,
@@ -397,6 +404,9 @@ fn serve_connection(
                 error,
             },
         );
+        return;
+    }
+    if stream.set_read_timeout(None).is_err() {
         return;
     }
     let client_name = client.name.unwrap_or_else(|| "serial-nexus-mcp".into());

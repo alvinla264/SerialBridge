@@ -115,6 +115,29 @@ impl Terminal {
 }
 
 #[test]
+fn reopening_connect_keeps_the_in_progress_pairing_form() {
+    let _guard = serial_test();
+    let (_local, socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);
+    let mut terminal = Terminal::new(&socket);
+    terminal.app.start_connect();
+    let form = terminal.app.state.connect.as_mut().expect("connect form");
+    form.address = "192.0.2.45".into();
+    form.port = "7331".into();
+    form.ca = "pinned-ca".into();
+    form.fingerprint = "pinned-fingerprint".into();
+    form.credential = "in-progress-secret".into();
+
+    terminal.app.start_connect();
+
+    let form = terminal.app.state.connect.as_ref().expect("connect form");
+    assert_eq!(form.address, "192.0.2.45");
+    assert_eq!(form.port, "7331");
+    assert_eq!(form.ca, "pinned-ca");
+    assert_eq!(form.fingerprint, "pinned-fingerprint");
+    assert_eq!(form.credential, "in-progress-secret");
+}
+
+#[test]
 fn a_new_connection_does_not_hide_existing_host_disconnects() {
     let _guard = serial_test();
     let (_local, local_socket) = start_core(Duration::from_secs(5), Duration::from_secs(300), 500);

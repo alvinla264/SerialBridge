@@ -1056,7 +1056,9 @@ impl App {
             return;
         }
         self.state.prompt = None;
-        self.state.connect = Some(ConnectForm::new());
+        if self.state.connect.is_none() {
+            self.state.connect = Some(ConnectForm::new());
+        }
         self.state.view = View::Connect;
         self.state.focus = Focus::Right;
     }

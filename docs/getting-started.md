@@ -188,10 +188,11 @@ The pairing view shows two separate credentials:
 
 - the **human credential** goes into another terminal's Connect form, together
   with the host address, port, CA certificate and certificate fingerprint;
-- the **MCP credential** is for `serial-nexus-mcp` on a remote MCP host. Add
-  the host endpoint, CA certificate, fingerprint and this credential to the
-  private `mcp-peers.json` file with mode `0600`; follow the actual setup and
-  tool-call examples in
+- the **MCP credential** is for `serial-nexus-mcp` running on the laptop whose
+  terminal owns the gateway. The MCP server uses that local gateway to connect
+  onward to the sharing host. Add the remote endpoint, CA certificate,
+  fingerprint and credential to the local MCP process's private `mcp-peers.json`
+  file with mode `0600`; follow the setup and tool-call examples in
   [`serial-nexus-mcp/README.md`](../crates/serial-nexus-mcp/README.md#reach-a-device-shared-by-another-host).
 
 Do not paste either credential into shell history, a repository, an issue or a

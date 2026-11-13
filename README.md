@@ -25,8 +25,8 @@ Linux is supported; macOS and Windows are not currently supported.
 ## Quick start
 
 You'll need access to your serial device. See [Linux serial permissions](docs/getting-started.md#linux-serial-permissions)
-if opening it fails with a permission error. The first client starts the core
-automatically; no separate service is needed.
+if opening it fails with a permission error. The foreground terminal starts the
+core automatically; no separate service is needed.
 
 ### Nix
 
@@ -54,7 +54,9 @@ installation options.
 
 ### Connect an AI host
 
-Configure an MCP-compatible host to start the MCP server. For example, with Nix:
+Keep `serial-nexus-terminal` running, then configure an MCP-compatible host on
+the same laptop to start the MCP server. MCP routes through the terminal-owned
+gateway and does not start the core itself. For example, with Nix:
 
 ```json
 {

@@ -160,7 +160,7 @@ impl Session {
         )
         .map_err(|error| {
             Failure::Tool(format!(
-                "terminal gateway unavailable for local MCP access; start serial-nexus-terminal and retry: {error}"
+                "could not establish local MCP access through the terminal gateway; confirm serial-nexus-terminal and its core connection are healthy, then retry: {error}"
             ))
         })?;
         *guard = Some(client.clone());
@@ -178,7 +178,11 @@ impl Session {
             }
         }
         guard.remove(&endpoint);
-        let pairing_file = serial_nexus_client::Peers::default_path().ok();
+        let pairing_file = serial_nexus_client::Peers::default_path().map_err(|error| {
+            Failure::Tool(format!(
+                "cannot locate the MCP pairing file for remote {endpoint}: {error}"
+            ))
+        })?;
         let client = Client::connect_to_gateway_with_pairing(
             paths::default_gateway_socket_path(),
             GatewayTarget::Remote {
@@ -186,12 +190,12 @@ impl Session {
                 port: endpoint.port,
                 scope_id: endpoint.scope_id,
             },
-            pairing_file,
+            Some(pairing_file),
             ClientInfo::ai(CLIENT_NAME),
         )
         .map_err(|error| {
             Failure::Tool(format!(
-                "terminal gateway could not connect to remote {endpoint}; start serial-nexus-terminal and verify the pairing: {error}"
+                "could not establish remote MCP access to {endpoint} through the terminal gateway; confirm serial-nexus-terminal is running, the pairing is current, and the host is sharing: {error}"
             ))
         })?;
         guard.insert(endpoint, client.clone());
@@ -1017,12 +1021,12 @@ fn describe_error(error: &ClientError, device: Option<&str>) -> String {
     }
     match error {
         ClientError::CoreNotFound => {
-            "serial-nexus-core was not found; install it next to serial-nexus-mcp or set SERIAL_NEXUS_CORE"
+            "serial-nexus-core was not found; check the installation and terminal configuration"
                 .to_string()
         }
-        ClientError::CoreStart(reason) => format!("serial-nexus-core did not start: {reason}"),
+        ClientError::CoreStart(reason) => format!("serial-nexus-core could not be started: {reason}"),
         ClientError::Disconnected(reason) => format!(
-            "lost the connection to serial-nexus-core ({reason}); the next call starts it again"
+            "the terminal gateway connection was lost ({reason}); confirm serial-nexus-terminal is running and retry"
         ),
         ClientError::Timeout(reason) => format!("serial-nexus-core did not answer in time: {reason}"),
         ClientError::UnsupportedProtocol { core, client } => format!(

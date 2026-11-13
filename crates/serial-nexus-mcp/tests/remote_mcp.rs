@@ -251,11 +251,31 @@ fn gateway_exit_disconnects_local_and_outgoing_remote_mcp_sessions() {
         ClientInfo::ai("gateway-policy-test"),
     )
     .expect("gateway policy probe");
-    let denied = gateway_probe.stop_sharing().unwrap_err();
-    assert_eq!(
-        denied.code(),
-        Some(serial_nexus_client::ErrorCode::PermissionDenied)
-    );
+    let denied = [
+        gateway_probe
+            .start_sharing(ShareBind::new("127.0.0.1".parse().unwrap(), 0), vec![])
+            .unwrap_err(),
+        gateway_probe.stop_sharing().unwrap_err(),
+        gateway_probe.check_shared_devices(vec![]).unwrap_err(),
+        gateway_probe
+            .replace_shared_devices_expected(vec![], Default::default())
+            .unwrap_err(),
+        gateway_probe
+            .prepare_shared_devices_expected(vec![], Default::default())
+            .unwrap_err(),
+        gateway_probe
+            .commit_shared_devices("invalid-token".into())
+            .unwrap_err(),
+        gateway_probe.uncheck_shared_devices(vec![]).unwrap_err(),
+        gateway_probe.sharing_status().unwrap_err(),
+    ];
+    for error in denied {
+        assert_eq!(
+            error.code(),
+            Some(serial_nexus_client::ErrorCode::PermissionDenied),
+            "every sharing-administration request must be refused by the gateway"
+        );
+    }
     drop(gateway_probe);
     let peers = peers.to_string_lossy().into_owned();
     let mut session = McpSession::spawn_at_gateway(
@@ -387,6 +407,32 @@ fn remote_mcp_requires_gateway_and_never_dials_endpoint_directly() {
     let (text, is_error) = reply(&result);
     assert!(is_error, "remote MCP without a terminal must fail: {text}");
     assert!(text.contains("gateway"), "{text}");
+    assert_eq!(host.owner.sharing_status().unwrap().remote_clients, 0);
+}
+
+#[test]
+fn a_scrubbed_mcp_environment_does_not_inherit_the_gateway_pairing_file() {
+    let device = SimulatedDevice::new();
+    let host = SharedHost::start(std::slice::from_ref(&device.path));
+    let mut session = McpSession::spawn_with_env(
+        &host.socket,
+        &[
+            ("SERIAL_NEXUS_MCP_PEERS", ""),
+            ("XDG_CONFIG_HOME", ""),
+            ("HOME", ""),
+        ],
+    );
+
+    let result = call(&mut session, "list_devices", remote_args(&host, json!({})));
+    let (text, is_error) = reply(&result);
+    assert!(
+        is_error,
+        "remote MCP without its own pairing path must fail: {text}"
+    );
+    assert!(
+        text.contains("cannot locate the MCP pairing file"),
+        "{text}"
+    );
     assert_eq!(host.owner.sharing_status().unwrap().remote_clients, 0);
 }
 

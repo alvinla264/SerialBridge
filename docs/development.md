@@ -90,8 +90,9 @@ path as a real serial port and the test drives the master. Covered end to end:
   during a waited write without replay, path replacement not inheriting
   authorization, secrets absent from responses/events/history, and existing
   Unix-socket clients still working while sharing is active;
-- core grace-period shutdown and client auto-start (including an explicit core
-  path, a missing binary, and the started core owning a separate session);
+- core grace-period shutdown and supported client auto-start (including an
+  explicit core path, a missing binary, and the started core owning a separate
+  session);
 - the terminal's side-by-side layout at a usable width and focused-pane layout
   when narrow, single-click highlight never changing the shown stream,
   Enter/double-click opening, focus switching with `Ctrl+]` without redirecting
@@ -149,7 +150,8 @@ Further terminal coverage uses real core/client seams and dedicated PTY flows:
 handshake and tool listing, protocol errors, default and joined baud, rejected
 conflicts, two independent sessions with read-only takeover, exact writes,
 waited sends, partial lines, timeouts, disconnect releasing control, detached
-and missing devices, an unplugged device, and auto-start. Remote MCP tests cover
+and missing devices and an unplugged device. Separate tests require the local
+terminal gateway and prove MCP never auto-starts the core. Remote MCP tests cover
 private pairing-file permissions/redaction, per-endpoint sessions and device
 identity, explicit remote pairing and transport, and isolation between local
 and remote endpoints.
