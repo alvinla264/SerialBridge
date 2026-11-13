@@ -282,10 +282,6 @@ impl TuiSession {
             .unwrap_or(false)
     }
 
-    /// Quit the terminal the way a human would: make sure the sidebar has the
-    /// keys, then `Ctrl+Q`. A zero exit status, the alternate screen left and
-    /// the PTY's termios restored are all part of the check, so a killed or
-    /// crashed process cannot pass.
     /// Everything the child has written to its terminal so far, including
     /// control sequences and output after leaving the alternate screen.
     pub fn raw_transcript(&self) -> Vec<u8> {
@@ -295,6 +291,10 @@ impl TuiSession {
             .unwrap_or_default()
     }
 
+    /// Quit the terminal the way a human would: make sure the sidebar has the
+    /// keys, then `Ctrl+Q`. A zero exit status, the alternate screen left and
+    /// the PTY's termios restored are all part of the check, so a killed or
+    /// crashed process cannot pass.
     pub fn quit(self) {
         let _ = self.shutdown();
     }

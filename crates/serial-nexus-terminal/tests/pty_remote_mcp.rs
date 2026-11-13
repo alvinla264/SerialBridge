@@ -302,10 +302,18 @@ fn write_peers(directory: &Path, info: &ShareSessionInfo) -> PathBuf {
             "secret": { "role": "ai", "credential": info.ai.credential },
         }],
     });
-    std::fs::write(&path, serde_json::to_vec(&peers).expect("peers json")).expect("write peers");
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+    // Create the file owner-only from the start: writing it first and
+    // chmodding afterwards would leave the credential briefly readable.
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
         .expect("private peers file");
+    file.write_all(&serde_json::to_vec(&peers).expect("peers json"))
+        .expect("write peers");
     path
 }
 
@@ -881,6 +889,10 @@ fn a_write_larger_than_the_serial_buffer_keeps_the_device_to_itself() {
         !stream.is_empty() && stream.iter().all(|byte| *byte == b'D'),
         "the AI request started before the human's"
     );
+    assert!(
+        stream.len() < REQUEST,
+        "the AI request is still incomplete when the human writes"
+    );
 
     // A human joins and writes another 40 KiB while the AI request is still
     // incomplete.
@@ -895,11 +907,12 @@ fn a_write_larger_than_the_serial_buffer_keeps_the_device_to_itself() {
         .open(&device.path, None, false)
         .expect("human joins the open device");
     let human_text = "E".repeat(REQUEST);
-    let human_write = {
-        let human = human.clone();
-        let text = human_text.clone();
-        std::thread::spawn(move || human.write_bytes(human_open.device_id, text.as_bytes(), None))
-    };
+    // A write without a wait answers as soon as the core queued it, so this
+    // returning proves the human request was admitted while the AI's 40 KiB
+    // request is still incomplete: nothing drains the device until then.
+    human
+        .write_bytes(human_open.device_id, human_text.as_bytes(), None)
+        .expect("human write is admitted mid-write");
 
     let deadline = Instant::now() + Duration::from_secs(15);
     while stream.len() < 2 * REQUEST && Instant::now() < deadline {
@@ -913,10 +926,6 @@ fn a_write_larger_than_the_serial_buffer_keeps_the_device_to_itself() {
         stream.len()
     );
 
-    human_write
-        .join()
-        .expect("human write thread")
-        .expect("human write");
     let answer = answer_for(&mut mcp, 7);
     assert!(
         !answer["result"]["isError"].as_bool().unwrap_or(false),
