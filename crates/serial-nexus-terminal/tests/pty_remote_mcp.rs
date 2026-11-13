@@ -476,9 +476,17 @@ fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway()
 
     // Every whole request reached the one device exactly once: one copy each,
     // byte for byte, with no extra or duplicated bytes in the stream.
-    let stream = drain_serial(&mut device, Duration::from_millis(300));
     let expected_len =
         "ai-through-gateway".len() + ai_text.len() + human_text.len() + second_text.len();
+    let mut stream = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while stream.len() < expected_len && Instant::now() < deadline {
+        stream.extend(device.try_read());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Extra bytes are a failure too: drain a short quiet window after the
+    // expected total arrived, then require the exact total.
+    stream.extend(drain_serial(&mut device, Duration::from_millis(200)));
     assert_eq!(
         stream.len(),
         expected_len,
@@ -597,11 +605,8 @@ fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway()
         result["isError"].as_bool().unwrap_or(false),
         "a write whose answer was lost must be reported"
     );
-    let uncertainty = result["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_lowercase();
-    let uncertainty = mcp.redacted(&uncertainty);
+    let uncertainty = result["content"][0]["text"].as_str().unwrap_or_default();
+    let uncertainty = mcp.redacted(uncertainty).to_lowercase();
     assert!(
         uncertainty.contains("may have reached") || uncertainty.contains("uncertain"),
         "the error must say the write may have reached the device: {uncertainty}"
@@ -669,6 +674,23 @@ fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway()
     // When the foreground terminal leaves while that remote session is
     // healthy, its gateway goes with it. MCP neither dials the host directly
     // nor starts a local core.
+    // No pairing value appeared on the terminal's own screen (the gateway's
+    // stderr is the terminal's PTY) or in the MCP process transcript.
+    let screen = terminal.text();
+    for secret in [
+        &info.ai.credential,
+        &info.human.credential,
+        &info.host.ca_cert_der_b64,
+        &rotated.ai.credential,
+        &rotated.human.credential,
+        &rotated.host.ca_cert_der_b64,
+    ] {
+        assert!(
+            !screen.contains(secret),
+            "the terminal screen leaked a pairing value"
+        );
+    }
+
     terminal.quit();
     let (is_error, text, _) = mcp.call_tool("list_devices", remote_args(&rotated, json!({})));
     assert!(
