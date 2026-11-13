@@ -813,8 +813,11 @@ fn a_remote_stream_keeps_scrollback_and_scroll_keys_stay_out_of_the_device() {
     terminal.app.handle_key(Key::Esc);
     assert_eq!(terminal.app.state.view, View::Stream);
 
-    // Typing in the stream still reaches only the remote device.
+    // Typing in the stream still reaches only the remote device. The exact
+    // body (not just the presence of `Q`) proves the scroll keys never queued
+    // escape sequences behind the notice.
     terminal.app.handle_key(Key::Char('Q'));
-    device.read_until(b"Q", Duration::from_secs(5));
+    let typed = device.read_until(b"Q", Duration::from_secs(5));
+    assert_eq!(typed, b"Q", "only the typed byte reaches the remote device");
     terminal.app.shutdown();
 }

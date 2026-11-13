@@ -146,9 +146,11 @@ Further terminal coverage uses real core/client seams and dedicated PTY flows:
 - `pty_sharing.rs` and `pty_remote.rs`: the actual rendered and keyboard-driven
   Share/Pairing and Connect workflows, including device access on the host.
 - `pty_remote_mcp.rs`: the real MCP binary reaching a remote host through the
-  real terminal's gateway, beside a second and third human client on the same
-  device, with whole non-retried writes, secret-free output, uncheck revocation,
-  credential rotation and no fallback when the gateway exits.
+  real terminal's gateway, beside two more human clients on the same device:
+  discovery and first-open baud on a checked but unopened port, whole
+  non-interleaved writes, an interrupted write reported uncertain and never
+  replayed, secret-free output across failure paths, uncheck revocation,
+  rotated credentials and no fallback when the gateway exits.
 
 `serial-nexus-mcp` additionally has end-to-end tests over real MCP stdio framing:
 handshake and tool listing, protocol errors, default and joined baud, rejected

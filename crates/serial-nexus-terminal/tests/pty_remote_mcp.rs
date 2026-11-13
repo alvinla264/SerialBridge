@@ -1,11 +1,12 @@
 //! The real `serial-nexus-mcp` binary reaching a checked device on a remote
-//! host through the real foreground terminal's gateway: two network clients
-//! (an AI MCP session and a second human) on one shared device, secrecy of the
-//! pairing credential, revocation on uncheck, and no silent fallback when the
-//! gateway or the host's session goes away.
+//! host through the real foreground terminal's gateway: three network clients
+//! on one shared device, secrecy of every pairing value, revocation on uncheck,
+//! an interrupted write that is reported uncertain and never replayed, rotated
+//! credentials, and no silent fallback when the gateway or the host's session
+//! goes away.
 //!
 //! The host core starts sharing with a detected device that was never opened
-//! locally, so the remote first open chooses the baud rate. Everything below
+//! locally, so the first remote open chooses the baud rate. Everything below
 //! the MCP server is a real process or a real TLS connection; only the serial
 //! endpoint is a simulated PTY.
 
@@ -27,7 +28,8 @@ use support::{start_core, wait_until, PortListerGuard, SimulatedDevice};
 use tempfile::TempDir;
 
 /// The workspace builds every binary before its integration tests run, so the
-/// terminal tests can drive the MCP binary at the same target directory.
+/// terminal tests can drive the MCP binary at the same target directory. This
+/// mirrors how `remote_mcp.rs` finds the core binary.
 fn mcp_binary() -> PathBuf {
     let test_binary = std::env::current_exe().expect("current test executable");
     let target = test_binary
@@ -50,11 +52,12 @@ struct Mcp {
     lines: Receiver<Value>,
     stdout: Arc<Mutex<String>>,
     stderr: Arc<Mutex<String>>,
+    secrets: Arc<Mutex<Vec<String>>>,
     next_id: u64,
 }
 
 impl Mcp {
-    fn spawn(env: &[(&str, &str)]) -> Self {
+    fn spawn(env: &[(&str, &str)], secrets: &[&str]) -> Self {
         let mut command = Command::new(mcp_binary());
         command
             .env_remove("SERIAL_NEXUS_CORE")
@@ -125,6 +128,9 @@ impl Mcp {
             lines: rx,
             stdout: seen_stdout,
             stderr: seen_stderr,
+            secrets: Arc::new(Mutex::new(
+                secrets.iter().map(|secret| (*secret).to_string()).collect(),
+            )),
             next_id: 1,
         };
         mcp.initialize();
@@ -140,7 +146,7 @@ impl Mcp {
                 "clientInfo": { "name": "remote-gateway-e2e", "version": "0" }
             }),
         );
-        assert!(response.get("result").is_some(), "initialize: {response}");
+        assert!(response.get("result").is_some(), "initialize failed");
         self.notify("notifications/initialized", json!({}));
     }
 
@@ -165,8 +171,8 @@ impl Mcp {
                 .unwrap_or_else(|_| {
                     panic!(
                         "no answer to {method}; stdout: {}; stderr: {}",
-                        self.stdout_text(),
-                        self.stderr_text()
+                        self.redacted(&self.stdout_text()),
+                        self.redacted(&self.stderr_text())
                     )
                 });
             if message.get("id").and_then(Value::as_u64) == Some(id) {
@@ -179,17 +185,34 @@ impl Mcp {
         let response = self.request("tools/call", json!({"name": name, "arguments": arguments}));
         assert!(
             response.get("error").is_none(),
-            "tools/call {name} was a protocol error: {response}"
+            "tools/call {name} was a protocol error"
         );
         let result = &response["result"];
         (
             result["isError"].as_bool().unwrap_or(false),
-            result["content"][0]["text"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
+            self.redacted(result["content"][0]["text"].as_str().unwrap_or_default()),
             result.get("structuredContent").cloned(),
         )
+    }
+
+    /// Replace every pairing value with a marker, so a failing assertion or a
+    /// timeout panic cannot republish a credential the test is meant to catch.
+    fn redacted(&self, text: &str) -> String {
+        let mut text = text.to_string();
+        if let Ok(secrets) = self.secrets.lock() {
+            for secret in secrets.iter() {
+                text = text.replace(secret.as_str(), "<pairing-secret>");
+            }
+        }
+        text
+    }
+
+    fn add_secrets(&self, secrets: &[&str]) {
+        if let Ok(mut known) = self.secrets.lock() {
+            for secret in secrets {
+                known.push((*secret).to_string());
+            }
+        }
     }
 
     fn stdout_text(&self) -> String {
@@ -237,6 +260,7 @@ fn remote_args(info: &ShareSessionInfo, extra: Value) -> Value {
     args
 }
 
+/// Write the private pairing file for `info`; the mode is owner-only.
 fn write_peers(directory: &Path, info: &ShareSessionInfo) -> PathBuf {
     let path = directory.join("mcp-peers.json");
     let peers = json!({
@@ -255,6 +279,37 @@ fn write_peers(directory: &Path, info: &ShareSessionInfo) -> PathBuf {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .expect("private peers file");
     path
+}
+
+/// Everything the device receives until it has been quiet for `quiet`.
+fn drain_serial(device: &mut SimulatedDevice, quiet: Duration) -> Vec<u8> {
+    let mut got = Vec::new();
+    let mut last_data = Instant::now();
+    loop {
+        let chunk = device.try_read();
+        if chunk.is_empty() {
+            if last_data.elapsed() >= quiet {
+                return got;
+            }
+        } else {
+            got.extend(chunk);
+            last_data = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Read one specific MCP answer, ignoring unrelated traffic.
+fn answer_for(mcp: &mut Mcp, id: u64) -> Value {
+    loop {
+        let message = mcp
+            .lines
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap_or_else(|_| panic!("no answer to request {id}"));
+        if message.get("id").and_then(Value::as_u64) == Some(id) {
+            return message;
+        }
+    }
 }
 
 #[test]
@@ -280,27 +335,25 @@ fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway()
     let mut terminal = TuiSession::spawn(&local_socket, xdg.path(), 30, 110);
     terminal.wait_for_text("focus: sidebar");
     let gateway = local_socket.with_file_name("gateway.sock");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !gateway.exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        gateway.exists(),
-        "no gateway at {}; terminal screen:\n{}",
-        gateway.display(),
-        terminal.text()
-    );
+    wait_until(Duration::from_secs(5), || gateway.exists());
 
     let peers_directory = TempDir::new().expect("peers directory");
     let peers = write_peers(peers_directory.path(), &info);
     let peers = peers.to_string_lossy().into_owned();
     let gateway_text = gateway.to_string_lossy().into_owned();
-    let mut mcp = Mcp::spawn(&[
-        ("SERIAL_NEXUS_GATEWAY_SOCKET", &gateway_text),
-        ("SERIAL_NEXUS_MCP_PEERS", &peers),
-        ("HOME", &xdg.path().to_string_lossy()),
-        ("XDG_CONFIG_HOME", &xdg.path().to_string_lossy()),
-    ]);
+    let mut mcp = Mcp::spawn(
+        &[
+            ("SERIAL_NEXUS_GATEWAY_SOCKET", &gateway_text),
+            ("SERIAL_NEXUS_MCP_PEERS", &peers),
+            ("HOME", &xdg.path().to_string_lossy()),
+            ("XDG_CONFIG_HOME", &xdg.path().to_string_lossy()),
+        ],
+        &[
+            &info.ai.credential,
+            &info.human.credential,
+            &info.host.ca_cert_der_b64,
+        ],
+    );
 
     // The checked device is discoverable on the remote host without a local
     // open, and the reply names that endpoint.
@@ -317,18 +370,18 @@ fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway()
         json!(info.host.address.port())
     );
 
-    // The first remote open chooses the baud; later clients join it.
+    // The first remote open chooses a non-default baud; later clients join it.
     let (is_error, text, structured) = mcp.call_tool(
         "connect",
         remote_args(
             &info,
-            json!({ "path": device.path, "baud": 115_200, "request_control": true }),
+            json!({ "path": device.path, "baud": 57_600, "request_control": true }),
         ),
     );
     assert!(!is_error, "{text}");
-    let device_id = structured.expect("structured connect")["device_id"]
-        .as_u64()
-        .expect("device id");
+    let structured = structured.expect("structured connect");
+    assert_eq!(structured["baud"], json!(57_600), "{text}");
+    let device_id = structured["device_id"].as_u64().expect("device id");
 
     let (is_error, text, _) = mcp.call_tool(
         "send",
@@ -339,8 +392,8 @@ fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway()
     );
     assert!(!is_error, "{text}");
 
-    // A second human pairs over TLS and joins the same open device at the
-    // rate the first open chose.
+    // Two humans pair the one human credential, join at the rate the first
+    // open chose, and write beside the AI.
     let human = RemoteClient::connect(
         &info.host,
         &info.human,
@@ -352,11 +405,9 @@ fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway()
         .open(&device.path, None, false)
         .expect("human joins the open device");
     assert_eq!(
-        human_open.baud, 115_200,
+        human_open.baud, 57_600,
         "a later client joins at the rate the first open chose"
     );
-    // Several humans may pair the same credential; each is its own network
-    // client and its writes stay whole beside the AI's.
     let second_human = RemoteClient::connect(
         &info.host,
         &info.human,
@@ -394,19 +445,9 @@ fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway()
         let text = second_text.clone();
         std::thread::spawn(move || human.write_bytes(second_open.device_id, text.as_bytes(), None))
     };
-    let mut answer = None;
-    while answer.is_none() {
-        let message = mcp
-            .lines
-            .recv_timeout(Duration::from_secs(20))
-            .expect("answer to the concurrent send");
-        if message.get("id").and_then(Value::as_u64) == Some(99) {
-            answer = Some(message);
-        }
-    }
-    let answer = answer.expect("answer");
+    let answer = answer_for(&mut mcp, 99);
     let result = &answer["result"];
-    assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+    assert!(!result["isError"].as_bool().unwrap_or(false));
     human_write
         .join()
         .expect("human write thread")
@@ -416,24 +457,18 @@ fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway()
         .expect("second human write thread")
         .expect("second human write");
 
-    // Every whole request reached the one device exactly once, and the device
-    // stream never carried either pairing credential.
-    let mut stream = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let has_every_request = |stream: &[u8]| {
-        [&ai_text, &human_text, &second_text]
-            .into_iter()
-            .all(|text| {
-                stream
-                    .windows(text.len())
-                    .any(|window| window == text.as_bytes())
-            })
-    };
-    while !has_every_request(&stream) && Instant::now() < deadline {
-        stream.extend(device.try_read());
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    // Every whole request reached the one device exactly once: one copy each,
+    // byte for byte, with no extra or duplicated bytes in the stream.
+    let stream = drain_serial(&mut device, Duration::from_millis(300));
+    let expected_len =
+        "ai-through-gateway".len() + ai_text.len() + human_text.len() + second_text.len();
+    assert_eq!(
+        stream.len(),
+        expected_len,
+        "the device got bytes no request sent"
+    );
     let stream = String::from_utf8_lossy(&stream).into_owned();
+    assert_eq!(stream.matches("ai-through-gateway").count(), 1);
     assert_eq!(
         stream.matches(&ai_text).count(),
         1,
@@ -475,7 +510,7 @@ fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway()
     );
     let (is_error, text, _) = mcp.call_tool(
         "connect",
-        remote_args(&info, json!({ "path": device.path, "baud": 115_200 })),
+        remote_args(&info, json!({ "path": device.path, "baud": 57_600 })),
     );
     assert!(
         is_error,
@@ -488,28 +523,79 @@ fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway()
         "the local core still lists it: {text}"
     );
 
-    // The credential never appeared in the server's output or diagnostics.
-    let output = mcp.stdout_text();
-    let diagnostics = mcp.stderr_text();
-    for secret in [
-        &info.ai.credential,
-        &info.human.credential,
-        &info.host.ca_cert_der_b64,
-    ] {
-        assert!(
-            !output.contains(secret),
-            "MCP stdout leaked a pairing value"
-        );
-        assert!(
-            !diagnostics.contains(secret),
-            "MCP stderr leaked a pairing value"
-        );
+    // Re-check the device so an in-flight write can be interrupted mid-wait.
+    owner
+        .check_shared_devices(vec![device.path.clone()])
+        .expect("check again");
+
+    // Uncertain write: a waited send is pending when the owner stops sharing.
+    // The answer is an error that says the bytes may have arrived, the device
+    // holds exactly one copy, and nothing is sent again.
+    let (is_error, text, structured) = mcp.call_tool(
+        "connect",
+        remote_args(
+            &info,
+            json!({ "path": device.path, "request_control": true }),
+        ),
+    );
+    assert!(!is_error, "{text}");
+    let device_id = structured.expect("structured reconnect")["device_id"]
+        .as_u64()
+        .expect("device id");
+    {
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": 98,
+            "method": "tools/call",
+            "params": {
+                "name": "send",
+                "arguments": remote_args(&info, json!({
+                    "device": device_id,
+                    "text": "uncertain-request",
+                    "lines": 3,
+                    "timeout_ms": 8_000,
+                })),
+            },
+        });
+        let stdin = mcp.stdin.as_mut().expect("stdin open");
+        writeln!(stdin, "{line}").expect("write pending send");
+        stdin.flush().expect("flush pending send");
+    }
+    let before_stop = drain_serial(&mut device, Duration::from_millis(200));
+    owner.stop_sharing().expect("sharing stops mid-write");
+    let answer = answer_for(&mut mcp, 98);
+    let result = &answer["result"];
+    assert!(
+        result["isError"].as_bool().unwrap_or(false),
+        "a write whose answer was lost must be reported"
+    );
+    let uncertainty = result["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        uncertainty.contains("may have reached") || uncertainty.contains("uncertain"),
+        "the error must say the write may have reached the device: {uncertainty}"
+    );
+    let after_stop = drain_serial(&mut device, Duration::from_millis(300));
+    let before_stop = String::from_utf8_lossy(&before_stop).into_owned();
+    let after_stop = String::from_utf8_lossy(&after_stop).into_owned();
+    assert_eq!(
+        before_stop.matches("uncertain-request").count(),
+        1,
+        "the pending write reached the device before sharing stopped"
+    );
+    assert!(
+        after_stop.is_empty(),
+        "an uncertain write is never retried: {after_stop:?}"
+    );
+    for value in [&before_stop, &after_stop] {
+        assert!(!value.contains(&info.ai.credential));
+        assert!(!value.contains(&info.human.credential));
     }
 
-    // Restarting sharing on the host rotates every session secret, so the old
-    // private pairing file is refused rather than silently reaching a new
-    // session.
-    owner.stop_sharing().expect("sharing stops");
+    // Restarting sharing rotates every session secret, so the old private
+    // pairing file is refused rather than silently reaching a new session.
     wait_until(Duration::from_secs(5), || !human.is_connected());
     let rotated = owner
         .start_sharing(
@@ -518,9 +604,22 @@ fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway()
         )
         .expect("sharing restarts");
     assert_eq!(rotated.bind, info.bind);
-    assert_ne!(rotated.session_id, info.session_id);
-    assert_ne!(rotated.ai.credential, info.ai.credential);
-    assert_ne!(rotated.host.ca_cert_der_b64, info.host.ca_cert_der_b64);
+    assert!(rotated.session_id != info.session_id);
+    assert!(rotated.ai.credential != info.ai.credential);
+    assert!(rotated.human.credential != info.human.credential);
+    assert!(rotated.host.ca_cert_der_b64 != info.host.ca_cert_der_b64);
+    mcp.add_secrets(&[
+        &rotated.ai.credential,
+        &rotated.human.credential,
+        &rotated.host.ca_cert_der_b64,
+    ]);
+    let old_human = RemoteClient::connect(
+        &rotated.host,
+        &info.human,
+        Some("stale-human".into()),
+        Duration::from_secs(5),
+    );
+    assert!(old_human.is_err(), "an old human credential is refused");
     let (is_error, text, _) = mcp.call_tool("list_devices", remote_args(&info, json!({})));
     assert!(
         is_error,
@@ -531,14 +630,48 @@ fn the_real_mcp_binary_reaches_a_remote_host_through_the_real_terminal_gateway()
         "a stale pairing must not echo its credential: {text}"
     );
 
-    // When the foreground terminal leaves, its gateway goes with it; MCP has
-    // no core or direct-dial fallback.
+    // With the rotated details the same MCP process reaches the new session.
+    write_peers(peers_directory.path(), &rotated);
+    let (is_error, text, _) = mcp.call_tool("list_devices", remote_args(&rotated, json!({})));
+    assert!(!is_error, "the rotated pairing is accepted: {text}");
+    assert!(text.contains(&device.path), "{text}");
+
+    // When the foreground terminal leaves while that remote session is
+    // healthy, its gateway goes with it. MCP neither dials the host directly
+    // nor starts a local core.
     terminal.quit();
+    let (is_error, text, _) = mcp.call_tool("list_devices", remote_args(&rotated, json!({})));
+    assert!(
+        is_error,
+        "MCP must not reach a remote host without the terminal gateway: {text}"
+    );
     let (is_error, text, _) = mcp.call_tool("list_devices", json!({}));
     assert!(
         is_error,
         "MCP must fail without the terminal gateway instead of starting a core: {text}"
     );
+
+    // No pairing value appeared anywhere in the server's output or
+    // diagnostics, across success, revocation, rotation and gateway loss.
+    let output = mcp.stdout_text();
+    let diagnostics = mcp.stderr_text();
+    for secret in [
+        &info.ai.credential,
+        &info.human.credential,
+        &info.host.ca_cert_der_b64,
+        &rotated.ai.credential,
+        &rotated.human.credential,
+        &rotated.host.ca_cert_der_b64,
+    ] {
+        assert!(
+            !output.contains(secret),
+            "MCP stdout leaked a pairing value"
+        );
+        assert!(
+            !diagnostics.contains(secret),
+            "MCP stderr leaked a pairing value"
+        );
+    }
 
     drop(host_core);
 }
