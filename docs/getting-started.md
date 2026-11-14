@@ -1,12 +1,18 @@
 # Installation and device behavior
 
+SerialNexus is pre-1.0. This tree is the planned v0.1.0 release, but no tag or
+GitHub release exists yet. Linux is the only supported platform. See
+[Verification status](#verification-status) for what has and has not been
+tested, and [SECURITY.md](../SECURITY.md) for private vulnerability reporting.
+
 ## Installing
 
 ### Prerequisites
 
-- **Linux.** The core uses a Unix socket and `SO_PEERCRED` uid checks, reads
-  `/dev/serial/by-id` and `/sys/class/tty`, and talks to ports through
-  `serialport`. macOS and Windows are not supported.
+- **Linux.** This is the only supported platform. The core uses a Unix socket
+  and `SO_PEERCRED` uid checks, reads `/dev/serial/by-id` and
+  `/sys/class/tty`, and talks to ports through `serialport`. macOS and Windows
+  are not supported.
 - **A serial adapter** (or an on-board port) and access to it: see
   [Linux serial permissions](#linux-serial-permissions).
 - **Rust 1.85 or newer** to build from source, or **Nix** with flakes enabled
@@ -87,6 +93,9 @@ require the foreground terminal gateway. No separate core install is needed;
 set `SERIAL_NEXUS_CORE` to make the terminal use a different one.
 
 ## Running
+
+Start the foreground terminal first. It hosts the local MCP gateway, and every
+MCP call - local or to a paired remote host - goes through it.
 
 - **The core has no service.** The foreground terminal starts it detached
   (own session, stdio discarded) on the standard per-user socket; the core exits
@@ -177,8 +186,14 @@ Device rules:
 
 ## LAN sharing and remote terminals
 
-Sharing is off by default and needs no configuration until it is used. The
-human terminal is the owner: open Settings, set a concrete IPv4 or IPv6 address
+Sharing is off by default and needs no configuration until it is used. Nothing
+listens on the network until the human terminal starts a session for one
+concrete address. The same-user trust model applies: any program running as
+your user can start or change sharing, so run only trusted software as that
+user. The path between two physical computers has not been verified; the
+automated sharing tests use loopback TLS (see
+[Verification status](#verification-status)). The human terminal is the owner:
+open Settings, set a concrete IPv4 or IPv6 address
 and port, tick the devices to share, Save, and start sharing from the sidebar's
 Share button (or `s`). See
 [Sharing devices on the LAN from the terminal](clients.md#sharing-devices-on-the-lan-from-the-terminal)
@@ -213,3 +228,25 @@ access immediately; unplugging it, or replacing it at the same path, clears its
 checkbox and requires a recheck. A write already in progress may finish, and a
 write whose answer is lost is reported as uncertain: nothing is retried or
 rolled back.
+
+## Verification status
+
+What has been checked for this release:
+
+- the workspace's automated tests on Linux, using PTY-based simulated serial
+  devices and loopback TLS for LAN sharing;
+- the x86_64-linux Nix package, built and checked locally;
+- local serial I/O with an STM32 Nucleo board through the terminal.
+
+What has not been verified:
+
+- the sharing path between two physical computers, or a real LAN peer. The
+  automated sharing tests use loopback TLS on one machine;
+- aarch64-linux at runtime. The flake declares `x86_64-linux` and
+  `aarch64-linux`, but a build or evaluation for the other architecture is not
+  proof that it runs there;
+- platforms other than Linux, which are not supported.
+
+This is a draft for the planned first release; it is not a tag, a GitHub
+release or a stability promise. See the
+[draft v0.1.0 release notes](release-notes-v0.1.md).

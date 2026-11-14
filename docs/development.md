@@ -2,6 +2,9 @@
 
 ## Security
 
+Report suspected vulnerabilities privately as described in
+[SECURITY.md](../SECURITY.md), not in a public issue.
+
 Local clients use a Unix socket: the socket directory is created 0700, the
 socket file is 0600, and every accepted connection is checked with `SO_PEERCRED`
 against the core's effective uid. A caller-provided socket directory is not
@@ -167,10 +170,12 @@ private pairing-file permissions/redaction, per-endpoint sessions and device
 identity, explicit remote pairing and transport, and isolation between local
 and remote endpoints.
 
-Not proven here: real hardware and drivers, PTY behaviour that differs from
-USB serial adapters, platforms other than Linux, terminals other than what the
-`vt100` emulator models in the PTY tests (truecolour, unusual key encodings),
-`libudev`-based enumeration (device discovery reads `/dev/serial/by-id` and
-`/sys/class/tty`), and real LAN peers (sharing tests use loopback). PTY fixtures
-are not enumerated, so sharing tests open them locally first; real enumerated
-devices need not be open locally.
+Not proven by these automated tests: real hardware and drivers, PTY behaviour
+that differs from USB serial adapters, platforms other than Linux, terminals
+other than what the `vt100` emulator models in the PTY tests (truecolour,
+unusual key encodings), `libudev`-based enumeration (device discovery reads
+`/dev/serial/by-id` and `/sys/class/tty`), and real LAN peers (sharing tests use
+loopback). Local serial I/O has also been checked manually on an STM32 Nucleo
+board, but the sharing path between two physical computers has not been
+verified. PTY fixtures are not enumerated, so sharing tests open them locally
+first; real enumerated devices need not be open locally.
